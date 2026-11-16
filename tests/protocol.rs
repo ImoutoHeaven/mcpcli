@@ -255,13 +255,24 @@ async fn protocol_errors_and_tool_errors_remain_distinct() {
 #[tokio::test]
 async fn failed_handshake_kills_child_and_crashed_server_is_not_restarted() {
     let fixture = Fixture::new();
-    let error = McpConnection::connect(
-        &fixture.stdio(true, "hang_initialize"),
-        Duration::from_millis(150),
-    )
-    .await;
-    assert_eq!(kind(&error.err().unwrap()), FailureKind::Timeout);
+    let config = fixture.stdio(true, "hang_initialize");
+    let connecting = McpConnection::connect(&config, BUDGET);
+    tokio::pin!(connecting);
+    tokio::select! {
+        result = &mut connecting => {
+            panic!("handshake ended before the blocked fixture was observed: {:?}", result.err());
+        }
+        () = wait_until(|| fixture.count("server/discover") == 1) => {}
+    }
     let pid = fixture.pid();
+    assert!(
+        running(pid),
+        "blocked handshake fixture exited before its deadline"
+    );
+    let error = tokio::time::timeout(BUDGET + Duration::from_secs(2), connecting)
+        .await
+        .expect("handshake timeout and cleanup remain bounded");
+    assert_eq!(kind(&error.err().unwrap()), FailureKind::Timeout);
     wait_until(|| !running(pid)).await;
 
     let fixture = Fixture::new();
