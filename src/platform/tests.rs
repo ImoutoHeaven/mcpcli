@@ -206,21 +206,37 @@ fn windows_ancestor_reparse_permissions_are_rejected() {
             assert!(!child.exists());
         }
 
-        // MS-FSA 2.1.5.10.37 permits this without DELETE, despite the live no-delete-share guard.
-        let guard = open_skill_root(&parent).unwrap();
-        let changed = convert_to_junction(&parent, mask, &target);
-        if safe {
-            assert_eq!(
-                changed.unwrap_err().kind(),
-                std::io::ErrorKind::PermissionDenied
-            );
-        } else {
-            changed.unwrap();
+        if !safe {
+            let guard = open_skill_root(&parent).unwrap();
+            convert_to_junction(&parent, mask, &target).unwrap();
             assert_eq!(parent.canonicalize().unwrap(), target);
+            drop(guard);
         }
-        drop(guard);
+        // Child-creation rights are accepted; runtime creation no longer relies on
+        // those rights being insufficient to change the parent's path semantics.
         std::fs::remove_dir(parent).unwrap();
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn private_runtime_creation_uses_the_opened_parent() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    let parent = base.join("parent");
+    let outside = base.join("other");
+    private_dir(&parent).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let result = windows::private_dir_with(&parent.join("private"), |_, _| {
+        convert_to_junction(&parent, FILE_WRITE_ATTRIBUTES, &outside)
+    });
+    assert!(
+        result.is_err(),
+        "a changed parent must not redirect runtime creation"
+    );
+    assert!(!outside.join("private").exists());
+    std::fs::remove_dir(parent).unwrap();
 }
 
 #[cfg(windows)]

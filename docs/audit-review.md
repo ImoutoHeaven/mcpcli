@@ -26,7 +26,7 @@
 | R6 | Medium | 新增 macOS/FreeBSD 实现的中间检查点 | 只检查祖先模式位会漏掉额外 ACL 修改授权。现在检查 native ACL 的 mutation grant，允许无害 deny/read 权限；macOS 原生测试和 FreeBSD 专用 NFSv4 文件系统测试必须执行。 |
 | R7 | Medium | 新增 Release CI 的中间检查点 | `release-*` 同时匹配旧日志和聚合包，失败重跑可污染严格七包集合。改为 `release-archive-*`，证据与聚合包分离，并明确替换本次 run 的旧同名产物。 |
 | R8 | Medium | R3 修复后的 C2 检查点 | oneshot inspect 在工具不存在时，经 `?` 提前返回会丢弃连接；reviewer 5 次独立复现中 4 次缺少 DELETE，基线与合法 inspect 对照均正常。现在将元数据转换错误连同连接交给统一输出/清理路径；保留 unknown_tool 和退出码 2，清理失败仅追加诊断。 |
-| R9 | Medium | 新增 Windows 实现的 C2 检查点 | 祖先 DACL 检查遗漏 FILE_WRITE_DATA 与 FILE_WRITE_ATTRIBUTES；任一权限即可把空目录转换为 junction，持有不共享 DELETE 的句柄不足以阻止此操作。现在拒绝这两类外部授权，保留仅创建子目录的权限；原生测试用精确受限句柄证明转换能力与拒绝规则。 |
+| R9 | Medium | 新增 Windows 实现的 C2 检查点 | 祖先 DACL 检查和固定目录句柄不足以保证按公共路径创建的目标身份。初始修复仅补充 mutation grant 拒绝；C4a 两个 Windows 原生 runner 随后推翻了原测试对另一权限分支的安全假设。当前工作区改为基于已验证父句柄相对创建，并重开公共路径核对身份；未提交，尚待双架构原生验收。 |
 | R10 | Medium | 新增 Windows 技能遍历实现 | 技能路径在每层检查后仍按完整路径打开下一层，允许已固定的空目录被原地转换为 junction 后访问外部资源。改为 NtCreateFile + RootDirectory 按句柄解析单个分量；枚举继续基于 GetFileInformationByHandleEx。确定性回归覆盖文件、嵌套目录及已打开目录的转换。 |
 | R11 | High | 新增 Windows daemon 启动实现 | Rust 1.92 默认继承全部可继承句柄；重定向新子进程 stdio 不会排除 CLI 原始捕获管道，daemon 会延长它们的生命期。两架构 E2E 均在首次 persistent 调用等待输出 EOF 时挂住。main 在任何线程/子进程启动前清除原始三个标准句柄的继承标志；显式配置的子进程 stdio 仍由标准库复制并传入。 |
 
@@ -55,7 +55,7 @@ C2：`cf62d0ff93ee3117a00fb4e1c48c336d42f4e964`，tree `d9f25083d23caba46dc0490e
 
 R8 独立复验：reviewer 重建 `4ec42aa9c74fc2acdf60c836bce6fd4f990ecec8`，5 次正常缺失工具查询、HTTP 500 清理、DELETE 超时、清理中断共 8 项均保留原错误且恰好发送一次 DELETE；主代理新增后 CLI 25/25 通过。
 
-R9 源码依据：[Microsoft MS-FSA §2.1.5.10.37](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165)。主代理与 reviewer 均确认修复范围和原生回归设计；Windows 两架构实际运行仍是最终门禁。
+R9 历史源码依据：[Microsoft MS-FSA §2.1.5.10.37](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165)。C4a 原生执行说明仅凭原先的权限推断不足以通过验收；后续修复改为固定父句柄创建和路径身份校验。相关 API 依据：[NtCreateFile](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntcreatefile)。必须以新冻结版本的双架构原生结果为门禁。
 
 C3：`9626d98ba14e004bb3d98b95876df4ec5316234c`，tree `72180159f5af0f4419942874fff24db928bc0772`。主代理和 reviewer 均独立通过 fmt、Clippy、45 单元 + 19 协议 + 25 CLI E2E，归档安全自测 3/3；因随后确认 R10/R11，C3 未推送，双方 **NO-SHIP**。
 
@@ -64,3 +64,38 @@ C2 Windows 的可复查证据确认 x64、ARM64 各 47 单元 + 19 协议全过�
 R11 源码依据：[Rust 1.92 Windows Command 实现](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/pal/windows/process.rs)。测试 harness 同时修复 Windows subprocess.run 在超时 kill 后无界等待 EOF 的诊断缺口；继续通过管道捕获输出验证产品行为。
 
 最终冻结 SHA 和双方 SHIP 将在原生 CI 与完整回归完成后记录；当前任何局部绿色结果均不构成发布门禁通过。
+
+## C4a 原生与产物审查补充
+
+更新时间：2026-11-16 19:02（Asia/Shanghai）。
+
+C4a 为 `b55d053c8611b34148255a19e27587d09fb22931`，tree `7f7bd7b2264b4a81417956fff59b7726e95f192f`。主代理与只读 reviewer 均为 **NO-SHIP**。
+
+- [原生 CI 43849272616](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43849272616)：failure。
+- [发布预演 43849272672](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43849272672)：failure。
+- run 均已结束，bundle 和 draft release 正确未获放行。
+
+| ID | 严重性 | 来源 | 发现及当前修复状态 |
+|---|---|---|---|
+| R12 | Medium | 新增 Windows 发布包 | 两个 EXE 导入 VCRUNTIME140.dll，但归档未提供运行库；runner 自带运行库掩盖交付缺陷。已提交 MSVC 静态 CRT 配置 `4b92702` 和 PE 架构、普通/延迟导入门禁 `8026c65`。6 项 PE 自测通过，旧 mcpcli 两包被正确拒绝，仍待新的实际产物验证。 |
+| R13 | Medium | 既有 HTTP 客户端构建路径 | 在无系统 CA 的 Debian 精简环境，即使目标为 http，默认 TLS verifier 构建也失败。当前工作区仅在默认构建失败且目标为 http 时用显式空根证书集合重建，保留严格 TLS 验证。定向 E2E 验证纯 HTTP 成功、自签 HTTPS 仍拒绝；未提交且尚未全套回归。 |
+
+R9 新修复已通过 Windows x64/ARM64 聚焦平台编译和 Clippy；当前仅源码预审通过，不能等同于原生执行。R10 固定句柄技能遍历回归在 C4a 两个 Windows runner 均通过。R11 修复后两个架构的真实 PIPE CLI 调用能结束，持久 daemon 继续工作，CLI 各 23 通过加 2 个 Unix 专属 skip；协议各 19 通过，归档 smoke 各 5/5。这些成功没有消除同一 run 的其他失败。
+
+FreeBSD 的 46 单元、19 协议、25 CLI、额外必跑 NFSv4 fixture 及清理、发布包均通过。Linux 原生容器和真实服务 E2E 通过。macOS Intel 的旧 150ms 握手 fixture 有冷启动竞态；`40a64fc` 已改为先观察实际握手阻塞再断言超时与子进程退出，待原生重跑。
+
+## 最新独立全树审查与未完成门禁
+
+新只读 reviewer 在隔离工作树完整审查：
+
+- SHA：`40a64fcdcfc2e75937d266744a64f944ae0f5c0c`。
+- Tree：`effabe8e71bcd9a05749f447c11fc35f56095127`。
+- 覆盖全部受跟踪 Rust、测试、脚本、workflow、锁文件、配置、文档和示例。
+- 独立 fmt/Clippy、45 单元、19 协议、25 CLI（0 skip）、3 归档自测、6 PE 自测全部通过。
+- 没有确认新的 must-fix 或 should-fix；但 HTTP/Windows 未提交增量仅完成源码预审，最终原生及七包验证未完成，明确 **NO-SHIP**。
+
+实际 Cargo.lock 的 reqwest 是 **0.13.5**，声明中的 0.13.3 并非精确锁定。新 reviewer 已核对 0.13.5 的 tls_certs_only(empty) 源码：显式空根证书集合保持证书及主机名验证，不是跳过验证。
+
+主代理执行通道随后连只读 git status 都返回 `aborted before dispatch`，未给出更详细原因。此前两个旧子代理的诊断调用被自动 cybersecurity risk 检查中止；对应诊断路线已停止，未创建或推送诊断分支，未通过其他代理代跑被中止命令。
+
+当前 HTTP/Windows 修复及本次文档更新尚未提交。main、正式 v0.1.0、Release 和 WIP 清理均未推进。恢复后必须冻结完整树、同 SHA 的全平台 CI/七包全绿、双方全树 SHIP，才可进入 Step 4。

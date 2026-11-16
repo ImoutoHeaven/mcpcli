@@ -157,29 +157,51 @@ fn open_directory(path: &Path, enumerate: bool) -> io::Result<File> {
 }
 
 pub fn private_dir(path: &Path) -> Result<()> {
+    private_dir_with(path, |_, _| Ok(()))
+}
+
+pub(super) fn private_dir_with(
+    path: &Path,
+    before_create: impl FnOnce(&Path, &File) -> io::Result<()>,
+) -> Result<()> {
     if !path.is_absolute() {
         bail!("runtime directory must be absolute");
     }
-    // Pin each ancestor against replacement; its ACL also excludes conversion into a junction.
+    let parent = path
+        .parent()
+        .context("runtime directory must have a parent")?;
+    let name = path
+        .file_name()
+        .context("runtime directory must have a name")?;
+    let mut current = PathBuf::new();
     let mut guards = Vec::new();
-    let parents: Vec<_> = path.ancestors().skip(1).collect();
-    for parent in parents.into_iter().rev() {
-        let guard = open_directory(parent, false)?;
-        check_security(&guard, false)
-            .with_context(|| format!("unsafe runtime ancestor {parent:?}"))?;
-        guards.push(guard);
+    for component in parent.components() {
+        current.push(component.as_os_str());
+        let file = match component {
+            Component::Prefix(_) => continue,
+            Component::RootDir => open_directory(&current, false)?,
+            Component::Normal(name) => {
+                let previous = guards.last().context("runtime path must be absolute")?;
+                open_relative(previous, name, true, false, None)?
+            }
+            _ => bail!("runtime path must be normalized"),
+        };
+        check_security(&file, false)
+            .with_context(|| format!("unsafe runtime ancestor {current:?}"))?;
+        guards.push(file);
     }
+    let parent = guards
+        .last()
+        .context("runtime path must have an opened parent")?;
+    before_create(path, parent)?;
     let attributes = SecurityAttributes::owner_only(true)?;
-    let name = wide(path.as_os_str())?;
-    let created = attributes.with_raw(|raw| unsafe { CreateDirectoryW(name.as_ptr(), raw.cast()) });
-    if created == 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error.into());
-        }
-    }
-    let file = open_directory(path, false)?;
+    let file = open_relative(parent, name, true, false, Some(&attributes))?;
     check_security(&file, true).with_context(|| format!("unsafe runtime directory {path:?}"))?;
+    // Revalidate the public path while its new private leaf and every ancestor remain pinned.
+    let verified = open_beneath(path, Path::new(""), true)?;
+    if !same_file(&file, &verified)? {
+        bail!("runtime directory changed during creation");
+    }
     Ok(())
 }
 
@@ -349,13 +371,10 @@ pub(super) fn open_beneath_with(
             Component::Prefix(_) => continue,
             Component::RootDir => open_directory(&path, !intermediate)?,
             Component::Normal(name) => {
-                if name.encode_wide().any(|unit| unit == u16::from(b':')) {
-                    return Err(refuse("alternate data streams are not skill resources"));
-                }
                 let parent = guards
                     .last()
                     .ok_or_else(|| refuse("skill root must be absolute"))?;
-                open_relative(parent, name, intermediate || directory, !intermediate)?
+                open_relative(parent, name, intermediate || directory, !intermediate, None)?
             }
             _ => return Err(refuse("resource path is not normalized")),
         };
@@ -377,16 +396,21 @@ fn open_relative(
     name: &OsStr,
     directory: bool,
     enumerate: bool,
+    create: Option<&SecurityAttributes>,
 ) -> io::Result<File> {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF, FILE_OPEN_REPARSE_POINT,
+        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
     };
     use windows_sys::Win32::Foundation::{
         OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+        return Err(refuse("alternate data streams are not supported"));
+    }
     let mut name = wide(name)?;
     let length = u16::try_from((name.len() - 1) * 2)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource name is too long"))?;
@@ -394,13 +418,6 @@ fn open_relative(
         Length: length,
         MaximumLength: length,
         Buffer: name.as_mut_ptr(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: parent.as_raw_handle(),
-        ObjectName: &mut name,
-        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
-        ..Default::default()
     };
     let access = READ_CONTROL
         | FILE_READ_ATTRIBUTES
@@ -416,21 +433,46 @@ fn open_relative(
         };
     let mut handle = std::ptr::null_mut();
     let mut status_block = IO_STATUS_BLOCK::default();
-    // The single component, parent handle, and synchronous status buffer stay live through open.
-    let status = unsafe {
-        NtCreateFile(
-            &mut handle,
-            access,
-            &attributes,
-            &mut status_block,
-            std::ptr::null(),
-            0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            FILE_OPEN,
-            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
-            std::ptr::null(),
-            0,
-        )
+    let mut open = |security| {
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &mut name,
+            Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+            SecurityDescriptor: security,
+            ..Default::default()
+        };
+        // The single name, parent, optional protected descriptor and status buffer stay live.
+        unsafe {
+            NtCreateFile(
+                &mut handle,
+                access,
+                &attributes,
+                &mut status_block,
+                std::ptr::null(),
+                FILE_ATTRIBUTE_NORMAL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                if create.is_some() {
+                    FILE_OPEN_IF
+                } else {
+                    FILE_OPEN
+                },
+                FILE_OPEN_REPARSE_POINT
+                    | FILE_SYNCHRONOUS_IO_NONALERT
+                    | if directory { FILE_DIRECTORY_FILE } else { 0 },
+                std::ptr::null(),
+                0,
+            )
+        }
+    };
+    let status = if let Some(security) = create {
+        security.with_raw(|raw| {
+            // SAFETY: with_raw supplies a live SECURITY_ATTRIBUTES and owns its descriptor.
+            let raw = unsafe { &*raw.cast::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() };
+            open(raw.lpSecurityDescriptor.cast())
+        })
+    } else {
+        open(std::ptr::null_mut())
     };
     if status != 0 {
         if !handle.is_null() && handle != INVALID_HANDLE_VALUE {

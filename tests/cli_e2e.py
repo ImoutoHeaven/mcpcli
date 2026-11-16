@@ -94,16 +94,16 @@ class Fixture:
     def save_config(self):
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
 
-    def use_http(self, mode):
+    def use_http(self, mode, tls=False):
         script = self.script.with_name("protocol_server.py")
         log = self.root / f"http-{mode}.log"
         process = subprocess.Popen([sys.executable, str(script), "--http", "--mode", mode,
-                                    "--log", str(log)], env=self.env,
+                                    "--log", str(log), *(["--tls"] if tls else [])], env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.http_servers.append(process)
         port = int(readline_with_timeout(process.stdout, 5))
         self.settings["servers"] = {"state": {
-            "transport": "http", "url": f"http://127.0.0.1:{port}/mcp",
+            "transport": "http", "url": f"{'https' if tls else 'http'}://127.0.0.1:{port}/mcp",
         }}
         self.save_config()
         return log
@@ -567,6 +567,22 @@ def http_delete_timeout_is_reported(f):
 
 
 
+def http_without_ca_store_keeps_tls_validation(f):
+    empty = f.root / "empty-ca-store"
+    empty.mkdir()
+    bundle = empty / "empty.pem"
+    bundle.write_bytes(b"")
+    f.env.update(SSL_CERT_FILE=str(bundle), SSL_CERT_DIR=str(empty))
+    log = f.use_http("no_system_ca")
+    assert f.invoke("--oneshot", "call", "state", "get").returncode == 0
+    assert log.read_text().splitlines().count("DELETE") == 1
+    tls_log = f.use_http("untrusted_tls", tls=True)
+    result = f.invoke("--oneshot", "call", "state", "get", code=4)
+    assert not result.stdout
+    assert error_value(result)["kind"] == "mcp_transport"
+    assert "tools/call" not in tls_log.read_text().splitlines(), "untrusted TLS was accepted"
+
+
 def oneshot_unknown_inspect_closes_session(f):
     for mode in ("normal", "delete_hang"):
         log = f.use_http(mode)
@@ -744,7 +760,7 @@ CASES = [
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
     interrupt_after_result_preserves_known_outcome, oneshot_unknown_inspect_closes_session,
-    oneshot_unknown_inspect_signal_preserves_error,
+    oneshot_unknown_inspect_signal_preserves_error, http_without_ca_store_keeps_tls_validation,
     burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
     unprivileged_execute_only_ancestors,
 ]

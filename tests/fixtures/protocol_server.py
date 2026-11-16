@@ -5,6 +5,8 @@ import json
 import os
 import queue
 import socketserver
+import ssl
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -13,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--http", action="store_true")
+parser.add_argument("--tls", action="store_true")
 parser.add_argument("--modern", action="store_true")
 parser.add_argument("--mode", default="normal")
 parser.add_argument("--log", required=True)
@@ -238,6 +241,11 @@ if args.http:
             self.server_port = self.server_address[1]
 
     server = LoopbackServer(("127.0.0.1", 0), Handler)
+    if args.tls:
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        fixture = Path(__file__).resolve().parent
+        context.load_cert_chain(fixture / "untrusted-test-cert.pem", fixture / "untrusted-test-key.pem")
+        server.socket = context.wrap_socket(server.socket, server_side=True)
     print(server.server_port, flush=True)
     server.serve_forever()
 else:

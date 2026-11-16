@@ -242,13 +242,28 @@ impl McpConnection {
                         value.set_sensitive(true);
                         parsed_headers.insert(name, value);
                     }
-                    let client = reqwest::Client::builder()
-                        .redirect(reqwest::redirect::Policy::none())
-                        .retry(reqwest::retry::never())
-                        .connect_timeout(MAX_CONNECT)
+                    let builder = || {
+                        reqwest::Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .retry(reqwest::retry::never())
+                            .connect_timeout(MAX_CONNECT)
+                    };
+                    let client = builder()
                         .build()
+                        .or_else(|error| {
+                            if reqwest::Url::parse(url).is_ok_and(|url| url.scheme() == "http") {
+                                // Minimal systems may have no CA store. Plain HTTP needs none;
+                                // an empty trust store still rejects any TLS connection or proxy.
+                                builder().tls_certs_only(std::iter::empty()).build()
+                            } else {
+                                Err(error)
+                            }
+                        })
                         .map_err(|_| {
-                            failure(FailureKind::Transport, "Cannot create HTTP client")
+                            failure(
+                                FailureKind::Transport,
+                                "Cannot create HTTP client; check the system CA certificates",
+                            )
                         })?;
                     let transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url.clone())
