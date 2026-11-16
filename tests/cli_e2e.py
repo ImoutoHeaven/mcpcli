@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 
-from platform_support import IdleConnection, LINUX, WINDOWS, interrupt, kill_owned, readline_with_timeout, running
+from platform_support import IdleConnection, LINUX, WINDOWS, interrupt, kill_owned, readline_with_timeout, running, test_temp_base
 
 
 class CaseSkipped(Exception):
@@ -704,7 +704,7 @@ CASES = [
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--artifacts", type=Path, default=Path("/tmp" if sys.platform == "darwin" else tempfile.gettempdir()) / "mcpcli-e2e")
+    parser.add_argument("--artifacts", type=Path, default=test_temp_base() / "mcpcli-e2e")
     parser.add_argument("--case", action="append", choices=[case.__name__ for case in CASES])
     parser.add_argument("--report", type=Path)
     options = parser.parse_args()

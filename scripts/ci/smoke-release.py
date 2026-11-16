@@ -14,6 +14,7 @@ import zipfile
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 from cli_e2e import (Fixture, offline_skills, state_and_discovery, json_inputs_and_outputs,
                      session_and_restart, http_optional_session_delete)
+from platform_support import test_temp_base
 
 
 def main():
@@ -21,7 +22,10 @@ def main():
     parser.add_argument("archive", type=Path)
     parser.add_argument("version")
     options = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix="mc-release-", dir="/tmp" if sys.platform == "darwin" else None) as directory:
+    base = test_temp_base()
+    if os.name == "nt":
+        os.environ.update(TEMP=str(base), TMP=str(base))
+    with tempfile.TemporaryDirectory(prefix="mc-release-", dir=base) as directory:
         root = Path(directory)
         if options.archive.suffix == ".zip":
             with zipfile.ZipFile(options.archive) as archive:

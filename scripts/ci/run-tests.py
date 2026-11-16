@@ -17,6 +17,9 @@ import tempfile
 import time
 import zipfile
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
+from platform_support import test_temp_base
+
 
 def outside_job():
     if os.name != "nt":
@@ -64,7 +67,10 @@ def main():
     options = parser.parse_args()
     if options.assert_outside_job:
         outside_job()
+    base = test_temp_base()
     env = dict(os.environ, MCPCLI_TEST_PYTHON=sys.executable, PYTHONUTF8="1")
+    if os.name == "nt":
+        env.update(TEMP=str(base), TMP=str(base))
     print(f"platform={sys.platform}, python={sys.executable}", flush=True)
     build = run(["cargo", "test", "--locked", "--all-targets", "--no-run",
                  "--message-format=json"], options.timeout, Path("ci-build-tests.log"), env, True)
@@ -101,7 +107,7 @@ def main():
             binaries.append(Path(item["executable"]))
     assert len(binaries) == 1, f"Cargo did not identify the release binary: {binaries}"
     binary = binaries[0]
-    with tempfile.TemporaryDirectory(prefix="mc-ci-", dir="/tmp" if sys.platform == "darwin" else None) as directory:
+    with tempfile.TemporaryDirectory(prefix="mc-ci-", dir=base) as directory:
         try:
             run([sys.executable, "tests/cli_e2e.py", "--binary", str(binary.resolve()),
                  "--artifacts", directory, "--report", "ci-cli-report.json"],

@@ -9,10 +9,33 @@ import socket
 import time
 import subprocess
 import sys
+import tempfile
 import threading
 
 WINDOWS = os.name == "nt"
 LINUX = sys.platform.startswith("linux")
+
+
+def test_temp_base():
+    """Match the OS's private temp root, including SYSTEM's GetTempPath2 directory."""
+    if not WINDOWS:
+        return Path("/tmp" if sys.platform == "darwin" else tempfile.gettempdir())
+    profile = Path(os.environ["LOCALAPPDATA"])
+    profile.mkdir(parents=True, exist_ok=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    if hasattr(kernel, "GetTempPath2W"):
+        from ctypes import wintypes
+        kernel.GetTempPath2W.argtypes = [wintypes.DWORD, wintypes.LPWSTR]
+        kernel.GetTempPath2W.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = kernel.GetTempPath2W(len(buffer), buffer)
+        if not length or length >= len(buffer):
+            raise OSError(ctypes.get_last_error(), "GetTempPath2W")
+        base = Path(buffer.value)
+    else:
+        base = profile / "Temp"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def running(pid):
