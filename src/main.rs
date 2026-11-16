@@ -113,7 +113,7 @@ enum DaemonCommand {
 }
 
 struct Output {
-    value: Value,
+    value: Option<Value>,
     text: Option<String>,
     code: i32,
     diagnostic: Option<Failure>,
@@ -122,7 +122,7 @@ struct Output {
 impl Output {
     fn json(value: Value) -> Self {
         Self {
-            value,
+            value: Some(value),
             text: None,
             code: 0,
             diagnostic: None,
@@ -131,10 +131,22 @@ impl Output {
     }
     fn with_text(value: Value, text: String) -> Self {
         Self {
-            value,
+            value: Some(value),
             text: Some(text),
             code: 0,
             diagnostic: None,
+            connection: None,
+        }
+    }
+    fn failure(error: anyhow::Error) -> Self {
+        let failure = error
+            .downcast::<Failure>()
+            .unwrap_or_else(|error| Failure::new(1, "runtime", format!("{error:#}")));
+        Self {
+            value: None,
+            text: None,
+            code: failure.code,
+            diagnostic: Some(failure),
             connection: None,
         }
     }
@@ -144,8 +156,12 @@ impl Output {
     }
     fn cleanup(mut self, error: Option<Failure>) -> Self {
         if let Some(error) = error {
-            self.code = error.code;
-            self.diagnostic = Some(error);
+            if let Some(original) = &mut self.diagnostic {
+                original.message = format!("{}; additionally: {}", original.message, error.message);
+            } else {
+                self.code = error.code;
+                self.diagnostic = Some(error);
+            }
         }
         self
     }
@@ -153,6 +169,13 @@ impl Output {
 struct RemoteOutput {
     value: Value,
     connection: Option<McpConnection>,
+}
+impl RemoteOutput {
+    fn into_output(self, render: impl FnOnce(Value) -> Result<Output>) -> Output {
+        render(self.value)
+            .unwrap_or_else(Output::failure)
+            .with_connection(self.connection)
+    }
 }
 fn usage(kind: &str, error: impl std::fmt::Display) -> anyhow::Error {
     Failure::new(2, kind, error.to_string()).into()
@@ -464,16 +487,18 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 uncertain,
             )
             .await?;
-            let list = remote.value.as_array().context("invalid tool list")?;
-            let compact:Vec<_>=list.iter().map(|tool|json!({
-                "name":tool["name"],"description":brief(tool["description"].as_str().unwrap_or(""))
-            })).collect();
-            let text = list
-                .iter()
-                .map(discovery::tool_summary)
-                .collect::<Vec<_>>()
-                .join("\n");
-            Ok(Output::with_text(json!(compact), text).with_connection(remote.connection))
+            Ok(remote.into_output(|value| {
+                let list = value.as_array().context("invalid tool list")?;
+                let compact: Vec<_> = list.iter().map(|tool| json!({
+                    "name":tool["name"],"description":brief(tool["description"].as_str().unwrap_or(""))
+                })).collect();
+                let text = list
+                    .iter()
+                    .map(discovery::tool_summary)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Ok(Output::with_text(json!(compact), text))
+            }))
         }
         Command::Inspect { server, tool } => {
             let remote = remote(
@@ -485,17 +510,18 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 uncertain,
             )
             .await?;
-            let found = remote
-                .value
-                .as_array()
-                .context("invalid tool list")?
-                .iter()
-                .find(|t| t["name"].as_str() == Some(tool))
-                .ok_or_else(|| usage("unknown_tool", format!("unknown tool {tool:?}")))?;
-            Ok(
-                Output::with_text(found.clone(), discovery::render_tool(found))
-                    .with_connection(remote.connection),
-            )
+            Ok(remote.into_output(|value| {
+                let found = value
+                    .as_array()
+                    .context("invalid tool list")?
+                    .iter()
+                    .find(|t| t["name"].as_str() == Some(tool))
+                    .ok_or_else(|| usage("unknown_tool", format!("unknown tool {tool:?}")))?;
+                Ok(Output::with_text(
+                    found.clone(),
+                    discovery::render_tool(found),
+                ))
+            }))
         }
         Command::Call {
             server,
@@ -530,7 +556,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 None
             };
             Ok(Output {
-                value: remote.value,
+                value: Some(remote.value),
                 text,
                 code,
                 diagnostic: None,
@@ -639,62 +665,52 @@ async fn entry(cli: Cli) -> i32 {
         }
     };
 
-    match result {
-        Ok(mut output) => {
-            if let Some(mut connection) = output.connection.take() {
-                let cleanup = tokio::select! {
-                    biased;
-                    result = connection.close() => result.err().map(|error|
-                        Failure::new(1, "cleanup", format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation"))),
-                    interrupted = &mut signal => Some(match interrupted {
-                        Ok(code) => Failure::new(code, "cancelled", "MCP result received; connection cleanup interrupted; do not replay the operation"),
-                        Err(error) => Failure::new(1, "cleanup", format!("MCP result received; signal handling failed during cleanup: {error}")),
-                    }),
-                };
-                output = output.cleanup(cleanup);
-            }
-            if let Some(error) = &output.diagnostic {
-                let mut stderr = std::io::stderr().lock();
-                let _ = serde_json::to_writer(&mut stderr, &json!({"error":error}));
-                let _ = writeln!(stderr);
-            }
-            let mut stdout = std::io::stdout().lock();
-            let written = if cli.text {
-                let text = output
-                    .text
-                    .unwrap_or_else(|| serde_json::to_string_pretty(&output.value).unwrap());
-                let rendered = safe_text(&text);
-                if rendered.is_empty() {
-                    Ok(())
-                } else if rendered.ends_with('\n') {
-                    stdout.write_all(rendered.as_bytes())
-                } else {
-                    writeln!(stdout, "{rendered}")
-                }
-            } else {
-                serde_json::to_writer(&mut stdout, &output.value)
-                    .map_err(std::io::Error::other)
-                    .and_then(|_| writeln!(stdout))
-            };
-            if let Err(error) = written {
-                if error.kind() != std::io::ErrorKind::BrokenPipe {
-                    eprintln!("mcpcli: stdout failed: {error}");
-                }
-                1
-            } else {
-                output.code
-            }
+    let mut output = result.unwrap_or_else(Output::failure);
+    if let Some(mut connection) = output.connection.take() {
+        let cleanup = tokio::select! {
+            biased;
+            result = connection.close() => result.err().map(|error|
+                Failure::new(1, "cleanup", format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation"))),
+            interrupted = &mut signal => Some(match interrupted {
+                Ok(code) => Failure::new(code, "cancelled", "MCP result received; connection cleanup interrupted; do not replay the operation"),
+                Err(error) => Failure::new(1, "cleanup", format!("MCP result received; signal handling failed during cleanup: {error}")),
+            }),
+        };
+        output = output.cleanup(cleanup);
+    }
+    if let Some(error) = &output.diagnostic {
+        let mut stderr = std::io::stderr().lock();
+        let _ = serde_json::to_writer(&mut stderr, &json!({"error":error}));
+        let _ = writeln!(stderr);
+    }
+    let Some(value) = output.value else {
+        return output.code;
+    };
+    let mut stdout = std::io::stdout().lock();
+    let written = if cli.text {
+        let text = output
+            .text
+            .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap());
+        let rendered = safe_text(&text);
+        if rendered.is_empty() {
+            Ok(())
+        } else if rendered.ends_with('\n') {
+            stdout.write_all(rendered.as_bytes())
+        } else {
+            writeln!(stdout, "{rendered}")
         }
-        Err(error) => {
-            let failure = error
-                .downcast_ref::<Failure>()
-                .cloned()
-                .unwrap_or_else(|| Failure::new(1, "runtime", format!("{error:#}")));
-            let mut stderr = std::io::stderr().lock();
-            let _ = serde_json::to_writer(&mut stderr, &json!({"error":failure}));
-            let _ = writeln!(stderr);
-            failure.code
+    } else {
+        serde_json::to_writer(&mut stdout, &value)
+            .map_err(std::io::Error::other)
+            .and_then(|_| writeln!(stdout))
+    };
+    if let Err(error) = written {
+        if error.kind() != std::io::ErrorKind::BrokenPipe {
+            eprintln!("mcpcli: stdout failed: {error}");
         }
+        1
+    } else {
+        output.code
     }
 }
 
