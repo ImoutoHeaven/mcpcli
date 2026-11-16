@@ -117,6 +117,7 @@ struct Output {
     text: Option<String>,
     code: i32,
     diagnostic: Option<Failure>,
+    connection: Option<McpConnection>,
 }
 impl Output {
     fn json(value: Value) -> Self {
@@ -125,6 +126,7 @@ impl Output {
             text: None,
             code: 0,
             diagnostic: None,
+            connection: None,
         }
     }
     fn with_text(value: Value, text: String) -> Self {
@@ -133,7 +135,12 @@ impl Output {
             text: Some(text),
             code: 0,
             diagnostic: None,
+            connection: None,
         }
+    }
+    fn with_connection(mut self, connection: Option<McpConnection>) -> Self {
+        self.connection = connection;
+        self
     }
     fn cleanup(mut self, error: Option<Failure>) -> Self {
         if let Some(error) = error {
@@ -145,7 +152,7 @@ impl Output {
 }
 struct RemoteOutput {
     value: Value,
-    cleanup: Option<Failure>,
+    connection: Option<McpConnection>,
 }
 fn usage(kind: &str, error: impl std::fmt::Display) -> anyhow::Error {
     Failure::new(2, kind, error.to_string()).into()
@@ -280,16 +287,22 @@ async fn remote(
             .map_err(|error| {
                 anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
             });
-            let cleanup=connection.close().await.err().map(|error|
-                Failure::new(1,"cleanup",format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation")));
             match result {
-                Ok(value) => Ok(RemoteOutput { value, cleanup }),
+                Ok(value) => {
+                    uncertain.store(false, Ordering::Release);
+                    Ok(RemoteOutput {
+                        value,
+                        connection: Some(connection),
+                    })
+                }
                 Err(mut error) => {
-                    if let Some(cleanup) = cleanup
+                    if let Err(cleanup) = connection.close().await
                         && let Some(failure) = error.downcast_mut::<Failure>()
                     {
-                        failure.message =
-                            format!("{}; additionally: {}", failure.message, cleanup.message);
+                        failure.message = format!(
+                            "{}; additionally: connection cleanup failed: {cleanup}",
+                            failure.message
+                        );
                     }
                     Err(error)
                 }
@@ -320,7 +333,7 @@ async fn remote(
             .await?;
             Ok(RemoteOutput {
                 value: response.result.context("daemon did not return a result")?,
-                cleanup: None,
+                connection: None,
             })
         }
     };
@@ -460,7 +473,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 .map(discovery::tool_summary)
                 .collect::<Vec<_>>()
                 .join("\n");
-            Ok(Output::with_text(json!(compact), text).cleanup(remote.cleanup))
+            Ok(Output::with_text(json!(compact), text).with_connection(remote.connection))
         }
         Command::Inspect { server, tool } => {
             let remote = remote(
@@ -481,7 +494,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 .ok_or_else(|| usage("unknown_tool", format!("unknown tool {tool:?}")))?;
             Ok(
                 Output::with_text(found.clone(), discovery::render_tool(found))
-                    .cleanup(remote.cleanup),
+                    .with_connection(remote.connection),
             )
         }
         Command::Call {
@@ -521,8 +534,9 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 text,
                 code,
                 diagnostic: None,
+                connection: None,
             }
-            .cleanup(remote.cleanup))
+            .with_connection(remote.connection))
         }
         Command::Reset { server, force } => {
             let remote = remote(
@@ -538,7 +552,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             if let Some(warning) = remote.value.get("cleanup_warning").and_then(Value::as_str) {
                 eprintln!("mcpcli: {}", safe_text(warning));
             }
-            Ok(Output::json(remote.value).cleanup(remote.cleanup))
+            Ok(Output::json(remote.value).with_connection(remote.connection))
         }
         Command::Skills { command } => {
             let catalog = skills::discover(&loaded.config.skills)
@@ -608,12 +622,15 @@ async fn entry(cli: Cli) -> i32 {
         }
     );
     let uncertain = AtomicBool::new(false);
+    let signal = mcpcli::platform::interrupted();
+    tokio::pin!(signal);
     let result = if foreground {
         run(&cli, &uncertain).await
     } else {
         tokio::select! {
+            biased;
             result = run(&cli, &uncertain) => result,
-            signal = mcpcli::platform::interrupted() => match signal {
+            signal = &mut signal => match signal {
                 Ok(code) => Err(Failure::new(code, "cancelled", "interrupted; cancellation is not rollback")
                     .uncertain(uncertain.load(Ordering::Acquire))
                     .into()),
@@ -623,7 +640,19 @@ async fn entry(cli: Cli) -> i32 {
     };
 
     match result {
-        Ok(output) => {
+        Ok(mut output) => {
+            if let Some(mut connection) = output.connection.take() {
+                let cleanup = tokio::select! {
+                    biased;
+                    result = connection.close() => result.err().map(|error|
+                        Failure::new(1, "cleanup", format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation"))),
+                    interrupted = &mut signal => Some(match interrupted {
+                        Ok(code) => Failure::new(code, "cancelled", "MCP result received; connection cleanup interrupted; do not replay the operation"),
+                        Err(error) => Failure::new(1, "cleanup", format!("MCP result received; signal handling failed during cleanup: {error}")),
+                    }),
+                };
+                output = output.cleanup(cleanup);
+            }
             if let Some(error) = &output.diagnostic {
                 let mut stderr = std::io::stderr().lock();
                 let _ = serde_json::to_writer(&mut stderr, &json!({"error":error}));
