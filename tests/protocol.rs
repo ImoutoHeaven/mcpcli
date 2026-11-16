@@ -15,6 +15,11 @@ use tempfile::TempDir;
 
 const BUDGET: Duration = Duration::from_secs(5);
 
+fn python() -> String {
+    std::env::var("MCPCLI_TEST_PYTHON")
+        .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into())
+}
+
 struct Fixture {
     dir: TempDir,
     http: Option<Child>,
@@ -51,7 +56,7 @@ impl Fixture {
     }
     fn stdio(&self, modern: bool, mode: &str) -> ServerConfig {
         ServerConfig::Stdio {
-            command: "python3".into(),
+            command: python(),
             args: self.args(modern, mode),
             env: BTreeMap::new(),
             cwd: None,
@@ -59,7 +64,7 @@ impl Fixture {
         }
     }
     fn http(&mut self, modern: bool, mode: &str) -> ServerConfig {
-        let mut child = Command::new("python3")
+        let mut child = Command::new(python())
             .args(self.args(modern, mode))
             .arg("--http")
             .stdin(Stdio::null())
@@ -129,13 +134,19 @@ async fn wait_until(mut predicate: impl FnMut() -> bool) {
 }
 
 fn running(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .ok()
-        .and_then(|s| {
-            s.rsplit_once(") ")
-                .map(|(_, fields)| !fields.starts_with('Z'))
-        })
-        .unwrap_or(false)
+    let status = Command::new(python())
+        .arg(format!(
+            "{}/tests/platform_support.py",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .args(["--running", &pid.to_string()])
+        .status()
+        .expect("run native process inspection");
+    match status.code() {
+        Some(0) => true,
+        Some(1) => false,
+        other => panic!("process inspection failed: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -162,6 +173,7 @@ async fn stdio_negotiates_both_eras_and_preserves_application_state() {
         assert_eq!(fixture.count("initialize"), usize::from(!modern));
         assert_eq!(fixture.count("server/discover"), 1);
         let pid = fixture.pid();
+        assert!(running(pid), "process observer did not see live fixture");
         connection.close().await.unwrap();
         wait_until(|| !running(pid)).await;
     }
@@ -534,5 +546,46 @@ async fn expired_or_unsupported_remote_delete_allows_local_close() {
         assert!(connection.is_closed());
         connection.close().await.unwrap();
         assert_eq!(fixture.count("DELETE"), 1);
+    }
+}
+
+#[tokio::test]
+async fn get_sse_responses_validate_exact_media_types_and_bound_events() {
+    for mode in ["get_sse", "get_sse_mixed"] {
+        let mut fixture = Fixture::new();
+        let config = fixture.http(false, mode);
+        let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
+        let result = connection.call("get", Map::new(), BUDGET).await.unwrap();
+        assert_eq!(result["structuredContent"]["name"], "get", "{mode}");
+        assert!(fixture.count("GET") > 0, "fixture never exercised GET SSE");
+        connection.close().await.unwrap();
+    }
+    for mode in [
+        "get_sse_invalid",
+        "get_sse_oversize",
+        "get_auth_401",
+        "get_auth_403",
+    ] {
+        let mut fixture = Fixture::new();
+        let mut config = fixture.http(false, mode);
+        if let ServerConfig::Http { url, .. } = &mut config {
+            url.push_str("?token=secret-query-do-not-print");
+        }
+        let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
+        let error = connection
+            .call("get", Map::new(), Duration::from_millis(800))
+            .await
+            .expect_err("invalid or oversized GET stream must not deliver a result");
+        assert!(
+            !format!("{error:?}").contains("secret"),
+            "{mode}: {error:?}"
+        );
+        assert!(fixture.count("GET") > 0, "fixture never exercised GET SSE");
+        assert_eq!(
+            fixture.count("tools/call"),
+            1,
+            "{mode}: tool call was replayed"
+        );
+        connection.close().await.unwrap();
     }
 }

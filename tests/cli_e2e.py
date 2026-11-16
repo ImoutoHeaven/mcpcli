@@ -7,8 +7,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import select
 import signal
+import socket
 import shutil
 import subprocess
 import sys
@@ -16,6 +16,12 @@ import tempfile
 import threading
 import time
 import traceback
+
+from platform_support import IdleConnection, LINUX, WINDOWS, kill_owned, readline_with_timeout, running
+
+
+class CaseSkipped(Exception):
+    """An OS-specific check is recorded separately from a passing test."""
 
 
 def wait_for(predicate, message, seconds=5):
@@ -26,13 +32,6 @@ def wait_for(predicate, message, seconds=5):
             return value
         time.sleep(0.02)
     raise AssertionError(message)
-
-
-def running(pid):
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0] != "Z"
-    except (OSError, IndexError):
-        return False
 
 
 def error_value(result):
@@ -72,7 +71,10 @@ class Fixture:
         self.sessions = set()
         self.processes = []
         self.http_servers = []
-        self.env = dict(os.environ, MCPCLI_RUNTIME_DIR=str(self.runtime), TMPDIR=str(self.root))
+        self.env = dict(os.environ, MCPCLI_RUNTIME_DIR=str(self.runtime), TMPDIR=str(self.root),
+                        PYTHONUTF8="1")
+        self.env.pop("MCPCLI_CONFIG", None)
+        self.env.pop("MCPCLI_SESSION", None)
         self.script = Path(__file__).resolve().parent / "fixtures" / "cli_server.py"
         self.skill = self.root / "skills" / "ops"
         (self.skill / "references").mkdir(parents=True)
@@ -99,8 +101,7 @@ class Fixture:
                                     "--log", str(log)], env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.http_servers.append(process)
-        assert select.select([process.stdout], [], [], 5)[0], "HTTP fixture did not become ready"
-        port = int(process.stdout.readline())
+        port = int(readline_with_timeout(process.stdout, 5))
         self.settings["servers"] = {"state": {
             "transport": "http", "url": f"http://127.0.0.1:{port}/mcp",
         }}
@@ -115,7 +116,7 @@ class Fixture:
     def invoke(self, *args, code=0, session="default", timeout=10, input_text=None, wall_timeout=40):
         command = self.command(*args, session=session, timeout=timeout)
         options = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
-        result = subprocess.run(command, env=self.env, text=True, capture_output=True,
+        result = subprocess.run(command, env=self.env, text=True, encoding="utf-8", capture_output=True,
                                 timeout=wall_timeout, **options)
         assert result.returncode == code, (
             f"{command!r}: expected exit {code}, got {result.returncode}\n"
@@ -143,7 +144,8 @@ class Fixture:
     def start(self, *args, session="default", timeout=10, open_stdin=False):
         process = subprocess.Popen(self.command(*args, session=session, timeout=timeout), env=self.env,
             stdin=subprocess.PIPE if open_stdin else subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0)
         self.processes.append(process)
         return process
 
@@ -189,12 +191,9 @@ class Fixture:
         owned.extend((entry["child_pid"], str(self.log)) for entry in self.events("child"))
         for pid, marker in owned:
             try:
-                command = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-                if marker.encode() not in command:
-                    continue
-                os.kill(pid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
+                kill_owned(pid, marker)
+            except (OSError, subprocess.SubprocessError) as error:
+                failures.append(f"emergency cleanup PID {pid}: {error}")
         for process in self.http_servers:
             if process.poll() is None:
                 process.terminate()
@@ -209,7 +208,7 @@ class Fixture:
 def offline_skills(f):
     for option in ("--help", "--version"):
         process = subprocess.run([str(f.binary), "--config", str(f.root / "missing.json"), option],
-                                 env=f.env, text=True, capture_output=True, timeout=3)
+                                 env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=3)
         assert process.returncode == 0
     catalog = f.value("catalog")
     assert [s["name"] for s in catalog["servers"]] == ["state"]
@@ -220,7 +219,7 @@ def offline_skills(f):
     assert f.value("search", "absent")["skills"] == []
     assert f.value("skills", "list")["skills"][0]["description"].endswith("preserve sessions.")
     shown = f.value("skills", "show", "ops")
-    assert shown["root"] == str(f.skill) and "# Operations" in shown["content"]
+    assert Path(shown["root"]).samefile(f.skill) and "# Operations" in shown["content"]
     assert f.value("skills", "files", "ops")["files"] == ["references/guide.md"]
     assert f.value("skills", "read", "ops", "references/guide.md")["content"] == "Keep the session open.\n"
     assert f.fail("skills", "read", "ops", "../mcpcli.json")["kind"] == "skill_read"
@@ -339,8 +338,13 @@ def simultaneous_startup(f):
     socket_path = f.runtime / status["namespace"] / "sock"
     queued = [f.start("call", "slow", "wait", "--args", '{"seconds":30}', timeout=40)
               for _ in range(8)]
-    wait_for(lambda: connected_data_sockets(status["pid"], socket_path) >= 8,
-             "slow server queue did not fill", seconds=8)
+    wait_for(lambda: f.events("waiting"), "slow server did not start waiting", seconds=8)
+    if LINUX:
+        wait_for(lambda: connected_data_sockets(status["pid"], socket_path) >= 8,
+                 "slow server queue did not fill", seconds=8)
+    else:
+        time.sleep(1)
+        assert all(process.poll() is None for process in queued), "queued client exited early"
     started = time.monotonic()
     result = f.value("call", "fast", "get", timeout=2, wall_timeout=4)["structuredContent"]
     assert result["pid"] == fast["pid"]
@@ -382,9 +386,13 @@ def interrupted_stdin(f):
         except (OSError, StopIteration):
             return False
 
-    wait_for(listening_for_sigint, "CLI did not register interruption handling")
-    process.send_signal(signal.SIGINT)
-    assert process.wait(timeout=5) == 130, "reading incomplete stdin ignored Ctrl-C"
+    if LINUX:
+        wait_for(listening_for_sigint, "CLI did not register interruption handling")
+    else:
+        time.sleep(1)
+        assert process.poll() is None, "stdin reader exited before interruption"
+    process.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+    assert process.wait(timeout=5) == (143 if WINDOWS else 130), "stdin ignored interruption"
     stdout, stderr = process.communicate()
     parsed_error = json.loads(stderr)["error"]
     assert not stdout and parsed_error["kind"] == "cancelled"
@@ -419,7 +427,8 @@ def configuration_errors_redact_values(f):
 
 
 def oneshot_signals_clean_process_group(f):
-    for signum, expected in ((signal.SIGINT, 130), (signal.SIGTERM, 143)):
+    signals = [(signal.CTRL_BREAK_EVENT, 143)] if WINDOWS else [(signal.SIGINT, 130), (signal.SIGTERM, 143)]
+    for signum, expected in signals:
         previous = len(f.events("child"))
         process = f.start("--oneshot", "call", "state", "spawn_wait", "--args",
                           '{"seconds":30}', timeout=40)
@@ -440,8 +449,13 @@ def saturated_control_channel(f):
     socket_path = f.runtime / status["namespace"] / "sock"
     processes = [f.start("call", "state", "wait", "--args", '{"seconds":30}', timeout=40)
                  for _ in range(32)]
-    wait_for(lambda: connected_data_sockets(status["pid"], socket_path) >= 32,
-             "32 outstanding CLI calls never filled data admission", seconds=12)
+    wait_for(lambda: f.events("waiting"), "server never started the pending call", seconds=12)
+    if LINUX:
+        wait_for(lambda: connected_data_sockets(status["pid"], socket_path) >= 32,
+                 "32 outstanding CLI calls never filled data admission", seconds=12)
+    else:
+        time.sleep(1)
+        assert all(process.poll() is None for process in processes), "saturated client exited early"
     started = time.monotonic()
     assert f.value("daemon", "status", wall_timeout=4)["running"] is True
     assert time.monotonic() - started < 3, "status was blocked by data saturation"
@@ -457,7 +471,7 @@ def saturated_control_channel(f):
 def unclean_stop_requires_explicit_recovery(f):
     status = f.value("daemon", "start")
     assert not f.events("start"), "daemon start eagerly spawned the server"
-    os.kill(status["pid"], signal.SIGKILL)
+    os.kill(status["pid"], signal.SIGTERM if WINDOWS else signal.SIGKILL)
     wait_for(lambda: not running(status["pid"]), "daemon did not exit after SIGKILL")
     assert f.fail("call", "state", "get", code=6)["kind"] == "state_lost"
     assert not f.events("start"), "implicit recovery spawned an MCP process"
@@ -531,6 +545,22 @@ def http_delete_timeout_is_reported(f):
     http_cleanup_failure(f, "delete_hang")
 
 
+
+def interrupt_after_result_preserves_known_outcome(f):
+    log = f.use_http("delete_hang")
+    process = f.start("--oneshot", "call", "state", "get", timeout=20)
+    wait_for(lambda: log.exists() and "DELETE" in log.read_text().splitlines(),
+             "tool result did not enter remote cleanup", seconds=8)
+    process.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+    stdout, stderr = process.communicate(timeout=6)
+    assert process.returncode == (143 if WINDOWS else 130), (process.returncode, stderr)
+    assert json.loads(stdout)["structuredContent"] == {"name": "get"}, stdout
+    failure = json.loads(stderr)["error"]
+    assert failure["kind"] == "cancelled", failure
+    assert not failure.get("outcome_unknown", False), "known result became an uncertain call"
+    assert log.read_text().splitlines().count("tools/call") == 1
+
+
 def http_optional_session_delete(f):
     for mode in ("delete_expired", "delete_unsupported"):
         log = f.use_http(mode)
@@ -541,7 +571,7 @@ def http_optional_session_delete(f):
     assert not f.runtime.exists()
 
 
-def burst_admission_and_prewrite_certainty(f):
+def burst_admission(f):
     f.call("get")
     barrier = threading.Barrier(40)
 
@@ -553,6 +583,34 @@ def burst_admission_and_prewrite_certainty(f):
         counters = list(pool.map(increment, range(40)))
     assert sorted(counters) == list(range(1, 41)), "connections past 32 were dropped instead of queued"
 
+
+
+
+def admission_uses_original_deadline(f):
+    f.call("get")
+    status = f.value("daemon", "status")
+    endpoint = status.get("endpoint", str(f.runtime / status["namespace"] / "sock"))
+    held = []
+    try:
+        for _ in range(32):
+            held.append(IdleConnection(endpoint))
+        started = time.monotonic()
+        failed = f.fail("call", "state", "increment", timeout=1, code=5, wall_timeout=3)
+        assert failed["kind"] == "timeout", failed
+        assert time.monotonic() - started < 2.5, "admission renewed the expired request budget"
+        assert not f.events("call", tool="increment"), "queued request executed after its deadline"
+    finally:
+        for connection in held:
+            connection.close()
+    # Let the daemon accept any queued connection; a stale frame must still never execute.
+    assert f.call("get")["structuredContent"]["state"] == {}
+    assert not f.events("call", tool="increment"), "expired request executed after admission reopened"
+
+
+def insecure_unix_endpoint_rejected_before_write(f):
+    if WINDOWS:
+        raise CaseSkipped("Unix socket modes; Windows named-pipe DACL checks run in platform unit tests")
+    f.call("set", {"counter": 40})
     status = f.value("daemon", "status")
     socket_path = f.runtime / status["namespace"] / "sock"
     socket_path.chmod(0o666)
@@ -582,9 +640,13 @@ def text_mode_crlf_and_empty_outputs(f):
 
 
 def unprivileged_execute_only_ancestors(f):
+    if WINDOWS:
+        raise CaseSkipped("execute-only Unix directory permissions; Windows reparse/DACL tests run separately")
     if os.geteuid() != 0:
-        return
-    outer = Path(tempfile.mkdtemp(prefix="mcpcli-0711-"))
+        if os.environ.get("MCPCLI_REQUIRE_ROOT_TEST") == "1":
+            raise AssertionError("root permission test was required but this process is not root")
+        raise CaseSkipped("requires root; enforced by Linux container and FreeBSD CI lanes")
+    outer = Path(tempfile.mkdtemp(prefix="mcpcli-0711-", dir="/var/tmp"))
     try:
         outer.chmod(0o711)
         restricted = outer / "home"
@@ -612,7 +674,7 @@ def unprivileged_execute_only_ancestors(f):
                     ["skills", "files", "ops"], ["skills", "read", "ops", "references/doc.md"]):
             res = subprocess.run(
                 [str(user_bin), "--config", str(cfg), *cmd],
-                env=env, cwd=user_dir, text=True, capture_output=True, timeout=10,
+                env=env, cwd=user_dir, text=True, encoding="utf-8", capture_output=True, timeout=10,
                 user=65534, group=65534,
             )
             assert res.returncode == 0, f"{cmd} failed under 0711 ancestor: {res.stderr}"
@@ -627,7 +689,8 @@ CASES = [
     oneshot_signals_clean_process_group, saturated_control_channel,
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
-    burst_admission_and_prewrite_certainty, text_mode_crlf_and_empty_outputs,
+    interrupt_after_result_preserves_known_outcome,
+    burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
     unprivileged_execute_only_ancestors,
 ]
 
@@ -635,14 +698,14 @@ CASES = [
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=Path)
-    parser.add_argument("--artifacts", type=Path, default=Path(tempfile.gettempdir()) / "mcpcli-e2e")
+    parser.add_argument("--artifacts", type=Path, default=Path("/tmp" if sys.platform == "darwin" else tempfile.gettempdir()) / "mcpcli-e2e")
     parser.add_argument("--case", action="append", choices=[case.__name__ for case in CASES])
     parser.add_argument("--report", type=Path)
     options = parser.parse_args()
     source_binary = options.binary.resolve(strict=True)
     options.artifacts.mkdir(parents=True, exist_ok=True)
     snapshot = Path(tempfile.mkdtemp(prefix="binary-", dir=options.artifacts))
-    binary = snapshot / "mcpcli"
+    binary = snapshot / ("mcpcli.exe" if WINDOWS else "mcpcli")
     shutil.copy2(source_binary, binary)
     binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
     outcomes = []
@@ -655,6 +718,9 @@ def main():
         try:
             case(fixture)
             outcome["passed"] = True
+        except CaseSkipped as error:
+            outcome["passed"] = False
+            outcome["skipped"] = str(error)
         except Exception:
             outcome["passed"] = False
             outcome["error"] = traceback.format_exc()
@@ -663,7 +729,9 @@ def main():
         if cleanup_failures:
             outcome["passed"] = False
             outcome["error"] = outcome.get("error", "") + "\n".join(cleanup_failures)
-        if outcome["passed"]:
+        if outcome.get("skipped"):
+            print(f"SKIP {case.__name__}: {outcome['skipped']}", flush=True)
+        elif outcome["passed"]:
             print(f"PASS {case.__name__}", flush=True)
         else:
             print(f"FAIL {case.__name__}\n{outcome['error']}", flush=True)
@@ -671,12 +739,14 @@ def main():
         outcomes.append(outcome)
     report = {"passed": sum(case["passed"] for case in outcomes), "total": len(outcomes),
               "source_binary": str(source_binary), "binary": str(binary),
-              "sha256": binary_hash, "cases": outcomes}
+              "sha256": binary_hash, "cases": outcomes,
+              "skipped": sum("skipped" in case for case in outcomes)}
     if options.report:
         options.report.parent.mkdir(parents=True, exist_ok=True)
         options.report.write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"passed": report["passed"], "total": report["total"]}), flush=True)
-    return 0 if report["passed"] == report["total"] else 1
+    print(json.dumps({"passed": report["passed"], "skipped": report["skipped"],
+                      "total": report["total"]}), flush=True)
+    return 0 if report["passed"] + report["skipped"] == report["total"] else 1
 
 
 if __name__ == "__main__":

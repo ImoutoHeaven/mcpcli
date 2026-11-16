@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -18,6 +19,7 @@ args = parser.parse_args()
 write_lock = threading.Lock()
 state = {}
 unlocked = False
+get_replies = queue.Queue()
 
 
 def record(value):
@@ -84,7 +86,7 @@ def dispatch(request):
         name = request["params"]["name"]
         values = request["params"].get("arguments", {})
         if name == "spawn_child":
-            descendant = subprocess.Popen(["sleep", "60"])
+            descendant = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
             record("desc:" + str(descendant.pid))
         if name == "die":
             os._exit(7)
@@ -129,13 +131,34 @@ if args.http:
             self.end_headers()
 
         def do_GET(self):
-            if args.mode == "get_auth_leak":
-                record("GET")
-                self.send_response(401)
+            record("GET")
+            if args.mode in ("get_auth_leak", "get_auth_401", "get_auth_403"):
+                self.send_response(403 if args.mode == "get_auth_403" else 401)
                 self.send_header("WWW-Authenticate", 'Bearer realm="secret-www-auth-do-not-print"')
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
+            if args.mode in ("get_sse", "get_sse_mixed", "get_sse_invalid", "get_sse_oversize"):
+                self.send_response(200)
+                content_type = {
+                    "get_sse_mixed": "TEXT/EVENT-STREAM; charset=UTF-8",
+                    "get_sse_invalid": "text/event-stream-INVALID; secret=do-not-print",
+                }.get(args.mode, "text/event-stream")
+                self.send_header("Content-Type", content_type)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                try:
+                    while True:
+                        response = get_replies.get(timeout=10)
+                        body = b"data: " + json.dumps(response, separators=(",", ":")).encode() + b"\n\n"
+                        if args.mode == "get_sse_oversize":
+                            body = b"data: " + b"x" * (16 * 1024 * 1024 + 1) + b"\n\n"
+                        for offset in range(0, len(body), 16384):
+                            chunk = body[offset:offset + 16384]
+                            self.wfile.write(("%x\r\n" % len(chunk)).encode() + chunk + b"\r\n")
+                            self.wfile.flush()
+                except (queue.Empty, BrokenPipeError, ConnectionResetError):
+                    return
             self.empty(405)
 
         def do_DELETE(self):
@@ -165,6 +188,12 @@ if args.http:
                 record("param-region:" + self.headers.get("Mcp-Param-Region", "MISSING"))
                 record("method-header:" + self.headers.get("Mcp-Method", "MISSING"))
             response = dispatch(request)
+            if request.get("method") == "tools/call" and args.mode in (
+                    "get_sse", "get_sse_mixed", "get_sse_invalid", "get_sse_oversize",
+                    "get_auth_401", "get_auth_403"):
+                get_replies.put(response)
+                self.empty(202)
+                return
             if response is None:
                 self.empty(202)
                 return
