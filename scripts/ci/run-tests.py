@@ -38,11 +38,23 @@ def outside_job():
 def run(command, timeout, log, env, capture=False):
     print("$ " + subprocess.list2cmdline(command), flush=True)
     started = time.monotonic()
-    with log.open("w", encoding="utf-8") as output:
+    with log.open("w", encoding="utf-8") as output, log.open("r", encoding="utf-8", errors="replace") as progress:
         child = subprocess.Popen(command, env=env, stdout=output, stderr=subprocess.STDOUT,
                                  start_new_session=os.name != "nt")
         try:
-            code = child.wait(timeout=timeout)
+            while True:
+                remaining = max(0, started + timeout - time.monotonic())
+                try:
+                    code = child.wait(timeout=min(1, remaining))
+                except subprocess.TimeoutExpired:
+                    if not capture:
+                        print(progress.read(), end="", flush=True)
+                    if time.monotonic() >= started + timeout:
+                        raise
+                else:
+                    if not capture:
+                        print(progress.read(), end="", flush=True)
+                    break
         except subprocess.TimeoutExpired:
             if os.name == "nt":
                 subprocess.run(["taskkill", "/F", "/T", "/PID", str(child.pid)],
@@ -52,7 +64,7 @@ def run(command, timeout, log, env, capture=False):
             child.wait(timeout=30)
             raise AssertionError(f"command exceeded {timeout}s: {command}")
     text = log.read_text(encoding="utf-8", errors="replace")
-    if not capture or code:
+    if capture and code:
         print(text, end="", flush=True)
     print(f"exit {code} after {time.monotonic() - started:.1f}s", flush=True)
     if code:

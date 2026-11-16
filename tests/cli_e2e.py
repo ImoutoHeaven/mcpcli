@@ -115,9 +115,22 @@ class Fixture:
 
     def invoke(self, *args, code=0, session="default", timeout=10, input_text=None, wall_timeout=40):
         command = self.command(*args, session=session, timeout=timeout)
-        options = {"input": input_text} if input_text is not None else {"stdin": subprocess.DEVNULL}
-        result = subprocess.run(command, env=self.env, text=True, encoding="utf-8", capture_output=True,
-                                timeout=wall_timeout, **options)
+        process = subprocess.Popen(command, env=self.env, text=True, encoding="utf-8",
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = process.communicate(input=input_text, timeout=wall_timeout)
+        except subprocess.TimeoutExpired:
+            # A detached daemon retaining these pipes must fail without trapping the test runner.
+            self.processes.append(process)
+            if process.poll() is None:
+                process.kill()
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass  # cleanup stops the daemon before draining the retained pipes again.
+            raise
+        result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
         assert result.returncode == code, (
             f"{command!r}: expected exit {code}, got {result.returncode}\n"
             f"stdout={result.stdout}\nstderr={result.stderr}")
@@ -175,10 +188,6 @@ class Fixture:
         for process in self.processes:
             if process.poll() is None:
                 process.kill()
-            try:
-                process.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
         if self.runtime.exists():
             for session in sorted(self.sessions):
                 try:
@@ -200,6 +209,11 @@ class Fixture:
                 kill_owned(pid, marker)
             except (OSError, subprocess.SubprocessError) as error:
                 failures.append(f"emergency cleanup PID {pid}: {error}")
+        for process in self.processes:
+            try:
+                process.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                failures.append(f"captured pipes still open after daemon cleanup for PID {process.pid}")
         for process in self.http_servers:
             if process.poll() is None:
                 process.terminate()
@@ -757,6 +771,7 @@ def main():
         started = time.monotonic()
         outcome = {"case": case.__name__, "artifacts": str(fixture.root)}
         try:
+            print(f"START {case.__name__}", flush=True)
             case(fixture)
             outcome["passed"] = True
         except CaseSkipped as error:

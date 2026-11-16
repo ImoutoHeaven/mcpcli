@@ -74,6 +74,7 @@ def main():
                      session_and_restart, http_optional_session_delete]:
             fixture = Fixture(binary, root, case.__name__)
             try:
+                print("START " + case.__name__, flush=True)
                 case(fixture)
             finally:
                 errors = fixture.cleanup()
