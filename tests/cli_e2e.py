@@ -552,6 +552,40 @@ def http_delete_timeout_is_reported(f):
 
 
 
+
+def oneshot_unknown_inspect_closes_session(f):
+    for mode in ("normal", "delete_hang"):
+        log = f.use_http(mode)
+        started = time.monotonic()
+        result = f.invoke("--oneshot", "inspect", "state", "nonexistent", code=2, wall_timeout=6)
+        elapsed = time.monotonic() - started
+        failure = error_value(result)
+        assert not result.stdout and failure["kind"] == "unknown_tool", (result.stdout, failure)
+        assert not failure.get("outcome_unknown", False), failure
+        assert log.read_text().splitlines().count("DELETE") == 1, "inspect exited before cleanup"
+        assert log.read_text().splitlines().count("tools/call") == 0
+        if mode == "delete_hang":
+            assert 1 <= elapsed < 5, f"cleanup did not respect its bounded wait: {elapsed}"
+            assert "cleanup" in failure["message"].lower(), failure
+
+
+def oneshot_unknown_inspect_signal_preserves_error(f):
+    log = f.use_http("delete_hang")
+    process = f.start("--oneshot", "inspect", "state", "nonexistent", timeout=20,
+                      signal_console=True)
+    wait_for(lambda: log.exists() and "DELETE" in log.read_text().splitlines(),
+             "unknown inspect did not enter cleanup", seconds=8)
+    interrupt(process, signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+    stdout, stderr = process.communicate(timeout=6)
+    assert process.returncode == 2, (process.returncode, stdout, stderr)
+    failure = json.loads(stderr)["error"]
+    assert not stdout and failure["kind"] == "unknown_tool", (stdout, failure)
+    assert not failure.get("outcome_unknown", False), failure
+    assert "cleanup" in failure["message"].lower(), failure
+    assert log.read_text().splitlines().count("DELETE") == 1
+    assert log.read_text().splitlines().count("tools/call") == 0
+
+
 def interrupt_after_result_preserves_known_outcome(f):
     log = f.use_http("delete_hang")
     process = f.start("--oneshot", "call", "state", "get", timeout=20, signal_console=True)
@@ -695,7 +729,8 @@ CASES = [
     oneshot_signals_clean_process_group, saturated_control_channel,
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
-    interrupt_after_result_preserves_known_outcome,
+    interrupt_after_result_preserves_known_outcome, oneshot_unknown_inspect_closes_session,
+    oneshot_unknown_inspect_signal_preserves_error,
     burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
     unprivileged_execute_only_ancestors,
 ]
