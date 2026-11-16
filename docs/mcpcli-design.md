@@ -148,8 +148,9 @@ Windows creates protected DACLs granting access to the current user. Validation
 also trusts SYSTEM, Administrators and the Windows servicing account when
 checking existing ancestors. Existing files/directories must have the expected
 ownership and access grants. Reparse points, alternate data streams and hard-linked private
-files are rejected. Directory handles prevent replacement while protected file
-operations are in progress.
+files are rejected. Ancestor grants that permit directory replacement or in-place
+junction conversion are refused. Directory handles prevent replacement while protected
+file operations are in progress.
 
 A hash of the canonical config path and session name creates the namespace.
 Every request carries IPC version 2, namespace, executable SHA-256,
@@ -244,6 +245,10 @@ unexpected parent death. macOS relies on pipe closure and orderly cleanup.
 This is cleanup for trusted process groups, not containment of descendants
 that deliberately escape through setsid or another supervisor.
 
+At startup on Windows, the CLI clears inheritance on its incoming standard handles,
+so detached daemons cannot keep a caller's captured output pipes open. Explicit child
+stdio is still duplicated and inherited for that child.
+
 Windows creates stdio children suspended, assigns them to a kill-on-close Job,
 verifies opened thread ownership, and then resumes them. Cleanup terminates the
 Job and waits for both the child and the Job's active process count. A daemon
@@ -331,10 +336,11 @@ Unix resource access walks intermediate directory components with openat using
 O_PATH (Linux) or O_SEARCH (FreeBSD/macOS), plus O_NOFOLLOW and O_DIRECTORY.
 This permits traversal beneath execute-only ancestors. Final reads use O_RDONLY,
 O_NOFOLLOW and O_NONBLOCK; directory enumeration uses the open descriptor through
-fdopendir/readdir. Windows checks every component for reparse points and keeps
-directory handles open without delete sharing while enumerating or opening a
-resource. Absolute paths, traversal, symlinks/reparse points, alternate data
-streams, special files, excessive directory depth, and binary/non-UTF-8 resources
+fdopendir/readdir. Windows resolves each component with NtCreateFile relative to a
+pinned parent directory handle and refuses reparse points. It enumerates the live
+directory handle with GetFileInformationByHandleEx; an in-place junction conversion
+cannot redirect the next open or enumeration through the old pathname. Absolute paths,
+traversal, symlinks/reparse points, alternate data streams, special files, excessive directory depth, and binary/non-UTF-8 resources
 are rejected. Discovery pins the configured directory before canonicalizing it
 and verifies that the resolved directory has the same native identity. Trailing
 separators and `/.` cannot hide a symlink leaf. Existing ancestor aliases may

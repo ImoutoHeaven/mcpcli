@@ -54,7 +54,7 @@ try {
             $lastStatus = $now
         }
         $ran = (Test-Path $log) -or $info.LastRunTime -ge $started.AddSeconds(-2)
-        if ($ran -and $state -notin @('Running', 'Queued') -and -not (Test-Path $done)) {
+        if ($elapsed -gt 10 -and $ran -and $state -notin @('Running', 'Queued') -and -not (Test-Path $done)) {
             throw "test task stopped without an exit-code file: State=$state LastTaskResult=$result"
         }
         if ($elapsed -gt 60 -and -not (Test-Path $log)) {

@@ -1,6 +1,6 @@
 # mcpcli 0.1.0 工作进度
 
-更新时间：2026-11-16 18:14（Asia/Shanghai）
+更新时间：2026-11-16 18:27（Asia/Shanghai）
 
 ## 目标与发布门禁
 
@@ -35,16 +35,13 @@
 
 ## 当前集成与 CI
 
-- C2 冻结提交：`cf62d0ff93ee3117a00fb4e1c48c336d42f4e964`，tree `d9f25083d23caba46dc0490eecb37f81d2f533ef`。
-- 主代理和 reviewer 均独立通过 fmt、Clippy、45 单元 + 19 协议测试、release CLI E2E 23/23；reviewer 的技能目录竞态及尾缀链接外部复现已确认 fail closed。
-- C2 CI：[`43845012976`](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43845012976)；发版预演：[`43845013015`](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43845013015)。仍在采集 Windows 两架构及原生 ACL 证据。
-- 首轮 CI 已验证 Ubuntu、Alpine 两架构、Debian 两架构、FreeBSD 和真实 fastexec+Playwright 套件；Windows 测试环境问题已修复后进入 C2。macOS 揭示测试 HTTPServer 的反向 DNS 查询会阻塞启动，已改为纯回环绑定。
-- C2 发版预演 FreeBSD 归档/解包 E2E 已通过；Linux 归档在 Debian 上暴露 Python 3.11 解包参数差异，正在修复。
-- reviewer 新发现 R8：oneshot inspect 不存在的工具时，元数据错误路径可能跳过 DELETE。主代理正在统一结果与错误的清理所有权，CI 子代理补充正常、超时及中断清理回归。
-- R8 已修复；reviewer 独立 8 项定向复验通过，主代理扩展后 CLI 25/25 通过。
-- R9：Windows 祖先权限遗漏可设置 junction 的写权限，已增加拒绝规则和原生证明测试；主代理/reviewer 源码复核认可，等待 Windows 两架构实际执行。
-- macOS DNS 夹具、Debian 归档提取、FreeBSD mdconfig 清理修复均已整合；归档安全自测 3/3 通过。
-- 当前双方仍 **NO-SHIP**，因为 C3 候选尚未完成冻结后的全树审查与所有平台 CI。接下来冻结 C3，重跑完整 CI 与七包发版预演。
+- C3：`9626d98ba14e004bb3d98b95876df4ec5316234c`，tree `72180159f5af0f4419942874fff24db928bc0772`。主代理/reviewer 均独立通过 fmt、Clippy、45 单元 + 19 协议 + 25 CLI E2E，归档安全自测 3/3。
+- R8 已修复；reviewer 额外 8 项 oneshot 缺失工具、DELETE 失败/超时/中断复验通过。
+- R9 Windows runtime 祖先 junction 权限拒绝已实现；进一步审查发现技能路径存在相邻 R10，现已改为基于固定目录句柄逐组件打开，原生回归待新 CI。
+- C2 Windows x64/ARM64 各 47 单元 + 19 协议实际通过，DACL/default profile/Job 测试均有证据；CLI 在首个 persistent 调用挂住，定位为 R11 标准句柄继承导致捕获输出无法结束。main 的启动句柄隔离修复已提交，Windows 两架构聚焦编译/Clippy 通过。
+- macOS 的原生 ACL 测试通过；HTTP 测试服务器的反向 DNS 阻塞已修。FreeBSD 全套测试与必跑 NFSv4 回归通过，夹具卸载后 mdconfig 尾随空格问题已修。Debian 归档提取已改为支持 Python 3.11 的显式安全提取。
+- 旧 C2 [CI](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43845012976) 和 [发版预演](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43845013015) 已取消，完成日志均已收集；没有把取消或部分成功当作门禁通过。
+- C3 因 R10/R11 保持 **NO-SHIP**，未推送。Windows 测试的有界输出捕获和任务状态诊断已整合，保留真实管道 EOF 验证；现在冻结 C4，重跑全部原生 CI 与七包发版预演。
 
 ## 发布状态
 

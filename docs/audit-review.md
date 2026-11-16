@@ -27,6 +27,8 @@
 | R7 | Medium | 新增 Release CI 的中间检查点 | `release-*` 同时匹配旧日志和聚合包，失败重跑可污染严格七包集合。改为 `release-archive-*`，证据与聚合包分离，并明确替换本次 run 的旧同名产物。 |
 | R8 | Medium | R3 修复后的 C2 检查点 | oneshot inspect 在工具不存在时，经 `?` 提前返回会丢弃连接；reviewer 5 次独立复现中 4 次缺少 DELETE，基线与合法 inspect 对照均正常。现在将元数据转换错误连同连接交给统一输出/清理路径；保留 unknown_tool 和退出码 2，清理失败仅追加诊断。 |
 | R9 | Medium | 新增 Windows 实现的 C2 检查点 | 祖先 DACL 检查遗漏 FILE_WRITE_DATA 与 FILE_WRITE_ATTRIBUTES；任一权限即可把空目录转换为 junction，持有不共享 DELETE 的句柄不足以阻止此操作。现在拒绝这两类外部授权，保留仅创建子目录的权限；原生测试用精确受限句柄证明转换能力与拒绝规则。 |
+| R10 | Medium | 新增 Windows 技能遍历实现 | 技能路径在每层检查后仍按完整路径打开下一层，允许已固定的空目录被原地转换为 junction 后访问外部资源。改为 NtCreateFile + RootDirectory 按句柄解析单个分量；枚举继续基于 GetFileInformationByHandleEx。确定性回归覆盖文件、嵌套目录及已打开目录的转换。 |
+| R11 | High | 新增 Windows daemon 启动实现 | Rust 1.92 默认继承全部可继承句柄；重定向新子进程 stdio 不会排除 CLI 原始捕获管道，daemon 会延长它们的生命期。两架构 E2E 均在首次 persistent 调用等待输出 EOF 时挂住。main 在任何线程/子进程启动前清除原始三个标准句柄的继承标志；显式配置的子进程 stdio 仍由标准库复制并传入。 |
 
 此外完成 Windows 命令路径解析、drive-relative 路径拒绝、Windows 环境变量名大小写碰撞拒绝、原生 endpoint 身份稳定化，以及过期请求连接/写帧前短路。这些属于新增平台必须补齐的行为。
 
@@ -54,5 +56,11 @@ C2：`cf62d0ff93ee3117a00fb4e1c48c336d42f4e964`，tree `d9f25083d23caba46dc0490e
 R8 独立复验：reviewer 重建 `4ec42aa9c74fc2acdf60c836bce6fd4f990ecec8`，5 次正常缺失工具查询、HTTP 500 清理、DELETE 超时、清理中断共 8 项均保留原错误且恰好发送一次 DELETE；主代理新增后 CLI 25/25 通过。
 
 R9 源码依据：[Microsoft MS-FSA §2.1.5.10.37](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165)。主代理与 reviewer 均确认修复范围和原生回归设计；Windows 两架构实际运行仍是最终门禁。
+
+C3：`9626d98ba14e004bb3d98b95876df4ec5316234c`，tree `72180159f5af0f4419942874fff24db928bc0772`。主代理和 reviewer 均独立通过 fmt、Clippy、45 单元 + 19 协议 + 25 CLI E2E，归档安全自测 3/3；因随后确认 R10/R11，C3 未推送，双方 **NO-SHIP**。
+
+C2 Windows 的可复查证据确认 x64、ARM64 各 47 单元 + 19 协议全过，包含 DACL、默认用户目录、Job breakaway、线程所有权；CLI 卡在第一个持久 daemon 场景，不能当作平台验收通过。旧预演及直接 CI 已取消以释放 runner，完成的证据已归档。
+
+R11 源码依据：[Rust 1.92 Windows Command 实现](https://github.com/rust-lang/rust/blob/1.92.0/library/std/src/sys/pal/windows/process.rs)。测试 harness 同时修复 Windows subprocess.run 在超时 kill 后无界等待 EOF 的诊断缺口；继续通过管道捕获输出验证产品行为。
 
 最终冻结 SHA 和双方 SHIP 将在原生 CI 与完整回归完成后记录；当前任何局部绿色结果均不构成发布门禁通过。
