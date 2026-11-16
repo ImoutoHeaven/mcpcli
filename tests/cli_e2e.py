@@ -81,7 +81,7 @@ class Fixture:
         (self.skill / "SKILL.md").write_text(
             "---\nname: ops\ndescription: >-\n  Inspect stateful services\n  and preserve sessions.\n---\n"
             "# Operations\nRead references/guide.md before calling tools.\n", encoding="utf-8")
-        (self.skill / "references" / "guide.md").write_text("Keep the session open.\n", encoding="utf-8")
+        (self.skill / "references" / "guide.md").write_bytes(b"Keep the session open.\n")
         self.settings = {
             "version": 1,
             "servers": {"state": {"transport": "stdio", "command": sys.executable,

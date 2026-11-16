@@ -38,6 +38,8 @@ jobs:
           toolchain: "1.92.0"
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          cache-on-failure: true
       - name: formatting
         run: cargo fmt --all -- --check
       - name: lint
@@ -176,6 +178,8 @@ jobs:
         with:
           toolchain: "1.92.0"
       - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+        with:
+          cache-on-failure: true
       - name: build
         run: cargo build --locked --release
       - name: install pinned real services
