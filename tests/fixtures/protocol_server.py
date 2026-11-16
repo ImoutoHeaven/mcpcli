@@ -169,6 +169,12 @@ if args.http:
             record("DELETE")
             if args.mode == "delete_hang":
                 time.sleep(30)
+            if args.mode == "delete_redirect":
+                self.send_response(307)
+                self.send_header("Location", "/redirect")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.empty({"delete_error": 500, "delete_expired": 404,
                         "delete_unsupported": 405}.get(args.mode, 200))
 

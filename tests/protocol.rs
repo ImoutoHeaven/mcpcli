@@ -477,7 +477,7 @@ async fn input_required_is_one_failed_call_with_possible_side_effects() {
 
 #[tokio::test]
 async fn close_joins_local_worker_and_reports_unconfirmed_remote_cleanup() {
-    for mode in ["delete_hang", "delete_error"] {
+    for mode in ["delete_hang", "delete_error", "delete_redirect"] {
         let mut fixture = Fixture::new();
         let config = fixture.http(false, mode);
         let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();

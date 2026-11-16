@@ -525,6 +525,7 @@ def http_cleanup_failure(f, mode):
     assert json.loads(result.stdout)["structuredContent"] == {"name": "get"}
     assert error_value(result)["kind"] == "cleanup"
     assert "do not replay" in error_value(result)["message"]
+    assert log.read_text().splitlines().count("DELETE") == 1
     assert log.read_text().splitlines().count("tools/call") == 1
     peer = f.value("call", "local_peer", "set", "--args", '{"keep":"alive"}')["structuredContent"]
     f.call("get")
@@ -558,6 +559,13 @@ def http_cleanup_failure(f, mode):
 
 
 def http_delete_error_is_reported(f):
+    redirect_log = f.use_http("delete_redirect")
+    redirect_result = f.invoke("--oneshot", "call", "state", "get", code=1)
+    assert json.loads(redirect_result.stdout)["structuredContent"] == {"name": "get"}
+    assert error_value(redirect_result)["kind"] == "cleanup"
+    assert "do not replay" in error_value(redirect_result)["message"]
+    assert redirect_log.read_text().splitlines().count("DELETE") == 1
+    assert redirect_log.read_text().splitlines().count("tools/call") == 1
     http_cleanup_failure(f, "delete_error")
 
 

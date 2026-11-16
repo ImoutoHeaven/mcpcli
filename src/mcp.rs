@@ -1087,21 +1087,37 @@ impl StreamableHttpClient for BoundedHttp {
         auth: Option<String>,
         headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), HttpError> {
-        match timeout(
-            Duration::from_secs(2),
-            self.client.delete_session(uri, session, auth, headers),
-        )
-        .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(HttpError::Client(error)))
-                if matches!(
-                    error.status(),
-                    Some(http::StatusCode::NOT_FOUND | http::StatusCode::METHOD_NOT_ALLOWED)
-                ) =>
-            {
-                // Legacy sessions may already be gone or disallow explicit deletion.
-                Ok(())
+        let mut request = self.client.delete(uri.as_ref());
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        request = request.header("Mcp-Session-Id", session.as_ref());
+        if let Some(auth) = auth {
+            request = request.bearer_auth(auth);
+        }
+        match timeout(Duration::from_secs(2), request.send()).await {
+            Ok(Ok(response)) => {
+                let status = response.status();
+                if status.is_success()
+                    || matches!(
+                        status,
+                        http::StatusCode::NOT_FOUND | http::StatusCode::METHOD_NOT_ALLOWED
+                    )
+                {
+                    // Legacy sessions may already be gone or disallow explicit deletion.
+                    Ok(())
+                } else {
+                    record_cleanup_failure(
+                        &self.cleanup,
+                        FailureKind::Transport,
+                        "Local MCP client stopped; remote session deletion was not confirmed",
+                        true,
+                    );
+                    Err(HttpError::HttpStatus(HttpStatusError::new(
+                        status.as_u16(),
+                        None,
+                    )))
+                }
             }
             Ok(Err(_)) => {
                 record_cleanup_failure(
