@@ -29,8 +29,10 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - name: archive safety checks
-        run: python3 scripts/ci/test-release-archive.py
+      - name: archive safety and Windows dependency checks
+        run: |
+          python3 scripts/ci/test-release-archive.py
+          python3 scripts/ci/test-windows-pe.py
       - id: version
         shell: bash
         run: |

@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
 from cli_e2e import (Fixture, offline_skills, state_and_discovery, json_inputs_and_outputs,
                      session_and_restart, http_optional_session_delete)
 from platform_support import test_temp_base
+from windows_pe import MACHINES, check_windows_image
 
 
 def validate_member(name):
@@ -67,6 +68,10 @@ def main():
         candidates = list(root.glob("*/mcpcli.exe" if os.name == "nt" else "*/mcpcli"))
         assert len(candidates) == 1, f"archive must contain exactly one native executable: {candidates}"
         binary = candidates[0].resolve(strict=True)
+        if os.name == "nt":
+            names = {f"mcpcli-{options.version}-{platform}.zip": platform for platform in MACHINES}
+            platform = names[options.archive.name]
+            print(json.dumps(check_windows_image(binary, platform)), flush=True)
         version = subprocess.check_output([str(binary), "--version"], text=True,
                                           encoding="utf-8", timeout=5).strip()
         assert version == f"mcpcli {options.version}", version
