@@ -101,6 +101,7 @@ impl Paths {
                 .context("runtime directory must have a name")?,
         );
         private_dir(&root)?;
+        let root = root.canonicalize()?;
         let mut key = config.as_os_str().as_encoded_bytes().to_vec();
         key.push(0);
         key.extend_from_slice(session.as_bytes());
@@ -244,6 +245,11 @@ pub async fn exchange_tracked(
             .await
             .context("cannot connect to daemon")?;
         platform::validate_server(&stream)?;
+        if platform::monotonic_millis()? >= request.deadline_ms {
+            return Err(
+                Failure::new(5, "timeout", "request expired before writing to daemon").into(),
+            );
+        }
         ipc::write_frame_tracked(&mut stream, request, ipc::REQUEST_LIMIT, write_tracker).await?;
         let response: Response = ipc::read_frame(&mut stream, ipc::RESPONSE_LIMIT)
             .await?

@@ -67,8 +67,10 @@ pub fn endpoint(directory: &Path, control: bool) -> io::Result<PathBuf> {
     }
     #[cfg(windows)]
     {
-        let identity = format!("{}\0{}", local::user_sid()?, directory.display());
-        let hash = crate::config::digest(identity.as_bytes());
+        let mut identity = local::user_sid()?.into_bytes();
+        identity.push(0);
+        identity.extend_from_slice(directory.as_os_str().as_encoded_bytes());
+        let hash = crate::config::digest(&identity);
         Ok(PathBuf::from(format!(
             r"\\.\pipe\mcpcli-{}-{}",
             &hash[..32],
