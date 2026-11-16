@@ -45,6 +45,10 @@ use tokio::{
 
 use crate::config::ServerConfig;
 
+mod sse;
+#[cfg(windows)]
+mod windows_job;
+
 pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -499,7 +503,10 @@ fn has_media_type(content_type: &str, expected: &str) -> bool {
 struct ChildTransport {
     io: AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>,
     child: Option<Child>,
+    #[cfg(unix)]
     group: Option<i32>,
+    #[cfg(windows)]
+    job: Option<windows_job::Job>,
     cleanup: CleanupState,
 }
 
@@ -509,33 +516,83 @@ impl ChildTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .kill_on_drop(false)
-            .process_group(0);
-        let parent = std::process::id() as libc::pid_t;
-        // Only async-signal-safe libc calls run between fork and exec.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::getppid() != parent {
-                    libc::_exit(127);
-                }
-                Ok(())
-            });
+            .kill_on_drop(false);
+        #[cfg(unix)]
+        command.process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            let parent = std::process::id() as libc::pid_t;
+            // SAFETY: only async-signal-safe libc calls run between fork and exec.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        libc::_exit(127);
+                    }
+                    Ok(())
+                });
+            }
         }
+        #[cfg(target_os = "freebsd")]
+        {
+            let parent = std::process::id() as libc::pid_t;
+            // SAFETY: procctl/getppid/_exit do not allocate or acquire Rust locks.
+            unsafe {
+                command.pre_exec(move || {
+                    let signal: libc::c_int = libc::SIGKILL;
+                    if libc::procctl(
+                        libc::P_PID,
+                        0,
+                        libc::PROC_PDEATHSIG_CTL,
+                        (&signal as *const libc::c_int).cast_mut().cast(),
+                    ) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::getppid() != parent {
+                        libc::_exit(127);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        #[cfg(windows)]
+        command
+            .creation_flags(
+                windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                    | windows_sys::Win32::System::Threading::CREATE_NO_WINDOW,
+            )
+            .kill_on_drop(true);
         let mut child = command.spawn()?;
+        #[cfg(unix)]
         let group = child.id().map(|id| id as i32);
+        #[cfg(windows)]
+        let job = match windows_job::Job::adopt(&child) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                let _ = child.start_kill();
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Err(error);
+            }
+        };
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
         Ok(Self {
             io: AsyncRwTransport::new(stdout, stdin),
             child: Some(child),
+            #[cfg(unix)]
             group,
+            #[cfg(windows)]
+            job,
             cleanup,
         })
     }
 
+    #[cfg(unix)]
     fn signal_group(&self, signal: i32) {
         if let Some(group) = self.group {
             // This owns a trusted server's process group, not an escape-proof sandbox.
@@ -545,6 +602,7 @@ impl ChildTransport {
         }
     }
 
+    #[cfg(unix)]
     fn exited_unreaped(&mut self) -> std::io::Result<bool> {
         let Some(pid) = self.group else {
             return Ok(true);
@@ -569,6 +627,7 @@ impl ChildTransport {
         Ok(unsafe { info.si_pid() } == pid)
     }
 
+    #[cfg(unix)]
     async fn wait_unreaped(&mut self) -> std::io::Result<bool> {
         timeout(Duration::from_secs(1), async {
             while !self.exited_unreaped()? {
@@ -580,6 +639,7 @@ impl ChildTransport {
         .unwrap_or(Ok(false))
     }
 
+    #[cfg(unix)]
     async fn shutdown(&mut self) -> std::io::Result<()> {
         // A pending SDK send can hold the writer lock while the child stops
         // reading. Kill the still-owned process before waiting on that lock.
@@ -613,15 +673,53 @@ impl ChildTransport {
         self.child = None;
         waited
     }
+
+    #[cfg(windows)]
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        let _ = timeout(Duration::from_millis(500), self.io.close()).await;
+        if let Some(job) = &self.job {
+            job.terminate()?;
+        }
+        // Retain the job and child if cancellation interrupts the join.
+        timeout(Duration::from_secs(3), async {
+            if let Some(child) = &mut self.child {
+                child.wait().await?;
+            }
+            if let Some(job) = &self.job {
+                while !job.is_empty()? {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+            Ok::<_, std::io::Error>(())
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "MCP process job did not close",
+            )
+        })??;
+        self.child = None;
+        self.job = None;
+        Ok(())
+    }
 }
 
 impl Drop for ChildTransport {
     fn drop(&mut self) {
+        #[cfg(unix)]
         self.signal_group(libc::SIGKILL);
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            let _ = job.terminate();
+        }
         if let Some(mut child) = self.child.take() {
+            #[cfg(unix)]
             if self.group.is_some() {
                 let _ = child.start_kill();
             }
+            #[cfg(windows)]
+            let _ = child.start_kill();
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                 runtime.spawn(async move {
                     let _ = child.wait().await;
@@ -675,16 +773,20 @@ impl BoundedHttp {
             .content_length()
             .is_some_and(|length| length > limit as u64)
         {
-            return Err(HttpError::Io(std::io::Error::other(
-                "HTTP response exceeds 16 MiB",
-            )));
+            return Err(HttpError::Io(std::io::Error::other(format!(
+                "HTTP response exceeds {limit} bytes"
+            ))));
         }
         let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(HttpError::Client)? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| HttpError::Client(error.without_url()))?
+        {
             if bytes.len().saturating_add(chunk.len()) > limit {
-                return Err(HttpError::Io(std::io::Error::other(
-                    "HTTP response exceeds 16 MiB",
-                )));
+                return Err(HttpError::Io(std::io::Error::other(format!(
+                    "HTTP response exceeds {limit} bytes"
+                ))));
             }
             bytes.extend_from_slice(&chunk);
         }
@@ -718,7 +820,7 @@ impl BoundedHttp {
             .json(&message)
             .send()
             .await
-            .map_err(HttpError::Client)?;
+            .map_err(|error| HttpError::Client(error.without_url()))?;
         let status = response.status();
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
             return Err(HttpError::AuthRequired(AuthRequiredError::new(
@@ -911,37 +1013,58 @@ impl StreamableHttpClient for BoundedHttp {
         limit: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, HttpError> {
         let had_session = session.is_some();
-        self.client
-            .get_stream_with_max_sse_event_size(
-                uri,
-                session,
-                last_id,
-                auth,
-                headers,
-                limit.min(MAX_RESPONSE_BYTES),
-            )
+        let mut request = self
+            .client
+            .get(uri.as_ref())
+            .header("accept", "text/event-stream");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        if let Some(session) = session {
+            request = request.header("Mcp-Session-Id", session.as_ref());
+        }
+        if let Some(last_id) = last_id {
+            request = request.header("Last-Event-Id", last_id);
+        }
+        if let Some(auth) = auth {
+            request = request.bearer_auth(auth);
+        }
+        let response = request
+            .send()
             .await
-            .map_err(|error| match error {
-                HttpError::AuthRequired(_) | HttpError::InsufficientScope(_) => {
-                    HttpError::AuthRequired(AuthRequiredError::new(String::new()))
-                }
-                HttpError::Client(ref err) if err.status().is_some() => {
-                    let status = err.status().unwrap();
-                    if matches!(
-                        status,
-                        http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
-                    ) {
-                        HttpError::AuthRequired(AuthRequiredError::new(String::new()))
-                    } else if status == http::StatusCode::NOT_FOUND && had_session {
-                        HttpError::SessionExpired
-                    } else {
-                        HttpError::HttpStatus(HttpStatusError::new(status.as_u16(), None))
-                    }
-                }
-                HttpError::UnexpectedContentType(_) => HttpError::UnexpectedContentType(None),
-                other => other,
-            })
+            .map_err(|error| HttpError::Client(error.without_url()))?;
+        let status = response.status();
+        if status == http::StatusCode::METHOD_NOT_ALLOWED {
+            return Err(HttpError::ServerDoesNotSupportSse);
+        }
+        if matches!(
+            status,
+            http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+        ) {
+            return Err(HttpError::AuthRequired(AuthRequiredError::new(
+                String::new(),
+            )));
+        }
+        if status == http::StatusCode::NOT_FOUND && had_session {
+            return Err(HttpError::SessionExpired);
+        }
+        if !status.is_success() {
+            return Err(HttpError::HttpStatus(HttpStatusError::new(
+                status.as_u16(),
+                None,
+            )));
+        }
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        if !has_media_type(content_type, "text/event-stream") {
+            return Err(HttpError::UnexpectedContentType(None));
+        }
+        Ok(sse::bounded_stream(response, limit.min(MAX_RESPONSE_BYTES)))
     }
+
     async fn delete_session(
         &self,
         uri: Arc<str>,
@@ -991,7 +1114,7 @@ impl StreamableHttpClient for BoundedHttp {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1054,5 +1177,34 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    #[test]
+    fn media_type_essence_is_exact_and_case_insensitive() {
+        assert!(has_media_type(
+            "Application/JSON; charset=UTF-8",
+            "application/json"
+        ));
+        assert!(has_media_type(
+            " TEXT/EVENT-STREAM ; charset=UTF-8",
+            "text/event-stream"
+        ));
+        for value in [
+            "application/jsonp",
+            "application/json, text/plain",
+            "",
+            "application/jsonx",
+        ] {
+            assert!(!has_media_type(value, "application/json"));
+        }
+        assert!(!has_media_type(
+            "text/event-stream-INVALID",
+            "text/event-stream"
+        ));
     }
 }
