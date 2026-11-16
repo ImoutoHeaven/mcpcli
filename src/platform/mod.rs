@@ -20,6 +20,31 @@ pub fn image_path() -> io::Result<PathBuf> {
     std::env::current_exe()
 }
 
+/// Incoming standard handles belong to this CLI, not to its detached descendants.
+/// Rust duplicates explicitly configured child stdio with inheritance enabled when spawning.
+pub fn initialize_standard_handles() -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{
+            HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+        };
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for stream in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: these process-owned handles stay open; only their inheritance flag changes.
+            let handle = unsafe { GetStdHandle(stream) };
+            if !handle.is_null()
+                && handle != INVALID_HANDLE_VALUE
+                && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn interrupted() -> io::Result<i32> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

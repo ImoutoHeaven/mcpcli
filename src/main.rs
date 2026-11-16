@@ -715,6 +715,10 @@ async fn entry(cli: Cli) -> i32 {
 }
 
 fn main() -> std::process::ExitCode {
+    if let Err(error) = mcpcli::platform::initialize_standard_handles() {
+        eprintln!("mcpcli: cannot initialize standard handles: {error}");
+        return std::process::ExitCode::FAILURE;
+    }
     let cli = Cli::parse();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
