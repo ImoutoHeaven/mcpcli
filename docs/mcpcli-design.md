@@ -2,7 +2,7 @@
 
 ## 1. Product contract
 
-mcpcli is a standalone Linux command-line client for configured MCP tools and
+mcpcli is a standalone cross-platform command-line client for configured MCP tools and
 local Agent Skills. A short-lived CLI process can discover capabilities, inspect
 one tool, call it, or read one skill resource. A local daemon retains connections
 and application state between CLI processes.
@@ -16,10 +16,12 @@ elicitation/MRTR, asynchronous Tasks, OAuth login, the old two-endpoint
 HTTP+SSE transport, and an outbound MCP-server mode are outside this release.
 The client does not advertise unsupported capabilities.
 
-The supported platform is Linux with /proc and Unix domain sockets. The tested
-release target is x86_64-unknown-linux-gnu. This is a native executable; it does
-not need Python or Node to run. A configured MCP server may need its own runtime.
-This client is a trusted-command runner, not a security sandbox.
+Supported native systems are Alpine and Debian Linux (x86-64 and ARM64),
+FreeBSD (x86-64), macOS (Intel and Apple silicon), and Windows (x86-64 and ARM64).
+Linux release archives use musl and are tested on both distributions. Unix uses
+local domain sockets; Windows uses named pipes. This is a native executable; it
+does not need Python or Node to run. A configured MCP server may need its own
+runtime. This client is a trusted-command runner, not a security sandbox.
 
 ## 2. Why a daemon
 
@@ -97,10 +99,13 @@ configuration fields are rejected.
 | stdio | transport: stdio; command; optional args, env, cwd, description |
 | HTTP | transport: http; url; optional headers, description |
 
-Paths resolve from the configuration file's directory. A command containing a
-slash is resolved there; an ordinary command name uses the daemon's PATH.
+Paths resolve from the configuration file's directory. An explicit executable
+path uses native directory separators; an ordinary command name uses the
+daemon's PATH. Windows drive-relative paths are rejected, and environment
+overrides cannot contain two names that Windows treats as the same key.
 The default server cwd is the configuration directory. Arguments are passed
-directly to the executable, without shell evaluation.
+directly through the native process API. Windows npm launchers require an
+explicit `npx.cmd` command; batch files follow Windows command-processor rules.
 
 Only complete env/header values of the form ${NAME} are expanded. Missing or
 non-UTF-8 variables are errors. There is no expansion in command arguments and
@@ -126,46 +131,58 @@ authorizes that executable to run as the current user.
 
 ## 5. Runtime identity and local IPC
 
-Runtime storage is selected in this order:
+`MCPCLI_RUNTIME_DIR` selects an explicit runtime directory on every platform.
+Otherwise Unix uses `XDG_RUNTIME_DIR/mcpcli-UID` or `/tmp/mcpcli-UID`; Windows
+uses `LOCALAPPDATA/mcpcli`. System directory aliases are canonicalized before
+creating a namespace.
 
-1. MCPCLI_RUNTIME_DIR, when set.
-2. XDG_RUNTIME_DIR/mcpcli.
-3. /tmp/mcpcli-UID.
-
-The runtime leaf and namespace directories must be real, user-owned directories
-with mode 0700. Unsafe ancestors, symlinks at protected paths, unexpected file
-types, wrong owners, and permissive leaf modes are rejected. Existing unsafe
+On Unix, runtime leaf and namespace directories must be real, user-owned
+directories with mode 0700. Unsafe ancestors, symlinks at protected paths,
+unexpected file types, wrong owners, and permissive leaf modes are rejected.
+macOS and FreeBSD ACLs are checked in addition to mode bits. Existing unsafe
 directories are not chmod'ed into compliance. Runtime lock files must be
 single-link, user-owned regular files with mode 0600, opened with NOFOLLOW,
 CLOEXEC, and NONBLOCK.
 
+Windows creates protected DACLs granting access to the current user. Validation
+also trusts SYSTEM, Administrators and the Windows servicing account when
+checking existing ancestors. Existing files/directories must have the expected
+ownership and access grants. Reparse points, alternate data streams and hard-linked private
+files are rejected. Directory handles prevent replacement while protected file
+operations are in progress.
+
 A hash of the canonical config path and session name creates the namespace.
-Every request carries the IPC version, namespace, executable SHA-256, and
-configuration digest. The daemon rejects incompatible callers. Its executable
-identity is computed from /proc/self/exe, so replacing a binary on disk does
-not change the identity of a running process. A changed binary requires
-daemon restart.
+Every request carries IPC version 2, namespace, executable SHA-256,
+configuration digest and an absolute monotonic deadline. The daemon rejects
+incompatible callers; there is no IPC migration path. Linux hashes its mapped
+executable through `/proc/self/exe`; other platforms use the native executable
+path. A changed binary requires `daemon restart`.
 
 startup.lock serializes starters. daemon.lock is held for the daemon lifetime.
-Locks are never deleted: replacing a lock inode could create two owners.
-The daemon removes stale sockets only while holding the lifetime lock and only
-when the entry is an owned socket. Unix peer credentials must match the current
-effective UID. Socket paths must fit Linux's 107-byte pathname limit.
+Locks use native file locking and are never deleted: replacing a lock file
+could create two owners. The daemon removes stale Unix sockets only while
+holding the lifetime lock and only when the entry is an owned socket. Unix peer
+credentials must match the current effective UID; socket paths must fit that
+platform's native pathname limit. Windows named pipes reject remote clients,
+use protected per-user DACLs, and verify peer process token SIDs. Both endpoint
+names include the namespace identity.
 
 IPC frames have a four-byte little-endian length followed by UTF-8 JSON.
 The receiver checks the declared length before allocating the body; truncated
 frames, invalid frames, and over-limit messages are rejected. A connection
 carries exactly one request and one response.
 
-Two sockets separate admission:
+Separate data and control endpoints isolate admission:
 
-- sock: at most 32 active data connections and eight active server operations.
-- control.sock: at most eight active control connections, accepting only status/stop.
+- Data: at most 32 active connections and eight active server operations.
+- Control: at most eight active connections, accepting only status/stop.
 
 Admission permits are acquired before accepting sockets so bursts beyond 32
-connections wait in the kernel listen queue within the caller's deadline rather
-than being dropped prematurely. Five-second read/write deadlines bound
-unfinished framing and slow output. The control listener remains available when
+connections wait in native endpoint admission within the caller's deadline.
+A cross-process monotonic timestamp keeps backlog time inside the original
+budget; the daemon checks expiry before mutations or downstream connection
+creation, and the client refuses late writes. Five-second framing caps bound
+unfinished input and slow output, without extending the client's request deadline. The control listener remains available when
 all data connections are occupied. Requests for one server serialize on its
 mutex. The server mutex is acquired before a global work permit, so a queue for
 one slow server does not consume all eight active-operation slots. Different
@@ -175,8 +192,8 @@ servers can proceed concurrently.
 
 A request deadline covers waiting for its server/work slot, connection setup,
 fresh paginated discovery, and invocation. Connection setup is additionally
-limited to 30 seconds. The command's timeout range is 1-3600 seconds; IPC
-transfer and cleanup have their own bounded grace periods.
+limited to 30 seconds. The command's timeout range is 1-3600 seconds. IPC transfer does not renew the
+request budget. Connection cleanup has a separate bounded grace period.
 
 No layer automatically retries tools/call. reqwest retries and redirects are
 disabled. Legacy HTTP session-expiry reinitialization is disabled, because it
@@ -218,19 +235,27 @@ can continue waiting. HTTP DELETE has a two-second deadline. HTTP 404 and the
 protocol-permitted 405 allow local closure; they do not prove that remote
 application state was erased. Other cleanup failures remain visible.
 
-A stdio child has its own process group. Shutdown closes stdin, waits briefly,
+On Unix, a stdio child has its own process group. Shutdown closes stdin, waits briefly,
 then uses TERM/KILL as needed and reaps the child. WNOWAIT observations retain
 the unreaped leader until all process-group signals are complete, preventing
 a reused numeric PGID from being signaled. A full stdin pipe cannot block cleanup
-indefinitely. The child also receives PDEATHSIG for unexpected parent death.
+indefinitely. Linux and FreeBSD also request a direct-child death signal for
+unexpected parent death. macOS relies on pipe closure and orderly cleanup.
 This is cleanup for trusted process groups, not containment of descendants
 that deliberately escape through setsid or another supervisor.
 
-The CLI handles SIGINT and SIGTERM. Its runtime is shut down before returning
-ExitCode, allowing transport destructors to clean up same-group descendants.
-A three-second runtime grace bounds an interrupted blocking stdin reader.
-SIGKILL cannot run userspace cleanup; only the direct-child death signal is
-guaranteed in that case.
+Windows creates stdio children suspended, assigns them to a kill-on-close Job,
+verifies opened thread ownership, and then resumes them. Cleanup terminates the
+Job and waits for both the child and the Job's active process count. A daemon
+launch must detach from any enclosing Job; a supervisor that forbids breakaway
+must host `daemon run` explicitly.
+
+The CLI handles SIGINT/SIGTERM on Unix and Ctrl-C/Ctrl-Break on Windows. Its
+runtime is shut down before returning ExitCode, allowing transport destructors
+to clean up owned children. A three-second runtime grace bounds an interrupted
+blocking stdin reader. Forced process termination cannot run userspace cleanup;
+Windows Job closure and Linux/FreeBSD direct-child death signals provide the
+platform's additional protection.
 
 Downstream stderr is discarded to avoid unbounded logs and accidental
 credential capture. Diagnose a server by running it directly under appropriate
@@ -262,7 +287,9 @@ produce no blank line.
 
 A successful tool result followed by an --oneshot cleanup failure remains on
 stdout; the cleanup diagnostic goes to stderr and the exit status is nonzero.
-This prevents a lost result from encouraging an unsafe replay.
+An interruption after the tool result arrived also preserves that result and
+reports interrupted cleanup with a known outcome. This prevents a lost result
+from encouraging an unsafe replay.
 
 | Exit | Meaning |
 | --- | --- |
@@ -273,8 +300,8 @@ This prevents a lost result from encouraging an unsafe replay.
 | 4 | MCP protocol/transport failure or daemon communication failure |
 | 5 | Deadline exceeded |
 | 6 | Incompatible daemon or lost session state requiring explicit recovery |
-| 130 | SIGINT interruption |
-| 143 | SIGTERM interruption |
+| 130 | SIGINT / Ctrl-C interruption |
+| 143 | SIGTERM / Ctrl-Break interruption |
 
 Operational failures use a JSON error object on stderr with code, kind,
 message, and outcome_unknown when applicable. Clap's argument/help diagnostics
@@ -300,14 +327,19 @@ base directory. files lists resource paths. read returns one UTF-8 text file.
 No command runs scripts, interprets allowed-tools as permission, follows remote
 references, or modifies installed skills.
 
-Resource access walks intermediate directory components with openat using
-O_PATH | O_NOFOLLOW | O_DIRECTORY (allowing traversal beneath 0711 execute-only
-ancestor directories for unprivileged users) and opens only the target directory
-or regular file with O_RDONLY | O_NOFOLLOW | O_NONBLOCK. Absolute paths,
-traversal, symlinks, special files, excessive directory depth, and
-binary/non-UTF-8 resources are rejected. Directory enumeration uses
-/proc/self/fd. Discovery records a canonical root path; each read reopens and
-validates its directory components. A symlink replacement is rejected. Ordinary
+Unix resource access walks intermediate directory components with openat using
+O_PATH (Linux) or O_SEARCH (FreeBSD/macOS), plus O_NOFOLLOW and O_DIRECTORY.
+This permits traversal beneath execute-only ancestors. Final reads use O_RDONLY,
+O_NOFOLLOW and O_NONBLOCK; directory enumeration uses the open descriptor through
+fdopendir/readdir. Windows checks every component for reparse points and keeps
+directory handles open without delete sharing while enumerating or opening a
+resource. Absolute paths, traversal, symlinks/reparse points, alternate data
+streams, special files, excessive directory depth, and binary/non-UTF-8 resources
+are rejected. Discovery pins the configured directory before canonicalizing it
+and verifies that the resolved directory has the same native identity. Trailing
+separators and `/.` cannot hide a symlink leaf. Existing ancestor aliases may
+resolve during mounting; each later read reopens and validates the canonical
+directory components. A symlink replacement is rejected. Ordinary
 file changes remain visible on the next read.
 
 | Limit | Value |
@@ -326,11 +358,24 @@ file changes remain visible on the next read.
 
 ## 9. Verification
 
-Run `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`,
-and `cargo test --locked --all-targets` before publishing. The explicit Python
-acceptance runners in tests cover CLI lifecycle and real MCP services. Supply
-local dependency paths using their command-line options. Tests do not establish
-platform support beyond the environments they actually ran on.
+`ci.yml` runs formatting, Clippy with warnings denied, Rust unit/protocol tests,
+and the release CLI E2E suite on Ubuntu, Alpine, Debian, FreeBSD, macOS and Windows.
+Linux containers cover x86-64 and ARM64, macOS covers Intel and Apple silicon,
+and Windows covers x86-64 and ARM64. The root permission fixture is mandatory
+in container and FreeBSD jobs. OS-specific tests are recorded explicitly; Windows
+security has native DACL/reparse/ownership tests. Process inspection errors fail
+cleanup tests instead of being interpreted as an exited process.
+
+The real-service job pins fastexec and Playwright MCP dependencies and runs
+Chromium against a local test page through stdio and Streamable HTTP. All jobs
+must pass the aggregate CI gate.
+
+`release.yml` also runs on the WIP release-checkpoint branch for a full preflight.
+A pushed `vX.Y.Z` tag must match Cargo.toml and point to a commit on main. It
+reruns CI, builds seven platform archives, extracts and tests each executable,
+checks the complete asset set, and emits SHA256SUMS. Linux archives are exercised
+on Alpine and Debian. Only then does it create a draft GitHub Release. Publishing
+the draft follows verification of the frozen commit and release assets.
 
 ## 10. References
 

@@ -1,7 +1,27 @@
 # mcpcli
 
 A standalone Rust CLI for MCP tools and local [Agent Skills](https://agentskills.io).
-Version 0.1.0 supports Linux, stdio, and Streamable HTTP.
+Version 0.1.0 supports Alpine, Debian, FreeBSD, macOS, and Windows, with stdio
+and Streamable HTTP transports.
+
+## Install
+
+Download an archive and `SHA256SUMS` from the [releases](https://github.com/ImoutoHeaven/mcpcli/releases).
+Extract it, verify its checksum, and place `mcpcli` (or `mcpcli.exe`) on your PATH.
+The executable includes its client runtime; Python and Node are only needed when
+a configured MCP server requires them.
+
+| System | Architecture | Archive suffix |
+| --- | --- | --- |
+| Alpine / Debian Linux | x86-64 | `linux-amd64.tar.gz` |
+| Alpine / Debian Linux | ARM64 | `linux-arm64.tar.gz` |
+| FreeBSD | x86-64 | `freebsd-amd64.tar.gz` |
+| macOS | Intel / Apple silicon | `macos-amd64.tar.gz` / `macos-arm64.tar.gz` |
+| Windows | x86-64 / ARM64 | `windows-amd64.zip` / `windows-arm64.zip` |
+
+Linux archives use musl and run on both tested distributions. CI runs native
+builds and tests on Alpine 3.23, Debian 12, FreeBSD 15.1, macOS 15, Windows Server
+2022 (x86-64), and Windows 11 (ARM64).
 
 ## Build
 
@@ -10,7 +30,8 @@ cargo build --release --locked
 cargo install --path . --locked
 ~~~
 
-Rust 1.92+ is required to build. MCP servers keep their own runtime dependencies.
+Rust 1.92+ and a native C toolchain are required to build. MCP servers keep their
+own runtime dependencies.
 
 ## Configure
 
@@ -44,8 +65,10 @@ a parent directory whose immediate subdirectories are skills (for example,
 Set `MCP_AUTHORIZATION` to the full header value (for example, `Bearer TOKEN`),
 or remove the `remote` entry when not needed. Environment references must occupy
 the entire string value (`"${VAR}"`). Relative paths resolve from the
-configuration file's directory. Configured stdio commands run with your user
-permissions.
+configuration file's directory. On Windows, use `npx.cmd` for npm-based servers;
+explicit executable paths can use either directory separator. Drive-relative
+paths such as `C:server.exe` are rejected. Configured stdio commands run with
+your user permissions.
 
 ## Use
 
@@ -88,7 +111,25 @@ slot without disrupting other servers in the same daemon session. `daemon run`
 supports foreground process supervision.
 
 See [the design](docs/mcpcli-design.md) for limits, exit codes, transport
-semantics, and the supported scope. Tests require Python 3 in addition to Rust.
+semantics, and the supported scope.
+
+## Verify
+
+~~~sh
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets -- -D warnings
+python3 scripts/ci/run-tests.py
+~~~
+
+Tests require Python 3.11+ in addition to Rust (`python` on Windows). The runner
+executes Rust unit/protocol tests and the release CLI E2E suite. Native Windows
+CI runs persistent-daemon tests outside the runner's process Job. The real-service
+CI lane additionally tests fastexec, Playwright MCP and Chromium over stdio and
+HTTP. Release CI extracts each archive and exercises its actual executable
+before creating a draft release.
+
+[CI runs](https://github.com/ImoutoHeaven/mcpcli/actions/workflows/ci.yml) ·
+[Release runs](https://github.com/ImoutoHeaven/mcpcli/actions/workflows/release.yml)
 
 ## License
 

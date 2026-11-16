@@ -1,6 +1,6 @@
 # mcpcli 0.1.0 工作进度
 
-更新时间：2026-11-16 17:44（Asia/Shanghai）
+更新时间：2026-11-16 17:57（Asia/Shanghai）
 
 ## 目标与发布门禁
 
@@ -14,7 +14,7 @@
 - 基线：`285b0f19c85ef6deba34991baa131be6365a76e4`，父提交 `315a2467381a917c1ca7687450b8d585a03c634e`。
 - 远程：`https://github.com/ImoutoHeaven/mcpcli.git`。当前远程仅有 `main`，尚无远程标签；本地已有旧的 `v0.1.0` 标签，最终会先核实指向和发布状态再处理。
 - 已建立隔离工作树和分工：主代理 `wip/release-0.1.0`；平台重构 `wip/platform`；CI/E2E `wip/ci`；只读 reviewer 使用 detached 工作树。
-- 当前执行 Step 1：提交与全仓独立审查；Step 3 的平台和 CI 设计并行展开。
+- Step 1 基线审查完成（双方 NO-SHIP）；Step 2 已修复并提交确认问题；Step 3 原生平台层、回归与 CI 已集成，正在跑真实平台 CI 和冻结前复核。
 
 ## 并行职责
 
@@ -32,6 +32,14 @@
 主代理基线 fmt/clippy/38 单元 + 18 协议通过；reviewer 独立 38+18 和 CLI 20/20 通过，并额外复现上述三个缺陷。
 
 核心 GET 修复与 Windows stdio Job 启动已实现；当前 Linux fmt/clippy/41 单元 + 18 协议通过。平台、CI/E2E 改动尚未集成，不能视为最终验证。
+
+## 当前集成与 CI
+
+- 本地集成已通过格式、Clippy、45 个单元测试和 19 个协议测试；release CLI E2E 23/23，通过新增的排队超时和清理中断回归。
+- 新增原生平台实现与技能 root 固定、尾缀 symlink 拒绝、macOS/FreeBSD 祖先 ACL 校验；Windows 原生安全与 Job 策略测试进入 CI。
+- 第一轮 WIP CI：[`43843118435`](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43843118435)，提交 `f1ee19df807e68bc3b79b8a7e84c9941af12676b`。这是早于后续审查修复的检查点，不能替代最终冻结验证。
+- 已观察 Ubuntu、Debian 两架构、FreeBSD、Alpine amd64 和真实 fastexec+Playwright 套件通过；Windows 两架构首次 E2E 有失败，正在分辨已修复的控制台夹具问题和实现问题。其余 job 仍在运行。
+- 最新审查收尾：线程句柄所有权、技能 canonicalize 竞态及 `link/`/`link/.` 变体、祖先 ACL、Release 重跑产物混入均有提交和回归。下一个冻结 checkpoint 会重新运行全部 CI 与发版预演。
 
 ## 发布状态
 

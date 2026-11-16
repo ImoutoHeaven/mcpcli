@@ -17,6 +17,17 @@
 | R2 | Medium | 既有问题；该提交仅修复 POST | GET SSE 合法 `TEXT/EVENT-STREAM; charset=UTF-8` 超时，非法 `text/event-stream-INVALID` 被接受。SDK GET 默认代码采用大小写敏感前缀；3xx SSE 响应也可能被解析。 | GET 使用精确、大小写无关的 MIME essence 检查；要求成功状态；保留单事件内存上限、401/403 与 URL 脱敏。增加真正经 GET 返回工具结果的测试。 |
 | R3 | Medium | 既有问题 | `--oneshot` 工具返回成功后，DELETE 清理阻塞期间 SIGINT 导致 stdout 为空、exit 130、`outcome_unknown:true`，丢失已知结果。 | 将已知结果保留至输出；中断仅终止清理等待并单独报告，已知调用结果的 uncertainty 为 false。 |
 
+## 重构与补充审查
+
+| ID | 严重性 | 来源 | 问题与修复 |
+|---|---|---|---|
+| R4 | Medium | 新增 Windows 实现的中间检查点 | 线程快照中的 TID 在 OpenThread 前可能被复用。现在打开线程后用 GetProcessIdOfThread 验证实际归属，再恢复线程；原生测试拒绝错误归属。 |
+| R5 | Medium | 既有技能目录访问 | symlink_metadata 后、canonicalize 前替换根目录可使外部内容被当作挂载技能读取。reviewer 的 realpath 注入实测返回 `outside root secret`。现在先固定原始目录句柄，规范化后重开并核对 inode/file ID；同时修复 `link/` 和 `link/.` 绕过 final-component NOFOLLOW 的变体，测试覆盖 Unix 与 Windows 分隔符。 |
+| R6 | Medium | 新增 macOS/FreeBSD 实现的中间检查点 | 只检查祖先模式位会漏掉额外 ACL 修改授权。现在检查 native ACL 的 mutation grant，允许无害 deny/read 权限；macOS 原生测试和 FreeBSD 专用 NFSv4 文件系统测试必须执行。 |
+| R7 | Medium | 新增 Release CI 的中间检查点 | `release-*` 同时匹配旧日志和聚合包，失败重跑可污染严格七包集合。改为 `release-archive-*`，证据与聚合包分离，并明确替换本次 run 的旧同名产物。 |
+
+此外完成 Windows 命令路径解析、drive-relative 路径拒绝、Windows 环境变量名大小写碰撞拒绝、原生 endpoint 身份稳定化，以及过期请求连接/写帧前短路。这些属于新增平台必须补齐的行为。
+
 ## 已独立核验的历史修复
 
 `reset --force` 与 restart 清理恢复、0711 祖先目录穿透、CRLF/空文本输出、公开文档自洽、共享保留头列表、残留状态临时文件替换、配置结构错误脱敏诊断均已实际实现。并发超时与 HTTP MIME 的覆盖仍不完整，分别见 R1、R2。
@@ -34,4 +45,4 @@
 
 ## 最终冻结审查
 
-尚未开始；当前任何局部绿色结果均不构成最终 SHIP 或发布授权门禁通过。
+初始整合版本已完成中间全树复核，以上补充问题正在逐一验收。最终冻结 SHA 和双方 SHIP 将在原生 CI 与完整回归完成后记录；当前任何局部绿色结果均不构成发布门禁通过。
