@@ -2,11 +2,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 const MAX_DOCUMENT_BYTES: u64 = 1024 * 1024;
@@ -43,7 +40,7 @@ pub fn discover(roots: &[PathBuf]) -> Result<SkillCatalog> {
         let metadata = fs::symlink_metadata(configured)
             .with_context(|| format!("read configured skill directory {configured:?}"))?;
         ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            metadata.is_dir() && !crate::platform::is_link(&metadata),
             "configured skill root must be a directory, not a symlink: {configured:?}"
         );
         let root = fs::canonicalize(configured)?;
@@ -282,9 +279,10 @@ fn collect_files(
             );
             if path != Path::new("SKILL.md") {
                 result.push(
-                    path.to_str()
-                        .context("resource path is not UTF-8")?
-                        .to_owned(),
+                    path.iter()
+                        .map(|part| part.to_str().context("resource path is not UTF-8"))
+                        .collect::<Result<Vec<_>>>()?
+                        .join("/"),
                 );
             }
         }
@@ -317,27 +315,9 @@ fn check_document_size(file: &File) -> Result<()> {
     Ok(())
 }
 
-struct Entry {
-    name: OsString,
-    kind: fs::FileType,
-}
-
-/// Keep a directory fd open while enumerating it; do not re-follow a mutable path.
-fn entries(root: &Path, relative: &Path) -> Result<Vec<Entry>> {
+fn entries(root: &Path, relative: &Path) -> Result<Vec<crate::platform::DirectoryEntry>> {
     let directory = open_beneath(root, relative, true)?;
-    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
-    let mut result = Vec::new();
-    for entry in fs::read_dir(fd_path)? {
-        ensure!(
-            result.len() < MAX_ENTRIES,
-            "directory exceeds {MAX_ENTRIES} entries"
-        );
-        let entry = entry?;
-        result.push(Entry {
-            name: entry.file_name(),
-            kind: entry.file_type()?,
-        });
-    }
+    let mut result = crate::platform::directory_entries(&directory, MAX_ENTRIES)?;
     result.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(result)
 }
@@ -356,97 +336,34 @@ fn open_beneath(root: &Path, relative: &Path, directory: bool) -> Result<File> {
         "resource path is too deep"
     );
     ensure!(root.is_absolute(), "skill root must be absolute");
-    let mut root_names = Vec::new();
-    for component in root.components().skip(1) {
-        let Component::Normal(name) = component else {
-            bail!("skill root must be normalized: {root:?}");
-        };
-        root_names.push(name);
-    }
-    let rel_names: Vec<_> = components
-        .iter()
-        .map(|component| match component {
-            Component::Normal(name) => *name,
-            _ => unreachable!(),
-        })
-        .collect();
-    let total = root_names.len() + rel_names.len();
-    let mut current = if total == 0 {
-        open_root_fd(false, directory)?
-    } else {
-        open_root_fd(true, true)?
-    };
-    let mut index = 0usize;
-    for name in root_names {
-        let intermediate = index + 1 < total;
-        current = open_component(&current, name, intermediate, intermediate || directory)
-            .with_context(|| format!("open skill root {root:?}"))?;
-        index += 1;
-    }
-    for name in rel_names {
-        let intermediate = index + 1 < total;
-        current = open_component(&current, name, intermediate, intermediate || directory)
-            .with_context(|| format!("open resource {relative:?}"))?;
-        index += 1;
-    }
-    let metadata = current.metadata()?;
     ensure!(
-        if directory {
-            metadata.is_dir()
-        } else {
-            metadata.is_file()
-        },
-        "resource is not a regular {}: {relative:?}",
-        if directory { "directory" } else { "file" }
+        root.components().all(|part| matches!(
+            part,
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_)
+        )),
+        "skill root must be normalized"
     );
-    Ok(current)
-}
-
-fn open_root_fd(path_only: bool, directory: bool) -> Result<File> {
-    let root = CString::new("/").expect("static path");
-    let flags = if path_only {
-        libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY
-    } else {
-        libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 }
-    };
-    let fd = unsafe { libc::open(root.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn open_component(parent: &File, name: &OsStr, path_only: bool, directory: bool) -> Result<File> {
-    let name = CString::new(name.as_bytes()).context("path contains NUL")?;
-    let flags = if path_only {
-        // Traverse-only fd: requires execute (--x) rather than read (r--) on
-        // intermediate 0711 ancestors, while O_NOFOLLOW | O_DIRECTORY still
-        // fails with ENOTDIR on any symlink component.
-        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY
-    } else {
-        libc::O_RDONLY
-            | libc::O_CLOEXEC
-            | libc::O_NOFOLLOW
-            | libc::O_NONBLOCK
-            | if directory { libc::O_DIRECTORY } else { 0 }
-    };
-    // Each component is a single filename; no ancestor or leaf symlink is followed.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // openat returned a new owned fd.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    crate::platform::open_beneath(root, relative, directory)
+        .with_context(|| format!("open resource {relative:?} beneath {root:?}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::ffi::CString;
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
+    #[cfg(windows)]
+    fn symlink(source: impl AsRef<Path>, target: impl AsRef<Path>) -> std::io::Result<()> {
+        if source.as_ref().is_dir() {
+            std::os::windows::fs::symlink_dir(source, target)
+        } else {
+            std::os::windows::fs::symlink_file(source, target)
+        }
+    }
     use tempfile::TempDir;
 
     fn create_skill(parent: &Path, name: &str) -> PathBuf {
@@ -585,9 +502,12 @@ mod tests {
         symlink(temp.path(), root.join("directory-link")).unwrap();
         assert!(read(&skill, Path::new("directory-link/secret")).is_err());
         assert!(files(&skill).is_err());
-        let fifo = CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert!(read(&skill, Path::new("fifo")).is_err());
+        #[cfg(unix)]
+        {
+            let fifo = CString::new(root.join("fifo").as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+            assert!(read(&skill, Path::new("fifo")).is_err());
+        }
     }
 
     #[test]
@@ -643,6 +563,7 @@ mod tests {
         assert_eq!(catalog.warnings.len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn traverses_execute_only_ancestor_as_unprivileged_user() {
         use std::os::unix::fs::PermissionsExt;

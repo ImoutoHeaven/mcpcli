@@ -314,7 +314,7 @@ async fn remote(
             }
             let response = runtime::exchange_tracked(
                 &paths,
-                &paths.request(&loaded.digest, operation, remaining),
+                &paths.request(&loaded.digest, operation, remaining)?,
                 uncertain,
             )
             .await?;
@@ -387,7 +387,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 } else {
                     match runtime::exchange(
                         &paths,
-                        &paths.request("", Operation::Status, Duration::from_secs(2)),
+                        &paths.request("", Operation::Status, Duration::from_secs(2))?,
                     )
                     .await
                     {
@@ -416,7 +416,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 runtime::ensure(&paths, &loaded, true).await?;
                 let response = runtime::exchange(
                     &paths,
-                    &paths.request("", Operation::Status, Duration::from_secs(2)),
+                    &paths.request("", Operation::Status, Duration::from_secs(2))?,
                 )
                 .await?;
                 let status = response.result.unwrap();
@@ -600,14 +600,6 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     }
 }
 
-async fn interrupted() -> Result<i32> {
-    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    tokio::select! {
-        result=tokio::signal::ctrl_c()=>{ result?; Ok(130) },
-        _=terminate.recv()=>Ok(143),
-    }
-}
-
 async fn entry(cli: Cli) -> i32 {
     let foreground = matches!(
         cli.command,
@@ -621,11 +613,11 @@ async fn entry(cli: Cli) -> i32 {
     } else {
         tokio::select! {
             result = run(&cli, &uncertain) => result,
-            signal = interrupted() => match signal {
+            signal = mcpcli::platform::interrupted() => match signal {
                 Ok(code) => Err(Failure::new(code, "cancelled", "interrupted; cancellation is not rollback")
                     .uncertain(uncertain.load(Ordering::Acquire))
                     .into()),
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             },
         }
     };

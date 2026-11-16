@@ -4,7 +4,6 @@ use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::fmt;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 const MAX_DEPTH: usize = 64;
@@ -197,10 +196,7 @@ pub fn read_limited(reader: impl Read, max: usize) -> Result<Vec<u8>> {
 }
 
 pub fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)
+    let file = crate::platform::open_input(path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     if !file.metadata()?.is_file() {
         bail!("input must be a regular file");
@@ -294,6 +290,7 @@ mod tests {
             build: "test".into(),
             digest: "test".into(),
             timeout_ms: 1000,
+            deadline_ms: 1000,
             operation: crate::ipc::Operation::Call {
                 server: "server".into(),
                 tool: "echo".into(),
@@ -335,6 +332,7 @@ mod tests {
                 build: "test".into(),
                 digest: "test".into(),
                 timeout_ms: 1000,
+                deadline_ms: 1000,
                 operation: crate::ipc::Operation::Call {
                     server: "server".into(),
                     tool: "echo".into(),

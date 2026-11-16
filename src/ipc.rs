@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 pub const REQUEST_LIMIT: usize = 4 << 20;
 pub const RESPONSE_LIMIT: usize = 32 << 20;
 pub const ARGUMENT_LIMIT: usize = 1 << 20;
@@ -16,6 +16,7 @@ pub struct Request {
     pub build: String,
     pub digest: String,
     pub timeout_ms: u64,
+    pub deadline_ms: u64,
     pub operation: Operation,
 }
 
@@ -34,7 +35,6 @@ pub enum Operation {
     },
     Reset {
         server: String,
-        #[serde(default)]
         force: bool,
     },
 }

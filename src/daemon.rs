@@ -1,18 +1,20 @@
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response};
 use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure};
-use crate::runtime::{Lock, Paths, State, uid};
+use crate::platform::{
+    self,
+    local::{Conn, Listener},
+};
+use crate::runtime::{Lock, Paths, State};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
@@ -82,7 +84,8 @@ impl App {
         json!({"running":true,"pid":self.state.pid,"epoch":self.state.epoch,
             "session":self.paths.session,"namespace":self.paths.namespace,"version":env!("CARGO_PKG_VERSION"),
             "config_digest":self.config.digest,"build":self.paths.build,
-            "started_unix_ms":self.state.started_unix_ms,"servers":servers})
+            "started_unix_ms":self.state.started_unix_ms,"servers":servers,
+            "endpoint":self.paths.socket,"control_endpoint":self.paths.control_socket})
     }
     fn validate(&self, request: &Request) -> std::result::Result<(), Failure> {
         if request.protocol != ipc::PROTOCOL || request.namespace != self.paths.namespace {
@@ -150,6 +153,13 @@ impl App {
             .acquire()
             .await
             .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
+        if Instant::now() >= deadline {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "request deadline exceeded while queued",
+            ));
+        }
         if let Operation::Reset { force, .. } = operation {
             state.lost = true;
             let mut warning = None;
@@ -255,7 +265,7 @@ impl App {
     }
 }
 
-async fn send(stream: &mut UnixStream, app: &App, result: std::result::Result<Value, Failure>) {
+async fn send(stream: &mut Conn, app: &App, result: std::result::Result<Value, Failure>) {
     let response = app.response(result);
     let write = async {
         if let Err(error) = ipc::write_frame(stream, &response, ipc::RESPONSE_LIMIT).await
@@ -273,8 +283,8 @@ async fn send(stream: &mut UnixStream, app: &App, result: std::result::Result<Va
     let _ = timeout(FRAME_WAIT, write).await;
 }
 
-async fn handle(mut stream: UnixStream, app: Arc<App>, control: bool) {
-    if !matches!(stream.peer_cred(),Ok(peer) if peer.uid()==uid()) {
+async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
+    if platform::validate_client(&stream).is_err() {
         return;
     }
     let request = match timeout(
@@ -303,15 +313,35 @@ async fn handle(mut stream: UnixStream, app: Arc<App>, control: bool) {
         send(&mut stream, &app, Err(error)).await;
         return;
     }
+    let remaining = match platform::monotonic_millis() {
+        Ok(now) => request
+            .deadline_ms
+            .saturating_sub(now)
+            .min(request.timeout_ms),
+        Err(_) => return,
+    };
+    if remaining == 0 {
+        send(
+            &mut stream,
+            &app,
+            Err(Failure::new(
+                5,
+                "timeout",
+                "request expired before admission",
+            )),
+        )
+        .await;
+        return;
+    }
     if matches!(request.operation, Operation::Stop) {
         send(&mut stream, &app, Ok(json!({"stopping":true}))).await;
         app.shutdown.cancel();
         return;
     }
-    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    let deadline = Instant::now() + Duration::from_millis(remaining);
     let dispatched = AtomicBool::new(false);
     let execute = timeout(
-        Duration::from_millis(request.timeout_ms),
+        Duration::from_millis(remaining),
         app.execute(&request.operation, deadline, &dispatched),
     );
     let mut extra = [0u8; 1];
@@ -334,10 +364,10 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
     let _lifetime =
         Lock::try_acquire(&paths.daemon_lock())?.context("daemon is already running")?;
     paths.remove_socket()?;
-    let listener = UnixListener::bind(&paths.socket)?;
-    let control_listener = UnixListener::bind(&paths.control_socket)?;
+    let mut listener = Listener::bind(paths.socket.as_os_str())?;
+    let mut control_listener = Listener::bind(paths.control_socket.as_os_str())?;
     for socket in [&paths.socket, &paths.control_socket] {
-        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+        platform::secure_endpoint(socket)?;
     }
     let mut state = State::fresh();
     state.store(&paths)?;
@@ -358,20 +388,19 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let control_connections = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
     let mut tasks = JoinSet::new();
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let interrupted = platform::interrupted();
+    tokio::pin!(interrupted);
     loop {
         tokio::select! {
             _ = app.shutdown.cancelled() => break,
-            _ = term.recv() => break,
-            _ = interrupt.recv() => break,
+            signal = &mut interrupted => { signal?; break; },
             _ = tasks.join_next(), if !tasks.is_empty() => {},
             accepted = async {
                 let permit = connections.clone().acquire_owned().await.ok()?;
                 Some((listener.accept().await, permit))
             } => {
                 if let Some((accepted, permit)) = accepted {
-                    let (stream, _) = accepted?;
+                    let stream = accepted?;
                     let app = app.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
@@ -384,7 +413,7 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
                 Some((control_listener.accept().await, permit))
             } => {
                 if let Some((accepted, permit)) = accepted {
-                    let (stream, _) = accepted?;
+                    let stream = accepted?;
                     let app = app.clone();
                     tasks.spawn(async move {
                         let _permit = permit;
