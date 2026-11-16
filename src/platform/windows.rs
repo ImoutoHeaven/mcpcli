@@ -1,5 +1,5 @@
 use super::local::{self, SecurityAttributes};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -158,7 +158,8 @@ pub fn private_dir(path: &Path) -> Result<()> {
     let parents: Vec<_> = path.ancestors().skip(1).collect();
     for parent in parents.into_iter().rev() {
         let guard = open_directory(parent, false)?;
-        check_security(&guard, false)?;
+        check_security(&guard, false)
+            .with_context(|| format!("unsafe runtime ancestor {parent:?}"))?;
         guards.push(guard);
     }
     let attributes = SecurityAttributes::owner_only(true)?;
@@ -171,7 +172,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
         }
     }
     let file = open_directory(path, false)?;
-    check_security(&file, true)?;
+    check_security(&file, true).with_context(|| format!("unsafe runtime directory {path:?}"))?;
     Ok(())
 }
 

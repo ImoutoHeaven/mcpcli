@@ -60,7 +60,9 @@ fn runtime_dacls_and_reparse_points_are_checked() {
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
     };
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, WRITE_DAC};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
+    };
     let base = tempfile::tempdir().unwrap();
     let directory = base.path().canonicalize().unwrap().join("private");
     private_dir(&directory).unwrap();
@@ -75,7 +77,7 @@ fn runtime_dacls_and_reparse_points_are_checked() {
     assert!(private_dir(&link).is_err());
     for target in [&path, &directory] {
         let file = std::fs::OpenOptions::new()
-            .access_mode(WRITE_DAC)
+            .access_mode(READ_CONTROL | WRITE_DAC)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(target)
             .unwrap();
@@ -309,4 +311,23 @@ fn daemon_spawn_respects_job_breakaway_policy() {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn default_runtime_parent_accepts_private_user_files() {
+    let profile =
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").expect("Windows user local app data"))
+            .canonicalize()
+            .unwrap();
+    assert_eq!(default_runtime().unwrap().parent(), Some(profile.as_path()));
+    let base = tempfile::tempdir_in(&profile).unwrap();
+    let private = base.path().join("runtime");
+    private_dir(&private).unwrap();
+    secure_file(&private.join("state")).unwrap();
+    eprintln!(
+        "Windows native temp: {}; local app data: {}",
+        std::env::temp_dir().display(),
+        profile.display()
+    );
 }
