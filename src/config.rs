@@ -379,6 +379,53 @@ fn expand_env(value: &str) -> Result<String> {
     }
 }
 
+fn from_config_directory(parent: &Path, path: &Path) -> Result<PathBuf> {
+    #[cfg(windows)]
+    if !path.is_absolute()
+        && (path.has_root()
+            || matches!(
+                path.components().next(),
+                Some(std::path::Component::Prefix(_))
+            ))
+    {
+        bail!("configuration paths must be absolute or relative, not drive-relative");
+    }
+    Ok(if path.is_absolute() {
+        path.to_owned()
+    } else {
+        parent.join(path)
+    })
+}
+
+#[cfg(windows)]
+fn reject_duplicate_windows_env<'a>(keys: impl Iterator<Item = &'a String>) -> Result<()> {
+    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
+    let mut seen: Vec<Vec<u16>> = Vec::new();
+    for key in keys {
+        let key: Vec<u16> = key.encode_utf16().collect();
+        for previous in &seen {
+            // SAFETY: both UTF-16 buffers have explicit lengths and stay live for the call.
+            let comparison = unsafe {
+                CompareStringOrdinal(
+                    previous.as_ptr(),
+                    previous.len() as i32,
+                    key.as_ptr(),
+                    key.len() as i32,
+                    1,
+                )
+            };
+            if comparison == 0 {
+                bail!("cannot compare Windows environment variable names");
+            }
+            if comparison == CSTR_EQUAL {
+                bail!("duplicate case-insensitive Windows environment variable");
+            }
+        }
+        seen.push(key);
+    }
+    Ok(())
+}
+
 impl LoadedConfig {
     pub fn load(path: &Path) -> Result<Self> {
         let path = locate(path)?;
@@ -412,19 +459,15 @@ impl LoadedConfig {
                     if args.len() > 1024 || args.iter().any(|s| s.contains('\0')) {
                         bail!("server {name}: invalid or too many arguments");
                     }
-                    // Commands containing a slash resolve from the config, not the caller's cwd.
-                    if command.contains('/') && !Path::new(command).is_absolute() {
-                        *command = parent
-                            .join(&*command)
+                    // Explicit command paths use the configuration directory on every platform.
+                    if command.contains('/') || (cfg!(windows) && command.contains(['\\', ':'])) {
+                        *command = from_config_directory(parent, Path::new(command))?
                             .to_str()
                             .context("command path is not UTF-8")?
                             .to_owned();
                     }
-                    let resolved = match cwd.as_ref() {
-                        Some(p) if p.is_absolute() => p.clone(),
-                        Some(p) => parent.join(p),
-                        None => parent.to_path_buf(),
-                    };
+                    let resolved =
+                        from_config_directory(parent, cwd.as_deref().unwrap_or(Path::new(".")))?;
                     let resolved = resolved
                         .canonicalize()
                         .with_context(|| format!("server {name}: cwd does not exist"))?;
@@ -435,6 +478,8 @@ impl LoadedConfig {
                     if env.len() > 256 {
                         bail!("server {name}: too many environment overrides");
                     }
+                    #[cfg(windows)]
+                    reject_duplicate_windows_env(env.keys())?;
                     for (key, value) in env {
                         if key.is_empty() || key.contains(['=', '\0']) {
                             bail!("server {name}: invalid environment variable name");
@@ -488,9 +533,7 @@ impl LoadedConfig {
             if root.as_os_str().is_empty() {
                 bail!("skill root path must not be empty");
             }
-            if !root.is_absolute() {
-                *root = parent.join(&*root);
-            }
+            *root = from_config_directory(parent, root)?;
         }
         let digest = digest(&serde_json::to_vec(&config)?);
         Ok(Self {
@@ -517,8 +560,9 @@ mod tests {
         let ServerConfig::Stdio { command, cwd, .. } = &loaded.config.servers["x"] else {
             panic!()
         };
-        assert_eq!(command, dir.path().join("bin/server").to_str().unwrap());
-        assert_eq!(cwd.as_deref(), Some(dir.path()));
+        let canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(command, canonical.join("bin/server").to_str().unwrap());
+        assert_eq!(cwd.as_deref(), Some(canonical.as_path()));
         assert!(loaded.config.skills[0].is_absolute());
         std::fs::write(&path, r#"{"servers":{"x":{"transport":"http","url":"https://example.test","headers":{"Host":"elsewhere"}}}}"#).unwrap();
         assert!(LoadedConfig::load(&path).is_err());
@@ -558,7 +602,44 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             locate(&dir.path().join("deleted.json")).unwrap(),
-            dir.path().join("deleted.json")
+            dir.path().canonicalize().unwrap().join("deleted.json")
         );
+    }
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_paths_resolve_from_config_and_reject_ambiguous_drives() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcpcli.json");
+        std::fs::write(
+            &path,
+            r#"{"servers":{"x":{"transport":"stdio","command":"bin\\server.exe"}}}"#,
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&path).unwrap();
+        let ServerConfig::Stdio { command, .. } = &loaded.config.servers["x"] else {
+            panic!()
+        };
+        assert_eq!(
+            Path::new(command),
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join("bin")
+                .join("server.exe")
+        );
+        for command in ["C:server.exe", r"\server.exe"] {
+            let config =
+                serde_json::json!({"servers":{"x":{"transport":"stdio","command":command}}});
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(LoadedConfig::load(&path).is_err());
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn rejects_windows_environment_name_collisions() {
+        assert!(
+            reject_duplicate_windows_env(["Path".to_owned(), "PATH".to_owned()].iter()).is_err()
+        );
+        assert!(reject_duplicate_windows_env(["FOO".to_owned(), "BAR".to_owned()].iter()).is_ok());
     }
 }
