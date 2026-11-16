@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "Pinned real MCP service dependencies for CI",
+  "dependencies": {
+    "@playwright/mcp": "0.0.85"
+  }
+}

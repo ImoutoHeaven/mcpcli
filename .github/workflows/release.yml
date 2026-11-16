@@ -1,0 +1,244 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+    # Preflight the frozen release candidate before publishing main or a tag.
+    branches: ["wip/release-checkpoint"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONUTF8: "1"
+
+jobs:
+  check:
+    name: verify version and source
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - id: version
+        shell: bash
+        run: |
+          version="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['package']['version'])")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+
+  ci:
+    needs: check
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: archive (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: macos-amd64, runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { name: macos-arm64, runner: macos-15, target: aarch64-apple-darwin }
+          - { name: windows-amd64, runner: windows-2022, target: x86_64-pc-windows-msvc }
+          - { name: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      BIN: target/${{ matrix.target }}/release/mcpcli${{ contains(matrix.name, 'windows') && '.exe' || '' }}
+      ARCHIVE: dist/mcpcli-${{ needs.check.outputs.version }}-${{ matrix.name }}.${{ contains(matrix.name, 'windows') && 'zip' || 'tar.gz' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc
+        with:
+          toolchain: "1.92.0"
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@e9d7b9f1e587218970671bac74e5511ed9506e6a # v2
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package
+        shell: bash
+        run: python scripts/ci/package.py "$BIN" "$VERSION" "${{ matrix.name }}"
+      - name: extracted archive E2E (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: python scripts/ci/smoke-release.py "$ARCHIVE" "$VERSION"
+      - name: extracted archive E2E (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/ci/windows-tests.ps1 -PythonScript scripts/ci/smoke-release.py -ScriptArguments $env:ARCHIVE, $env:VERSION
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.name }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+      - name: failure evidence
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-log-${{ matrix.name }}
+          path: ci-*.log
+          if-no-files-found: ignore
+
+  linux:
+    name: archive (linux-${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      ARCHIVE: dist/mcpcli-${{ needs.check.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: native musl build and package
+        run: |
+          docker run --rm --init -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+            -e VERSION -e CARGO_BUILD_JOBS=2 rust:1.92.0-alpine3.23 sh -ec '
+              apk add --no-cache python3 build-base
+              cargo build --release --locked
+              python3 scripts/ci/package.py target/release/mcpcli "$VERSION" "linux-${{ matrix.arch }}"
+            '
+      - name: extracted archive E2E on Alpine and Debian
+        run: |
+          for image in alpine:3.23 debian:bookworm-slim; do
+            docker run --rm --init -v "$GITHUB_WORKSPACE:/workspace:ro" -w /workspace \
+              -e VERSION -e ARCHIVE "$image" sh -ec '
+                if command -v apk >/dev/null; then
+                  apk add --no-cache python3 procps
+                else
+                  apt-get update
+                  apt-get install -y --no-install-recommends python3 procps
+                fi
+                python3 scripts/ci/smoke-release.py "$ARCHIVE" "$VERSION"
+              '
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  freebsd:
+    name: archive (freebsd-amd64)
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: native build, package and extracted archive E2E
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "15.1"
+          arch: x86_64
+          mem: 6144
+          cpu: 4
+          envs: VERSION
+          prepare: pkg install -y rust python3
+          run: |
+            set -eu
+            export CARGO_TARGET_DIR=/mcpcli-release-target
+            export CARGO_BUILD_JOBS=2
+            cargo build --release --locked
+            python3 scripts/ci/package.py "$CARGO_TARGET_DIR/release/mcpcli" "$VERSION" freebsd-amd64
+            python3 scripts/ci/smoke-release.py "dist/mcpcli-$VERSION-freebsd-amd64.tar.gz" "$VERSION"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-freebsd-amd64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  gate:
+    name: all release checks passed
+    if: always()
+    needs: [check, ci, build, linux, freebsd]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: require every suite and archive
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ["RESULTS"])
+          assert results and all(job["result"] == "success" for job in results.values()), results
+          PY
+
+  bundle:
+    name: verify release bundle
+    needs: [check, gate]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: verify archive set and checksums
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          version = os.environ["VERSION"]
+          platforms = ["linux-amd64", "linux-arm64", "macos-amd64", "macos-arm64",
+                       "windows-amd64", "windows-arm64", "freebsd-amd64"]
+          expected = {f"mcpcli-{version}-{p}." + ("zip" if p.startswith("windows") else "tar.gz")
+                      for p in platforms}
+          root = Path("dist")
+          assert {p.name for p in root.iterdir()} == expected
+          lines = [hashlib.sha256((root / name).read_bytes()).hexdigest() + "  " + name
+                   for name in sorted(expected)]
+          (root / "SHA256SUMS").write_text("\n".join(lines) + "\n")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-bundle
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: create draft release
+    needs: [check, bundle]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-bundle
+          path: dist
+      - name: create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          live="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF" --jq .sha)"
+          test "$live" = "${{ needs.check.outputs.commit }}"
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes --title "mcpcli ${{ needs.check.outputs.version }}"
