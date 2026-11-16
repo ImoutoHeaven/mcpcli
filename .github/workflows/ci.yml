@@ -53,6 +53,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          overwrite: true
           name: evidence-native-${{ matrix.os }}
           path: |
             ci-*.log
@@ -97,6 +98,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          overwrite: true
           name: evidence-${{ matrix.name }}
           path: |
             ci-*.log
@@ -148,6 +150,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          overwrite: true
           name: evidence-freebsd-amd64
           path: |
             ci-*.log
@@ -200,6 +203,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
+          overwrite: true
           name: evidence-real-services
           path: ci-real-services
           if-no-files-found: warn
