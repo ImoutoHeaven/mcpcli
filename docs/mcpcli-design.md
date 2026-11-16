@@ -2,10 +2,10 @@
 
 ## 1. Product contract
 
-mcpcli is a standalone cross-platform command-line client for configured MCP tools and
-local Agent Skills. A short-lived CLI process can discover capabilities, inspect
-one tool, call it, or read one skill resource. A local daemon retains connections
-and application state between CLI processes.
+mcpcli is a native command-line client for configured MCP tools and local Agent
+Skills. Each CLI process discovers tools, inspects metadata, invokes a tool, or
+reads a skill resource. A local daemon keeps connections and application state
+alive between commands.
 
 Version 0.1.0 supports stdio and Streamable HTTP, including the modern
 2026-07-28 protocol and legacy lifecycle negotiation through rmcp 3.9.0. The
@@ -23,23 +23,19 @@ local domain sockets; Windows uses named pipes. This is a native executable; it
 does not need Python or Node to run. A configured MCP server may need its own
 runtime. This client is a trusted-command runner, not a security sandbox.
 
-## 2. Why a daemon
+## 2. Connection ownership
 
-The modern MCP specification is no longer intrinsically a connection-scoped
-initialize/session protocol. Application state still matters: a stdio process
-owns its browser, tasks, and in-memory data, and legacy servers can require
-initialized sessions. HTTP servers may also keep application state independent
-of protocol sessions.
+The daemon owns both transports, including notifications, request routing, HTTP
+streams, and protocol negotiation. A stdio server keeps its browser, tasks, and
+in-memory data for the connection lifetime. Legacy servers can require an
+initialized session; HTTP application state can exist independently of protocol
+sessions. The modern MCP protocol also supports a lifecycle without connection-scoped
+initialization. An HTTP session ID alone cannot retain the live client connection.
 
-One daemon owns both transports. There is no separate HTTP session-id file mode:
-an ID alone does not retain notifications, request routing, an HTTP stream,
-protocol negotiation, or application semantics.
-
-The daemon starts with zero downstream processes. A server is opened on its first
-tools, inspect, or call request. Connections stay alive until reset, daemon stop,
-a signal, or process failure. There is no automatic idle eviction, because
-eviction can destroy state that a later CLI command expects. --oneshot provides
-an explicit connection that is closed after a single command.
+The daemon opens a server on its first tools, inspect, or call request. Connections
+stay alive until reset, daemon stop, a signal, or process failure. Idle connections
+remain open to preserve state for later commands. --oneshot opens a connection
+that closes after one command.
 
 Session identity is the canonical configuration-file path plus --session NAME.
 Different names have separate daemons and stdio processes. This controls client
@@ -62,12 +58,10 @@ that two independently configured servers intentionally share.
 | reset [--force] SERVER | Close that connection and discard its client state | No new connection |
 | daemon start/status/stop/restart/run | Manage the selected daemon | No downstream connection |
 
-There is no startup scan of all MCP servers. Tool schemas are fetched only for
-the selected server. Every tools and inspect command fetches the current list;
-every call also performs fresh discovery before dispatch. This enables modern
-HTTP x-mcp-header mapping and prevents invoking a tool that the SDK filtered
-out or the server withdrew. Pagination, discovery, and dispatch share one
-operation budget.
+Tool schemas are fetched only for the selected server. Every tools, inspect, and
+call command fetches the current list. Fresh discovery supplies modern HTTP
+x-mcp-header mappings and excludes tools filtered by the SDK or withdrawn by the
+server. Pagination, discovery, and dispatch share one operation budget.
 
 There is no persistent schema cache. The SDK response cache is disabled. The SDK
 still retains internal per-tool metadata for HTTP header mapping; fresh
@@ -76,18 +70,17 @@ connection can handle legacy or unsolicited list-change notifications. Modern
 subscription-based notifications are not subscribed to in 0.1.0. Reading the
 current list does not depend on a notification or a previously cached flag.
 
-A full JSON Schema is not a general command-line flag grammar. Synthesizing CLI
-flags from arbitrary schemas introduces name-normalization collisions (such as
-`fooBar` versus `foo_bar`), ambiguous union or array coercion, nested-object
-escaping hazards, and brittle behavior when unknown properties appear. The CLI
-therefore uses one explicit JSON-object input, supplied by exactly one of
---args JSON, --args-file PATH, or --stdin. An omitted input is {}.
+Tool arguments use one JSON object, supplied by exactly one of --args JSON,
+--args-file PATH, or --stdin. An omitted input is {}. Fields retain their schema
+names, including distinct names such as `fooBar` and `foo_bar`. Union types,
+arrays, nested objects, and unknown properties stay in JSON instead of being
+mapped to generated flags.
 
 ## 4. Configuration and environment
 
 Configuration is JSON. The default path is ./mcpcli.json; --config and
-MCPCLI_CONFIG select another file. The CLI does not search ancestor projects or
-implicitly execute commands from another application's configuration.
+MCPCLI_CONFIG select another file. The CLI reads only that file, without searching
+ancestor projects or importing another application's configuration.
 
 The version field defaults to 1. servers is a map of aliases to tagged transport
 definitions. skills is a list of explicit directory paths. mcpServers and
@@ -228,13 +221,12 @@ supervisor killed it; it reports lost state and requires an explicit
 start/restart. Foreground daemon run is available for ordinary process
 supervision.
 
-The SDK can discard close errors or detach a private task if its own timeout
-helper is used. mcpcli instead retains the owned close future inside the
-connection, joins it, and separately records transport cleanup failures.
-The eight-second close deadline does not discard that future; a later close
-can continue waiting. HTTP DELETE has a two-second deadline. HTTP 404 and the
-protocol-permitted 405 allow local closure; they do not prove that remote
-application state was erased. Other cleanup failures remain visible.
+mcpcli retains and joins the close future, recording transport cleanup failures
+separately from the SDK task result. If the eight-second close deadline expires,
+a later close can continue waiting on the same future. HTTP DELETE has a
+two-second deadline and accepts only 2xx, 404, or the protocol-permitted 405.
+Other statuses, including redirects, leave remote cleanup unconfirmed. A 404 or
+405 allows local closure without proving that remote application state was erased.
 
 On Unix, a stdio child has its own process group. Shutdown closes stdin, waits briefly,
 then uses TERM/KILL as needed and reaps the child. WNOWAIT observations retain
@@ -315,10 +307,10 @@ mode notices also go to stderr. Exit status alone is not a retry policy.
 
 ## 8. Agent Skills
 
-Skills are mounted local directories, not an installation or execution service.
-A root can be one skill directory or a directory whose immediate children are
-skills. Only SKILL.md identifies a skill. A recursive scan of arbitrary Markdown
-would incorrectly classify references and notes.
+A skill root is a local directory containing SKILL.md, or a directory whose
+immediate children contain skills. References and other Markdown files remain
+resources within their skill. The CLI reads mounted skills without installing
+or executing them.
 
 Real YAML parsing supports standard frontmatter, multiline text, CRLF, and BOM.
 Name, description, directory-name agreement, and standard optional field types
@@ -365,7 +357,8 @@ file changes remain visible on the next read.
 ## 9. Verification
 
 `ci.yml` runs formatting, Clippy with warnings denied, Rust unit/protocol tests,
-and the release CLI E2E suite on Ubuntu, Alpine, Debian, FreeBSD, macOS and Windows.
+Python helper regressions, and the release CLI E2E suite on Ubuntu, Alpine,
+Debian, FreeBSD, macOS and Windows.
 Linux containers cover x86-64 and ARM64, macOS covers Intel and Apple silicon,
 and Windows covers x86-64 and ARM64. The root permission fixture is mandatory
 in container and FreeBSD jobs. OS-specific tests are recorded explicitly; Windows
@@ -392,7 +385,6 @@ the draft follows verification of the frozen commit and release assets.
 - [Microsoft Playwright MCP](https://github.com/microsoft/playwright-mcp)
 - [fastexec daemon design reference](https://github.com/ImoutoHeaven/fastexec-mcp/tree/a9b2985fd21143dc68abd0c04d795deeed91a8e4)
 
-The fastexec reference informed private runtime directories, separate startup and
+The fastexec reference covers private runtime directories, separate startup and
 lifetime locks, bounded framing, identity checks, and process ownership. mcpcli
-has its own shorter-lived CLI clients and retains server sessions independently
-of individual IPC connections.
+retains server sessions independently of its short-lived CLI connections.
