@@ -135,7 +135,8 @@ jobs:
               rustc --version &&
               cargo fmt --all -- --check &&
               cargo clippy --locked --all-targets -- -D warnings &&
-              python3 scripts/ci/run-tests.py
+              python3 scripts/ci/run-tests.py &&
+              sh scripts/ci/freebsd-acl-tests.sh
             ) > ci-freebsd.log 2>&1; then
               status=0
             else
