@@ -45,7 +45,9 @@ use tokio::{
 
 use crate::config::ServerConfig;
 
+pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_TOOLS: usize = 10_000;
 const MAX_TOOL_PAGES: usize = 256;
 
@@ -87,16 +89,41 @@ fn failure_with_outcome(
     .into()
 }
 
-type CleanupState = Arc<Mutex<Option<McpFailure>>>;
+#[derive(Clone, Debug)]
+struct CleanupRecord {
+    failure: McpFailure,
+    local_confirmed: bool,
+}
 
-fn record_cleanup_failure(state: &CleanupState, kind: FailureKind, message: &str) {
+type CleanupState = Arc<Mutex<Option<CleanupRecord>>>;
+
+fn record_cleanup_failure(
+    state: &CleanupState,
+    kind: FailureKind,
+    message: &str,
+    local_confirmed: bool,
+) {
     let mut stored = state.lock().unwrap_or_else(|poison| poison.into_inner());
-    if stored.is_none() {
-        *stored = Some(McpFailure {
-            kind,
-            message: message.into(),
-            outcome_unknown: false,
-        });
+    match stored.as_mut() {
+        None => {
+            *stored = Some(CleanupRecord {
+                failure: McpFailure {
+                    kind,
+                    message: message.into(),
+                    outcome_unknown: false,
+                },
+                local_confirmed,
+            });
+        }
+        Some(existing) if existing.local_confirmed && !local_confirmed => {
+            existing.failure = McpFailure {
+                kind,
+                message: message.into(),
+                outcome_unknown: false,
+            };
+            existing.local_confirmed = false;
+        }
+        Some(_) => {}
     }
 }
 
@@ -199,7 +226,7 @@ impl McpConnection {
                         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                             failure(FailureKind::Protocol, "Invalid HTTP header name")
                         })?;
-                        if reserved_header(name.as_str()) {
+                        if crate::config::is_reserved_header(name.as_str()) {
                             return Err(failure(
                                 FailureKind::Protocol,
                                 format!("HTTP header {name} is reserved"),
@@ -214,7 +241,7 @@ impl McpConnection {
                     let client = reqwest::Client::builder()
                         .redirect(reqwest::redirect::Policy::none())
                         .retry(reqwest::retry::never())
-                        .connect_timeout(budget)
+                        .connect_timeout(MAX_CONNECT)
                         .build()
                         .map_err(|_| {
                             failure(FailureKind::Transport, "Cannot create HTTP client")
@@ -258,6 +285,17 @@ impl McpConnection {
     pub fn is_closed(&self) -> bool {
         self.service.as_ref().is_none_or(RunningService::is_closed)
             || self.peer.is_transport_closed()
+    }
+
+    pub fn is_local_closed(&self) -> bool {
+        self.service.is_none()
+            && self.closing.is_none()
+            && self
+                .cleanup
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .is_none_or(|record| record.local_confirmed)
     }
 
     pub fn take_tools_changed(&self) -> bool {
@@ -414,6 +452,7 @@ impl McpConnection {
                     &self.cleanup,
                     FailureKind::Transport,
                     "MCP service task failed during cleanup; local closure is not confirmed",
+                    false,
                 );
             }
         }
@@ -421,7 +460,8 @@ impl McpConnection {
             .cleanup
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
+            .as_ref()
+            .map(|record| record.failure.clone());
         match error {
             Some(error) => Err(error.into()),
             None => Ok(()),
@@ -447,21 +487,12 @@ fn init_failure(error: rmcp::service::ClientInitializeError) -> anyhow::Error {
     }
 }
 
-fn reserved_header(name: &str) -> bool {
-    matches!(
-        name,
-        "host"
-            | "connection"
-            | "transfer-encoding"
-            | "content-length"
-            | "accept"
-            | "content-type"
-            | "mcp-session-id"
-            | "mcp-protocol-version"
-            | "mcp-method"
-            | "mcp-name"
-            | "last-event-id"
-    ) || name.starts_with("mcp-param-")
+fn has_media_type(content_type: &str, expected: &str) -> bool {
+    let essence = content_type
+        .split_once(';')
+        .map_or(content_type, |(essence, _)| essence)
+        .trim();
+    essence.eq_ignore_ascii_case(expected)
 }
 
 /// Own the child throughout shutdown, including cancellation of the close future.
@@ -618,6 +649,7 @@ impl Transport<RoleClient> for ChildTransport {
                 &self.cleanup,
                 FailureKind::Transport,
                 "MCP child cleanup failed; local closure is not confirmed",
+                false,
             );
         }
         result
@@ -714,7 +746,7 @@ impl BoundedHttp {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        if status.is_success() && content_type.starts_with("text/event-stream") {
+        if status.is_success() && has_media_type(&content_type, "text/event-stream") {
             let stream = response
                 .bytes_stream()
                 .scan((0usize, false), move |state, chunk| {
@@ -750,26 +782,49 @@ impl BoundedHttp {
             .filter(|v| v.as_bytes().len() <= 128)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let body = Self::bounded_body(response, limit).await?;
+        let is_json = has_media_type(&content_type, "application/json");
         if !status.is_success() {
             // Legacy middleware may reject discover before JSON-RPC dispatch.
             // Correlate only this read-only probe, never an ordinary tool call.
-            if !had_session
+            let discover_request_id = if !had_session
                 && status.is_client_error()
+                && status != http::StatusCode::TOO_MANY_REQUESTS
                 && let ClientJsonRpcMessage::Request(request) = &message
                 && matches!(request.request, ClientRequest::DiscoverRequest(_))
-                && status != http::StatusCode::TOO_MANY_REQUESTS
             {
+                Some(request.id.clone())
+            } else {
+                None
+            };
+            if status == http::StatusCode::TOO_MANY_REQUESTS
+                || (discover_request_id.is_none() && !is_json)
+            {
+                return Err(HttpError::HttpStatus(HttpStatusError::new(
+                    status.as_u16(),
+                    retry_after,
+                )));
+            }
+            let body = match Self::bounded_body(response, limit.min(MAX_ERROR_BYTES)).await {
+                Ok(body) => body,
+                Err(_) if discover_request_id.is_some() => Vec::new(),
+                Err(_) => {
+                    return Err(HttpError::HttpStatus(HttpStatusError::new(
+                        status.as_u16(),
+                        retry_after,
+                    )));
+                }
+            };
+            if let Some(request_id) = discover_request_id {
                 let error = match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
                     Ok(ServerJsonRpcMessage::Error(error)) => error.error,
                     _ => ErrorData::invalid_request("server/discover is unavailable", None),
                 };
                 return Ok(StreamableHttpPostResponse::Json(
-                    ServerJsonRpcMessage::error(error, Some(request.id.clone())),
+                    ServerJsonRpcMessage::error(error, Some(request_id)),
                     None,
                 ));
             }
-            if content_type.starts_with("application/json")
+            if is_json
                 && let Ok(message @ ServerJsonRpcMessage::Error(_)) = serde_json::from_slice(&body)
             {
                 return Ok(StreamableHttpPostResponse::Json(message, session));
@@ -779,7 +834,11 @@ impl BoundedHttp {
                 retry_after,
             )));
         }
-        if !content_type.starts_with("application/json") {
+        let body = Self::bounded_body(response, limit).await?;
+        if notification && body.is_empty() {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if !is_json {
             return Err(HttpError::UnexpectedContentType(None));
         }
         match serde_json::from_slice(&body) {
@@ -851,6 +910,7 @@ impl StreamableHttpClient for BoundedHttp {
         headers: HashMap<HeaderName, HeaderValue>,
         limit: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, HttpError> {
+        let had_session = session.is_some();
         self.client
             .get_stream_with_max_sse_event_size(
                 uri,
@@ -861,6 +921,26 @@ impl StreamableHttpClient for BoundedHttp {
                 limit.min(MAX_RESPONSE_BYTES),
             )
             .await
+            .map_err(|error| match error {
+                HttpError::AuthRequired(_) | HttpError::InsufficientScope(_) => {
+                    HttpError::AuthRequired(AuthRequiredError::new(String::new()))
+                }
+                HttpError::Client(ref err) if err.status().is_some() => {
+                    let status = err.status().unwrap();
+                    if matches!(
+                        status,
+                        http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
+                    ) {
+                        HttpError::AuthRequired(AuthRequiredError::new(String::new()))
+                    } else if status == http::StatusCode::NOT_FOUND && had_session {
+                        HttpError::SessionExpired
+                    } else {
+                        HttpError::HttpStatus(HttpStatusError::new(status.as_u16(), None))
+                    }
+                }
+                HttpError::UnexpectedContentType(_) => HttpError::UnexpectedContentType(None),
+                other => other,
+            })
     }
     async fn delete_session(
         &self,
@@ -890,6 +970,7 @@ impl StreamableHttpClient for BoundedHttp {
                     &self.cleanup,
                     FailureKind::Transport,
                     "Local MCP client stopped; remote session deletion was not confirmed",
+                    true,
                 );
                 Err(HttpError::Io(std::io::Error::other(
                     "Session deletion failed",
@@ -900,6 +981,7 @@ impl StreamableHttpClient for BoundedHttp {
                     &self.cleanup,
                     FailureKind::Timeout,
                     "Local MCP client stopped; remote session deletion timed out",
+                    true,
                 );
                 Err(HttpError::Io(std::io::Error::other(
                     "Session deletion timed out",

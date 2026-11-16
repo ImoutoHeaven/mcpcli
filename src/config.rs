@@ -75,6 +75,264 @@ pub fn valid_name(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+pub fn is_reserved_header(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "host"
+            | "content-length"
+            | "content-type"
+            | "accept"
+            | "connection"
+            | "transfer-encoding"
+            | "upgrade"
+            | "te"
+            | "trailer"
+            | "last-event-id"
+    ) || lower.starts_with("mcp-")
+        || lower.starts_with("mcp_")
+}
+
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn safe_key(key: &str) -> String {
+    if valid_name(key) {
+        format!("{key:?}")
+    } else {
+        "<redacted-key>".into()
+    }
+}
+
+/// Diagnose configuration shape errors using field paths and value kinds only,
+/// never echoing scalar string or number contents.
+fn diagnose_config_shape(value: &serde_json::Value) -> String {
+    let Some(root) = value.as_object() else {
+        return format!(
+            "invalid configuration shape: root must be a JSON object, got {}",
+            json_kind(value)
+        );
+    };
+    if root.contains_key("servers") && root.contains_key("mcpServers") {
+        return "invalid configuration shape: specify only one of \"servers\" or \"mcpServers\""
+            .into();
+    }
+    if root.contains_key("skills") && root.contains_key("skillDirs") {
+        return "invalid configuration shape: specify only one of \"skills\" or \"skillDirs\""
+            .into();
+    }
+    for key in root.keys() {
+        if !matches!(
+            key.as_str(),
+            "version" | "servers" | "mcpServers" | "skills" | "skillDirs"
+        ) {
+            return format!(
+                "invalid configuration shape: unknown top-level field {}",
+                safe_key(key)
+            );
+        }
+    }
+    if let Some(version) = root.get("version")
+        && version
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .is_none()
+    {
+        return format!(
+            "invalid configuration shape at version: expected unsigned integer, got {}",
+            json_kind(version)
+        );
+    }
+    for skills_field in ["skills", "skillDirs"] {
+        if let Some(skills) = root.get(skills_field) {
+            let Some(items) = skills.as_array() else {
+                return format!(
+                    "invalid configuration shape at {skills_field}: expected array of strings, got {}",
+                    json_kind(skills)
+                );
+            };
+            for (index, item) in items.iter().enumerate() {
+                if !item.is_string() {
+                    return format!(
+                        "invalid configuration shape at {skills_field}[{index}]: expected string, got {}",
+                        json_kind(item)
+                    );
+                }
+            }
+        }
+    }
+    for servers_field in ["servers", "mcpServers"] {
+        if let Some(servers) = root.get(servers_field) {
+            let Some(entries) = servers.as_object() else {
+                return format!(
+                    "invalid configuration shape at {servers_field}: expected object, got {}",
+                    json_kind(servers)
+                );
+            };
+            for (name, server) in entries {
+                let label = safe_key(name);
+                let Some(fields) = server.as_object() else {
+                    return format!(
+                        "invalid configuration shape at {servers_field}.{label}: expected object, got {}",
+                        json_kind(server)
+                    );
+                };
+                let Some(transport) = fields.get("transport") else {
+                    return format!(
+                        "invalid configuration shape at {servers_field}.{label}: missing required field \"transport\""
+                    );
+                };
+                match transport.as_str() {
+                    Some("stdio") => {
+                        for key in fields.keys() {
+                            if !matches!(
+                                key.as_str(),
+                                "transport" | "command" | "args" | "env" | "cwd" | "description"
+                            ) {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}: unknown stdio field {}",
+                                    safe_key(key)
+                                );
+                            }
+                        }
+                        match fields.get("command") {
+                            None => {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}: missing required field \"command\""
+                                );
+                            }
+                            Some(cmd) if !cmd.is_string() => {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.command: expected string, got {}",
+                                    json_kind(cmd)
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(args) = fields.get("args") {
+                            let Some(items) = args.as_array() else {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.args: expected array of strings, got {}",
+                                    json_kind(args)
+                                );
+                            };
+                            for (index, item) in items.iter().enumerate() {
+                                if !item.is_string() {
+                                    return format!(
+                                        "invalid configuration shape at {servers_field}.{label}.args[{index}]: expected string, got {}",
+                                        json_kind(item)
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(env) = fields.get("env") {
+                            let Some(map) = env.as_object() else {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.env: expected object of string values, got {}",
+                                    json_kind(env)
+                                );
+                            };
+                            for (key, val) in map {
+                                if !val.is_string() {
+                                    return format!(
+                                        "invalid configuration shape at {servers_field}.{label}.env.{}: expected string, got {}",
+                                        safe_key(key),
+                                        json_kind(val)
+                                    );
+                                }
+                            }
+                        }
+                        for optional in ["cwd", "description"] {
+                            if let Some(val) = fields.get(optional)
+                                && !val.is_string()
+                                && !val.is_null()
+                            {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.{optional}: expected string, got {}",
+                                    json_kind(val)
+                                );
+                            }
+                        }
+                    }
+                    Some("http") => {
+                        for key in fields.keys() {
+                            if !matches!(
+                                key.as_str(),
+                                "transport" | "url" | "headers" | "description"
+                            ) {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}: unknown http field {}",
+                                    safe_key(key)
+                                );
+                            }
+                        }
+                        match fields.get("url") {
+                            None => {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}: missing required field \"url\""
+                                );
+                            }
+                            Some(url) if !url.is_string() => {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.url: expected string, got {}",
+                                    json_kind(url)
+                                );
+                            }
+                            _ => {}
+                        }
+                        if let Some(headers) = fields.get("headers") {
+                            let Some(map) = headers.as_object() else {
+                                return format!(
+                                    "invalid configuration shape at {servers_field}.{label}.headers: expected object of string values, got {}",
+                                    json_kind(headers)
+                                );
+                            };
+                            for (key, val) in map {
+                                if !val.is_string() {
+                                    return format!(
+                                        "invalid configuration shape at {servers_field}.{label}.headers.{}: expected string, got {}",
+                                        safe_key(key),
+                                        json_kind(val)
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(desc) = fields.get("description")
+                            && !desc.is_string()
+                            && !desc.is_null()
+                        {
+                            return format!(
+                                "invalid configuration shape at {servers_field}.{label}.description: expected string, got {}",
+                                json_kind(desc)
+                            );
+                        }
+                    }
+                    Some(_) => {
+                        return format!(
+                            "invalid configuration shape at {servers_field}.{label}.transport: expected \"stdio\" or \"http\""
+                        );
+                    }
+                    None => {
+                        return format!(
+                            "invalid configuration shape at {servers_field}.{label}.transport: expected string (\"stdio\" or \"http\"), got {}",
+                            json_kind(transport)
+                        );
+                    }
+                }
+            }
+        }
+    }
+    "invalid configuration shape; check version, servers, skills and transport fields".into()
+}
+
 pub fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -126,11 +384,9 @@ impl LoadedConfig {
         let path = locate(path)?;
         let bytes = crate::json::read_file(&path, CONFIG_LIMIT)?;
         let value = crate::json::parse(&bytes)?;
-        let mut config: Config = serde_json::from_value(value).map_err(|_| {
-            anyhow::anyhow!(
-                "invalid configuration shape; check version, servers, skills and transport fields"
-            )
-        })?;
+        let diagnostic = diagnose_config_shape(&value);
+        let mut config: Config =
+            serde_json::from_value(value).map_err(|_| anyhow::anyhow!(diagnostic))?;
         if config.version != 1 {
             bail!("unsupported configuration version (expected 1)");
         }
@@ -211,20 +467,7 @@ impl LoadedConfig {
                             anyhow::anyhow!("server {name}: invalid HTTP header name")
                         })?;
                         let lower = key.as_str();
-                        if matches!(
-                            lower,
-                            "host"
-                                | "content-length"
-                                | "content-type"
-                                | "accept"
-                                | "connection"
-                                | "transfer-encoding"
-                                | "upgrade"
-                                | "te"
-                                | "trailer"
-                        ) || lower.starts_with("mcp-")
-                            || lower.starts_with("mcp_")
-                        {
+                        if is_reserved_header(lower) {
                             bail!(
                                 "server {name}: a header reserved by the transport cannot be overridden"
                             );
@@ -242,6 +485,9 @@ impl LoadedConfig {
             }
         }
         for root in &mut config.skills {
+            if root.as_os_str().is_empty() {
+                bail!("skill root path must not be empty");
+            }
             if !root.is_absolute() {
                 *root = parent.join(&*root);
             }
@@ -276,6 +522,10 @@ mod tests {
         assert!(loaded.config.skills[0].is_absolute());
         std::fs::write(&path, r#"{"servers":{"x":{"transport":"http","url":"https://example.test","headers":{"Host":"elsewhere"}}}}"#).unwrap();
         assert!(LoadedConfig::load(&path).is_err());
+        std::fs::write(&path, r#"{"servers":{"x":{"transport":"http","url":"https://example.test","headers":{"Last-Event-Id":"42"}}}}"#).unwrap();
+        assert!(LoadedConfig::load(&path).is_err());
+        std::fs::write(&path, r#"{"skills":[""]}"#).unwrap();
+        assert!(LoadedConfig::load(&path).is_err());
         std::fs::write(&path, r#"{"servers":{},"servers":{}}"#).unwrap();
         assert!(LoadedConfig::load(&path).is_err());
     }
@@ -285,7 +535,23 @@ mod tests {
         let path = dir.path().join("mcpcli.json");
         std::fs::write(&path, r#"{"servers":{"x":{"transport":"http","url":"https://example.test","headers":"Bearer SECRET_SENTINEL"}}}"#).unwrap();
         let error = LoadedConfig::load(&path).err().unwrap();
-        assert!(!format!("{error:#}").contains("SECRET_SENTINEL"));
+        let text = format!("{error:#}");
+        assert!(!text.contains("SECRET_SENTINEL"));
+        assert!(text.contains("servers.\"x\".headers"));
+
+        std::fs::write(
+            &path,
+            r#"{"servers":{"x":{"transport":"stdio","command":"sh","arg":["-c"],"Bearer KEY_SECRET":"1"}}}"#,
+        )
+        .unwrap();
+        let error = LoadedConfig::load(&path).err().unwrap();
+        let text = format!("{error:#}");
+        assert!(!text.contains("KEY_SECRET"));
+        assert!(text.contains("servers.\"x\""));
+
+        std::fs::write(&path, r#"{"servers":{},"mcpServers":{}}"#).unwrap();
+        let error = LoadedConfig::load(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("mcpServers"));
     }
     #[test]
     fn missing_config_can_be_located_for_stop() {

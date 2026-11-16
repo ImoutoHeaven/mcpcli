@@ -34,6 +34,8 @@ pub enum Operation {
     },
     Reset {
         server: String,
+        #[serde(default)]
+        force: bool,
     },
 }
 impl Operation {
@@ -116,6 +118,16 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
     value: &T,
     max: usize,
 ) -> io::Result<()> {
+    let started = std::sync::atomic::AtomicBool::new(false);
+    write_frame_tracked(writer, value, max, &started).await
+}
+
+pub async fn write_frame_tracked<W: AsyncWrite + Unpin, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+    max: usize,
+    started: &std::sync::atomic::AtomicBool,
+) -> io::Result<()> {
     // Count first so an oversized frame does not allocate a second large body.
     struct Count(usize);
     impl io::Write for Count {
@@ -136,6 +148,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
         ));
     }
     let bytes = serde_json::to_vec(value).map_err(io::Error::other)?;
+    started.store(true, std::sync::atomic::Ordering::Release);
     writer
         .write_all(&(bytes.len() as u32).to_le_bytes())
         .await?;

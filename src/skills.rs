@@ -356,20 +356,38 @@ fn open_beneath(root: &Path, relative: &Path, directory: bool) -> Result<File> {
         "resource path is too deep"
     );
     ensure!(root.is_absolute(), "skill root must be absolute");
-    let mut current = File::open("/")?;
+    let mut root_names = Vec::new();
     for component in root.components().skip(1) {
         let Component::Normal(name) = component else {
             bail!("skill root must be normalized: {root:?}");
         };
-        current = open_component(&current, name, true)
-            .with_context(|| format!("open skill root {root:?}"))?;
+        root_names.push(name);
     }
-    for (index, component) in components.iter().enumerate() {
-        let Component::Normal(name) = component else {
-            unreachable!()
-        };
-        current = open_component(&current, name, index + 1 < components.len() || directory)
+    let rel_names: Vec<_> = components
+        .iter()
+        .map(|component| match component {
+            Component::Normal(name) => *name,
+            _ => unreachable!(),
+        })
+        .collect();
+    let total = root_names.len() + rel_names.len();
+    let mut current = if total == 0 {
+        open_root_fd(false, directory)?
+    } else {
+        open_root_fd(true, true)?
+    };
+    let mut index = 0usize;
+    for name in root_names {
+        let intermediate = index + 1 < total;
+        current = open_component(&current, name, intermediate, intermediate || directory)
+            .with_context(|| format!("open skill root {root:?}"))?;
+        index += 1;
+    }
+    for name in rel_names {
+        let intermediate = index + 1 < total;
+        current = open_component(&current, name, intermediate, intermediate || directory)
             .with_context(|| format!("open resource {relative:?}"))?;
+        index += 1;
     }
     let metadata = current.metadata()?;
     ensure!(
@@ -384,13 +402,38 @@ fn open_beneath(root: &Path, relative: &Path, directory: bool) -> Result<File> {
     Ok(current)
 }
 
-fn open_component(parent: &File, name: &OsStr, directory: bool) -> Result<File> {
+fn open_root_fd(path_only: bool, directory: bool) -> Result<File> {
+    let root = CString::new("/").expect("static path");
+    let flags = if path_only {
+        libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY
+    } else {
+        libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 }
+    };
+    let fd = unsafe { libc::open(root.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_component(parent: &File, name: &OsStr, path_only: bool, directory: bool) -> Result<File> {
     let name = CString::new(name.as_bytes()).context("path contains NUL")?;
-    let flags = libc::O_RDONLY
-        | libc::O_CLOEXEC
-        | libc::O_NOFOLLOW
-        | libc::O_NONBLOCK
-        | if directory { libc::O_DIRECTORY } else { 0 };
+    let flags = if path_only {
+        // Traverse-only fd: requires execute (--x) rather than read (r--) on
+        // intermediate 0711 ancestors, while O_NOFOLLOW | O_DIRECTORY still
+        // fails with ENOTDIR on any symlink component.
+        libc::O_PATH | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY
+    } else {
+        libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if directory { libc::O_DIRECTORY } else { 0 }
+    };
     // Each component is a single filename; no ancestor or leaf symlink is followed.
     let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
     if fd < 0 {
@@ -598,5 +641,53 @@ mod tests {
         let catalog = discover(&[root]).unwrap();
         assert!(catalog.skills.is_empty());
         assert_eq!(catalog.warnings.len(), 1);
+    }
+
+    #[test]
+    fn traverses_execute_only_ancestor_as_unprivileged_user() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = TempDir::new_in("/tmp").unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o711)).unwrap();
+        let guard = temp.path().join("restricted");
+        fs::create_dir(&guard).unwrap();
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o711)).unwrap();
+        let workspace = guard.join("skills");
+        fs::create_dir(&workspace).unwrap();
+        let root = create_skill(&workspace, "restricted-skill");
+        fs::create_dir(root.join("references")).unwrap();
+        fs::write(root.join("references/note.md"), "Accessible\n").unwrap();
+        for entry in [
+            &workspace,
+            &root,
+            &root.join("SKILL.md"),
+            &root.join("references"),
+            &root.join("references/note.md"),
+        ] {
+            let mode = if entry.is_dir() { 0o755 } else { 0o644 };
+            fs::set_permissions(entry, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            let ok = unsafe { libc::setgid(65534) == 0 && libc::setuid(65534) == 0 }
+                && discover(&[workspace])
+                    .and_then(|cat| {
+                        let skill = cat.skills.into_iter().next().context("missing skill")?;
+                        let _ = show(&skill)?;
+                        let list = files(&skill)?;
+                        ensure!(list == ["references/note.md"]);
+                        let body = read(&skill, Path::new("references/note.md"))?;
+                        ensure!(body == "Accessible\n");
+                        Ok(())
+                    })
+                    .is_ok();
+            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 }

@@ -386,7 +386,9 @@ def interrupted_stdin(f):
     process.send_signal(signal.SIGINT)
     assert process.wait(timeout=5) == 130, "reading incomplete stdin ignored Ctrl-C"
     stdout, stderr = process.communicate()
-    assert not stdout and json.loads(stderr)["error"]["kind"] == "cancelled"
+    parsed_error = json.loads(stderr)["error"]
+    assert not stdout and parsed_error["kind"] == "cancelled"
+    assert not parsed_error.get("outcome_unknown", False), "pre-dispatch Ctrl-C falsely marked outcome_unknown"
     assert not f.events("call"), "incomplete input was dispatched"
 
 
@@ -479,17 +481,39 @@ def lost_server_requires_reset(f):
 
 def http_cleanup_failure(f, mode):
     log = f.use_http(mode)
+    f.settings["servers"]["local_peer"] = {
+        "transport": "stdio", "command": sys.executable,
+        "args": [str(f.script), "--log", str(f.log)],
+        "description": "Healthy sibling server",
+    }
+    f.save_config()
     result = f.invoke("--oneshot", "call", "state", "get", code=1)
     assert json.loads(result.stdout)["structuredContent"] == {"name": "get"}
     assert error_value(result)["kind"] == "cleanup"
     assert "do not replay" in error_value(result)["message"]
     assert log.read_text().splitlines().count("tools/call") == 1
+    peer = f.value("call", "local_peer", "set", "--args", '{"keep":"alive"}')["structuredContent"]
     f.call("get")
     assert f.fail("reset", "state", code=1)["kind"] == "cleanup"
     assert f.value("daemon", "status")["servers"]["state"]["state"] == "lost"
     assert f.fail("call", "state", "get", code=6)["kind"] == "session_lost"
     assert f.fail("reset", "state", code=1)["kind"] == "cleanup", "cleanup failure was forgotten"
     assert log.read_text().splitlines().count("tools/call") == 2, "cleanup error replayed a tool call"
+    # reset --force clears the unconfirmed remote HTTP slot while preserving sibling stdio state.
+    forced = f.invoke("reset", "--force", "state")
+    forced_json = json.loads(forced.stdout)
+    assert forced_json["reset"] is True and "cleanup_warning" in forced_json
+    assert "unconfirmed remote cleanup" in forced.stderr
+    assert f.value("call", "local_peer", "get")["structuredContent"]["pid"] == peer["pid"]
+    assert f.value("call", "local_peer", "get")["structuredContent"]["state"] == {"keep": "alive"}
+    assert f.call("get")["structuredContent"] == {"name": "get"}
+    # Active HTTP cleanup failure during daemon restart still brings up the replacement daemon.
+    old_pid = f.value("daemon", "status")["pid"]
+    restarted = f.invoke("daemon", "restart")
+    restarted_status = json.loads(restarted.stdout)
+    assert restarted_status["running"] is True and restarted_status["pid"] != old_pid
+    assert "cleanup" in restarted.stderr
+    assert f.call("get")["structuredContent"] == {"name": "get"}
     assert f.fail("daemon", "stop", code=1)["kind"] == "runtime"
     assert f.value("daemon", "status")["running"] is False
     states = list(f.runtime.glob("*/state.json"))
@@ -517,6 +541,85 @@ def http_optional_session_delete(f):
     assert not f.runtime.exists()
 
 
+def burst_admission_and_prewrite_certainty(f):
+    f.call("get")
+    barrier = threading.Barrier(40)
+
+    def increment(_):
+        barrier.wait()
+        return f.call("increment", timeout=20)["structuredContent"]["state"]["counter"]
+
+    with ThreadPoolExecutor(max_workers=40) as pool:
+        counters = list(pool.map(increment, range(40)))
+    assert sorted(counters) == list(range(1, 41)), "connections past 32 were dropped instead of queued"
+
+    status = f.value("daemon", "status")
+    socket_path = f.runtime / status["namespace"] / "sock"
+    socket_path.chmod(0o666)
+    try:
+        failed = f.fail("call", "state", "increment", code=4)
+        assert failed["kind"] == "daemon_transport"
+        assert not failed.get("outcome_unknown", False), "pre-write failure falsely set outcome_unknown"
+    finally:
+        socket_path.chmod(0o600)
+    assert f.call("get")["structuredContent"]["state"]["counter"] == 40
+
+
+def text_mode_crlf_and_empty_outputs(f):
+    assert f.invoke("--text", "search", "no-such-capability").stdout == ""
+    crlf_skill = f.root / "skills" / "crlf-doc"
+    crlf_skill.mkdir(parents=True)
+    (crlf_skill / "SKILL.md").write_bytes(
+        b"---\r\nname: crlf-doc\r\ndescription: CRLF skill\r\n---\r\nLine 1\r\nSpoof\rCheck\r\n"
+    )
+    assert f.invoke("--text", "skills", "files", "crlf-doc").stdout == ""
+    shown = f.invoke("--text", "skills", "show", "crlf-doc").stdout
+    assert "\\r\n" not in shown and "\r" not in shown
+    assert "Line 1\nSpoof\\rCheck\n" in shown
+    assert not shown.endswith("\n\n")
+    read_guide = f.invoke("--text", "skills", "read", "ops", "references/guide.md").stdout
+    assert read_guide == "Keep the session open.\n"
+
+
+def unprivileged_execute_only_ancestors(f):
+    if os.geteuid() != 0:
+        return
+    outer = Path(tempfile.mkdtemp(prefix="mcpcli-0711-"))
+    try:
+        outer.chmod(0o711)
+        restricted = outer / "home"
+        restricted.mkdir()
+        restricted.chmod(0o711)
+        user_dir = restricted / "user"
+        (user_dir / "skills" / "ops" / "references").mkdir(parents=True)
+        user_bin = user_dir / "mcpcli"
+        shutil.copy2(f.binary, user_bin)
+        user_bin.chmod(0o755)
+        (user_dir / "skills" / "ops" / "SKILL.md").write_text(
+            "---\nname: ops\ndescription: Traverse test\n---\n# Body\n", encoding="utf-8"
+        )
+        (user_dir / "skills" / "ops" / "references" / "doc.md").write_text("ok\n", encoding="utf-8")
+        cfg = user_dir / "mcpcli.json"
+        cfg.write_text(json.dumps({"version": 1, "servers": {}, "skills": ["skills"]}), encoding="utf-8")
+        for cur, dirs, files_list in os.walk(user_dir):
+            os.chown(cur, 65534, 65534)
+            for name in dirs:
+                os.chown(Path(cur) / name, 65534, 65534)
+            for name in files_list:
+                os.chown(Path(cur) / name, 65534, 65534)
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "MCPCLI_RUNTIME_DIR": str(user_dir / "rt")}
+        for cmd in (["catalog"], ["skills", "list"], ["skills", "show", "ops"],
+                    ["skills", "files", "ops"], ["skills", "read", "ops", "references/doc.md"]):
+            res = subprocess.run(
+                [str(user_bin), "--config", str(cfg), *cmd],
+                env=env, cwd=user_dir, text=True, capture_output=True, timeout=10,
+                user=65534, group=65534,
+            )
+            assert res.returncode == 0, f"{cmd} failed under 0711 ancestor: {res.stderr}"
+    finally:
+        shutil.rmtree(outer, ignore_errors=True)
+
+
 CASES = [
     offline_skills, state_and_discovery, json_inputs_and_outputs, session_and_restart,
     changed_and_deleted_config, simultaneous_startup, timeout_and_disconnect,
@@ -524,6 +627,8 @@ CASES = [
     oneshot_signals_clean_process_group, saturated_control_channel,
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
+    burst_admission_and_prewrite_certainty, text_mode_crlf_and_empty_outputs,
+    unprivileged_execute_only_ancestors,
 ]
 
 

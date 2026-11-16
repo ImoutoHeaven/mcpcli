@@ -11,6 +11,7 @@ use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt}
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::net::UnixStream;
 use tokio::time::{Instant, sleep, timeout};
@@ -256,9 +257,12 @@ impl State {
         ))
     }
     pub fn store(&self, paths: &Paths) -> Result<()> {
-        let path = paths
-            .directory
-            .join(format!("state-{}.tmp", std::process::id()));
+        let path = paths.directory.join("state.json.tmp");
+        match std::fs::remove_file(&path) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -273,14 +277,25 @@ impl State {
             Ok(())
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(&path);
         }
         result
     }
 }
 
 pub async fn exchange(paths: &Paths, request: &Request) -> Result<Response> {
-    let uncertain = request.operation.is_call();
+    let dispatched = AtomicBool::new(false);
+    exchange_tracked(paths, request, &dispatched).await
+}
+
+pub async fn exchange_tracked(
+    paths: &Paths,
+    request: &Request,
+    dispatched: &AtomicBool,
+) -> Result<Response> {
+    let is_call = request.operation.is_call();
+    let ignored = AtomicBool::new(false);
+    let write_tracker = if is_call { dispatched } else { &ignored };
     let future = async {
         let socket = if request.operation.management() {
             &paths.control_socket
@@ -297,7 +312,7 @@ pub async fn exchange(paths: &Paths, request: &Request) -> Result<Response> {
         if stream.peer_cred()?.uid() != uid() {
             bail!("daemon peer belongs to a different user");
         }
-        ipc::write_frame(&mut stream, request, ipc::REQUEST_LIMIT).await?;
+        ipc::write_frame_tracked(&mut stream, request, ipc::REQUEST_LIMIT, write_tracker).await?;
         let response: Response = ipc::read_frame(&mut stream, ipc::RESPONSE_LIMIT)
             .await?
             .context("daemon disconnected before returning a result")?;
@@ -333,14 +348,14 @@ pub async fn exchange(paths: &Paths, request: &Request) -> Result<Response> {
             "daemon_transport",
             "daemon communication failed; tool calls are never replayed",
         )
-        .uncertain(uncertain)
+        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
         .into()),
         Err(_) => Err(Failure::new(
             5,
             "timeout",
             "daemon deadline exceeded; cancellation is not rollback",
         )
-        .uncertain(uncertain)
+        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
         .into()),
     }
 }
@@ -426,11 +441,15 @@ pub async fn stop(paths: &Paths) -> Result<serde_json::Value> {
     if !paths.running()? {
         return Ok(serde_json::json!({"stopped":false,"running":false}));
     }
-    exchange(
+    if let Err(error) = exchange(
         paths,
         &paths.request("", Operation::Stop, Duration::from_secs(2)),
     )
-    .await?;
+    .await
+        && paths.running()?
+    {
+        return Err(error);
+    }
     let deadline = Instant::now() + STOP_WAIT;
     while paths.running()? {
         if Instant::now() >= deadline {
@@ -484,5 +503,36 @@ mod tests {
         let c = Paths::with_root(base.path().join("b.json"), "a", &root).unwrap();
         assert_ne!(a.namespace, b.namespace);
         assert_ne!(a.namespace, c.namespace);
+    }
+    #[test]
+    fn state_store_replaces_stale_temp_file_from_crashed_pid() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("runtime");
+        let paths = Paths::with_root(base.path().join("mcpcli.json"), "default", &root).unwrap();
+        std::fs::write(paths.directory.join("state.json.tmp"), b"partial").unwrap();
+        let state = State::fresh();
+        state.store(&paths).unwrap();
+        let loaded = State::load(&paths).unwrap().unwrap();
+        assert_eq!(loaded.epoch, state.epoch);
+        assert!(!paths.directory.join("state.json.tmp").exists());
+    }
+    #[tokio::test]
+    async fn pre_write_transport_failure_is_not_outcome_unknown() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("runtime");
+        let paths = Paths::with_root(base.path().join("mcpcli.json"), "default", &root).unwrap();
+        let req = paths.request(
+            "digest",
+            Operation::Call {
+                server: "s".into(),
+                tool: "t".into(),
+                arguments: serde_json::Map::new(),
+            },
+            Duration::from_secs(2),
+        );
+        let err = exchange(&paths, &req).await.unwrap_err();
+        let failure = err.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.kind, "daemon_transport");
+        assert!(!failure.outcome_unknown);
     }
 }

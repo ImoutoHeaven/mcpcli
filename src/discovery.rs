@@ -55,9 +55,13 @@ pub fn render_tool(tool: &Value) -> String {
     sections.join("\n\n")
 }
 
-fn safe_text(text: &str) -> String {
+pub fn safe_text(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
-    for character in text.chars() {
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            continue;
+        }
         if character.is_control() && !matches!(character, '\n' | '\t') {
             result.extend(character.escape_default());
         } else {
@@ -109,5 +113,12 @@ mod tests {
         assert!(rendered.contains("readOnlyHint"));
         assert!(rendered.contains("vendor"));
         assert!(!rendered.contains("--foo-bar"));
+    }
+
+    #[test]
+    fn safe_text_preserves_crlf_lines_while_escaping_bare_cr() {
+        assert_eq!(safe_text("one\r\ntwo\r\n"), "one\ntwo\n");
+        assert_eq!(safe_text("spoof\roverwrite"), "spoof\\roverwrite");
+        assert_eq!(safe_text("mixed\r\r\nline"), "mixed\\r\nline");
     }
 }

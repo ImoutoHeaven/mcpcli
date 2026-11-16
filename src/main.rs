@@ -2,7 +2,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpcli::{
     config::{self, LoadedConfig},
-    daemon, discovery,
+    daemon,
+    discovery::{self, safe_text},
     ipc::{self, Failure, Operation},
     json as input,
     mcp::McpConnection,
@@ -12,6 +13,7 @@ use mcpcli::{
 use serde_json::{Map, Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::{Instant, timeout};
@@ -72,7 +74,14 @@ enum Command {
         stdin: bool,
     },
     /// Close a server connection and discard its session state.
-    Reset { server: String },
+    Reset {
+        server: String,
+        #[arg(
+            long,
+            help = "Discard client session state even if remote HTTP session deletion failed"
+        )]
+        force: bool,
+    },
     /// Discover and read explicitly configured local skill directories.
     #[command(alias = "skill")]
     Skills {
@@ -140,17 +149,6 @@ struct RemoteOutput {
 }
 fn usage(kind: &str, error: impl std::fmt::Display) -> anyhow::Error {
     Failure::new(2, kind, error.to_string()).into()
-}
-fn safe_text(value: &str) -> String {
-    let mut text = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_control() && !matches!(ch, '\n' | '\t') {
-            text.extend(ch.escape_default());
-        } else {
-            text.push(ch);
-        }
-    }
-    text
 }
 fn brief(value: &str) -> String {
     let line = value.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -236,11 +234,16 @@ async fn arguments(
         .ok_or_else(|| usage("arguments", "tool arguments must be a JSON object"))
 }
 
-async fn remote(cli: &Cli, loaded: &LoadedConfig, operation: Operation) -> Result<RemoteOutput> {
+async fn remote(
+    cli: &Cli,
+    loaded: &LoadedConfig,
+    operation: Operation,
+    uncertain: &AtomicBool,
+) -> Result<RemoteOutput> {
     let server = match &operation {
         Operation::Tools { server }
         | Operation::Call { server, .. }
-        | Operation::Reset { server } => server,
+        | Operation::Reset { server, .. } => server,
         _ => unreachable!(),
     };
     let config = loaded
@@ -250,7 +253,6 @@ async fn remote(cli: &Cli, loaded: &LoadedConfig, operation: Operation) -> Resul
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
     let budget = Duration::from_secs(cli.timeout);
     let started = Instant::now();
-    let calling = operation.is_call();
     let future = async {
         if cli.oneshot {
             if matches!(operation, Operation::Reset { .. }) {
@@ -268,10 +270,16 @@ async fn remote(cli: &Cli, loaded: &LoadedConfig, operation: Operation) -> Resul
                     .map(|tools| json!(tools)),
                 Operation::Call {
                     tool, arguments, ..
-                } => connection.call(tool, arguments.clone(), remaining).await,
+                } => {
+                    connection
+                        .call_with_dispatch(tool, arguments.clone(), remaining, uncertain)
+                        .await
+                }
                 _ => unreachable!(),
             }
-            .map_err(|error| anyhow::Error::from(daemon::mcp_error(error, calling)));
+            .map_err(|error| {
+                anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
+            });
             let cleanup=connection.close().await.err().map(|error|
                 Failure::new(1,"cleanup",format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation")));
             match result {
@@ -304,9 +312,12 @@ async fn remote(cli: &Cli, loaded: &LoadedConfig, operation: Operation) -> Resul
             if remaining.is_zero() {
                 return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
             }
-            let response =
-                runtime::exchange(&paths, &paths.request(&loaded.digest, operation, remaining))
-                    .await?;
+            let response = runtime::exchange_tracked(
+                &paths,
+                &paths.request(&loaded.digest, operation, remaining),
+                uncertain,
+            )
+            .await?;
             Ok(RemoteOutput {
                 value: response.result.context("daemon did not return a result")?,
                 cleanup: None,
@@ -321,7 +332,7 @@ async fn remote(cli: &Cli, loaded: &LoadedConfig, operation: Operation) -> Resul
                 "timeout",
                 "request deadline exceeded; the call is not replayed",
             )
-            .uncertain(calling)
+            .uncertain(uncertain.load(Ordering::Acquire))
         })?
 }
 
@@ -354,7 +365,7 @@ fn tool_text(result: &Value) -> String {
     texts.join("\n")
 }
 
-async fn run(cli: &Cli) -> Result<Output> {
+async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     if let Command::Daemon { command } = &cli.command {
         if cli.oneshot {
             return Err(usage(
@@ -366,17 +377,24 @@ async fn run(cli: &Cli) -> Result<Output> {
         let paths = Paths::new(locator, &cli.session)?;
         return match command {
             DaemonCommand::Status => {
-                if !paths.running()? {
-                    Ok(Output::json(
+                let offline = || {
+                    Output::json(
                         json!({"running":false,"session":cli.session,"namespace":paths.namespace}),
-                    ))
+                    )
+                };
+                if !paths.running()? {
+                    Ok(offline())
                 } else {
-                    let response = runtime::exchange(
+                    match runtime::exchange(
                         &paths,
                         &paths.request("", Operation::Status, Duration::from_secs(2)),
                     )
-                    .await?;
-                    Ok(Output::json(response.result.unwrap()))
+                    .await
+                    {
+                        Ok(response) => Ok(Output::json(response.result.unwrap())),
+                        Err(_) if !paths.running()? => Ok(offline()),
+                        Err(error) => Err(error),
+                    }
                 }
             }
             DaemonCommand::Stop => Ok(Output::json(runtime::stop(&paths).await?)),
@@ -387,8 +405,13 @@ async fn run(cli: &Cli) -> Result<Output> {
             }
             DaemonCommand::Start | DaemonCommand::Restart => {
                 let loaded = load(cli)?;
-                if matches!(command, DaemonCommand::Restart) {
-                    runtime::stop(&paths).await?;
+                if matches!(command, DaemonCommand::Restart)
+                    && let Err(error) = runtime::stop(&paths).await
+                {
+                    if paths.running()? {
+                        return Err(error);
+                    }
+                    eprintln!("mcpcli: {}", safe_text(&format!("{error:#}")));
                 }
                 runtime::ensure(&paths, &loaded, true).await?;
                 let response = runtime::exchange(
@@ -425,6 +448,7 @@ async fn run(cli: &Cli) -> Result<Output> {
                 Operation::Tools {
                     server: server.clone(),
                 },
+                uncertain,
             )
             .await?;
             let list = remote.value.as_array().context("invalid tool list")?;
@@ -445,6 +469,7 @@ async fn run(cli: &Cli) -> Result<Output> {
                 Operation::Tools {
                     server: server.clone(),
                 },
+                uncertain,
             )
             .await?;
             let found = remote
@@ -478,6 +503,7 @@ async fn run(cli: &Cli) -> Result<Output> {
                     tool: tool.clone(),
                     arguments: args,
                 },
+                uncertain,
             )
             .await?;
             let code = if remote.value["isError"].as_bool() == Some(true) {
@@ -498,15 +524,20 @@ async fn run(cli: &Cli) -> Result<Output> {
             }
             .cleanup(remote.cleanup))
         }
-        Command::Reset { server } => {
+        Command::Reset { server, force } => {
             let remote = remote(
                 cli,
                 &loaded,
                 Operation::Reset {
                     server: server.clone(),
+                    force: *force,
                 },
+                uncertain,
             )
             .await?;
+            if let Some(warning) = remote.value.get("cleanup_warning").and_then(Value::as_str) {
+                eprintln!("mcpcli: {}", safe_text(warning));
+            }
             Ok(Output::json(remote.value).cleanup(remote.cleanup))
         }
         Command::Skills { command } => {
@@ -584,15 +615,17 @@ async fn entry(cli: Cli) -> i32 {
             command: DaemonCommand::Run
         }
     );
+    let uncertain = AtomicBool::new(false);
     let result = if foreground {
-        run(&cli).await
+        run(&cli, &uncertain).await
     } else {
         tokio::select! {
-            result=run(&cli)=>result,
-            signal=interrupted()=>match signal {
-                Ok(code)=>Err(Failure::new(code,"cancelled","interrupted; cancellation is not rollback")
-                    .uncertain(matches!(cli.command,Command::Call{..})).into()),
-                Err(error)=>Err(error),
+            result = run(&cli, &uncertain) => result,
+            signal = interrupted() => match signal {
+                Ok(code) => Err(Failure::new(code, "cancelled", "interrupted; cancellation is not rollback")
+                    .uncertain(uncertain.load(Ordering::Acquire))
+                    .into()),
+                Err(error) => Err(error),
             },
         }
     };
@@ -609,7 +642,14 @@ async fn entry(cli: Cli) -> i32 {
                 let text = output
                     .text
                     .unwrap_or_else(|| serde_json::to_string_pretty(&output.value).unwrap());
-                writeln!(stdout, "{}", safe_text(&text))
+                let rendered = safe_text(&text);
+                if rendered.is_empty() {
+                    Ok(())
+                } else if rendered.ends_with('\n') {
+                    stdout.write_all(rendered.as_bytes())
+                } else {
+                    writeln!(stdout, "{rendered}")
+                }
             } else {
                 serde_json::to_writer(&mut stdout, &output.value)
                     .map_err(std::io::Error::other)

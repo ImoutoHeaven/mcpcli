@@ -1,6 +1,6 @@
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response};
-use crate::mcp::{FailureKind, McpConnection, McpFailure};
+use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure};
 use crate::runtime::{Lock, Paths, State, uid};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -21,7 +21,6 @@ use tokio_util::sync::CancellationToken;
 const MAX_CONNECTIONS: usize = 32;
 const MAX_CONTROL_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
-const MAX_CONNECT: Duration = Duration::from_secs(30);
 const FRAME_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
@@ -140,7 +139,7 @@ impl App {
             Operation::Stop => return Ok(json!({"stopping":true})),
             Operation::Tools { server }
             | Operation::Call { server, .. }
-            | Operation::Reset { server } => server,
+            | Operation::Reset { server, .. } => server,
         };
         let state = self.servers.get(server).ok_or_else(|| {
             Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
@@ -151,22 +150,41 @@ impl App {
             .acquire()
             .await
             .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
-        if let Operation::Reset { .. } = operation {
+        if let Operation::Reset { force, .. } = operation {
             state.lost = true;
-            if let Some(connection) = state.connection.as_mut() {
-                connection.close().await.map_err(|error| {
-                    Failure::new(
+            let mut warning = None;
+            if let Some(connection) = state.connection.as_mut()
+                && let Err(error) = connection.close().await
+            {
+                let local_closed = connection.is_local_closed();
+                if *force && local_closed {
+                    warning = Some(format!(
+                        "server {server:?} reset forced after unconfirmed remote cleanup: {error}"
+                    ));
+                } else {
+                    let hint = if local_closed {
+                        format!(
+                            "; use `mcpcli reset --force {server}` to discard unconfirmed remote session"
+                        )
+                    } else {
+                        String::new()
+                    };
+                    return Err(Failure::new(
                         1,
                         "cleanup",
                         format!(
-                            "server {server:?} cleanup failed: {error}; session remains unavailable"
+                            "server {server:?} cleanup failed: {error}; session remains unavailable{hint}"
                         ),
-                    )
-                })?;
+                    ));
+                }
             }
             state.connection = None;
             state.lost = false;
-            return Ok(json!({"server":server,"reset":true,"state":"lazy"}));
+            let mut value = json!({"server":server,"reset":true,"state":"lazy"});
+            if let Some(warning) = warning {
+                value["cleanup_warning"] = Value::String(warning);
+            }
+            return Ok(value);
         }
         if state.lost
             || state
@@ -187,6 +205,13 @@ impl App {
             let budget = deadline
                 .saturating_duration_since(Instant::now())
                 .min(MAX_CONNECT);
+            if budget.is_zero() {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "request deadline exceeded before connecting",
+                ));
+            }
             let config = &self.config.config.servers[server];
             state.connection = Some(
                 McpConnection::connect(config, budget)
@@ -195,8 +220,14 @@ impl App {
             );
         }
         let budget = deadline.saturating_duration_since(Instant::now());
-        let calling = operation.is_call();
-        if calling {
+        if budget.is_zero() {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "request deadline exceeded before dispatch",
+            ));
+        }
+        if operation.is_call() {
             state.calls += 1;
         }
         let connection = state
@@ -220,7 +251,7 @@ impl App {
         if connection.is_closed() {
             state.lost = true;
         }
-        result.map_err(|e| mcp_error(e, calling))
+        result.map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))
     }
 }
 
@@ -285,15 +316,16 @@ async fn handle(mut stream: UnixStream, app: Arc<App>, control: bool) {
     );
     let mut extra = [0u8; 1];
     let result = tokio::select! {
+        biased;
+        _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
+            .uncertain(dispatched.load(Ordering::Acquire))),
+        // One request per connection; EOF or extra input abandons the in-flight operation.
+        _ = stream.read(&mut extra) => return,
         result = execute => match result {
             Ok(result)=>result,
             Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
                 .uncertain(dispatched.load(Ordering::Acquire))),
         },
-        // One request per connection; EOF or extra input abandons the in-flight operation.
-        _ = stream.read(&mut extra) => return,
-        _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
-            .uncertain(dispatched.load(Ordering::Acquire))),
     };
     send(&mut stream, &app, result).await;
 }
@@ -334,18 +366,30 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
             _ = term.recv() => break,
             _ = interrupt.recv() => break,
             _ = tasks.join_next(), if !tasks.is_empty() => {},
-            accepted = listener.accept() => {
-                let (stream,_) = accepted?;
-                if let Ok(permit) = connections.clone().try_acquire_owned() {
+            accepted = async {
+                let permit = connections.clone().acquire_owned().await.ok()?;
+                Some((listener.accept().await, permit))
+            } => {
+                if let Some((accepted, permit)) = accepted {
+                    let (stream, _) = accepted?;
                     let app = app.clone();
-                    tasks.spawn(async move { let _permit=permit; handle(stream,app,false).await; });
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        handle(stream, app, false).await;
+                    });
                 }
             }
-            accepted = control_listener.accept() => {
-                let (stream,_) = accepted?;
-                if let Ok(permit) = control_connections.clone().try_acquire_owned() {
+            accepted = async {
+                let permit = control_connections.clone().acquire_owned().await.ok()?;
+                Some((control_listener.accept().await, permit))
+            } => {
+                if let Some((accepted, permit)) = accepted {
+                    let (stream, _) = accepted?;
                     let app = app.clone();
-                    tasks.spawn(async move { let _permit=permit; handle(stream,app,true).await; });
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        handle(stream, app, true).await;
+                    });
                 }
             }
         }

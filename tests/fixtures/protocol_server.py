@@ -129,6 +129,13 @@ if args.http:
             self.end_headers()
 
         def do_GET(self):
+            if args.mode == "get_auth_leak":
+                record("GET")
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Bearer realm="secret-www-auth-do-not-print"')
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.empty(405)
 
         def do_DELETE(self):
@@ -144,6 +151,7 @@ if args.http:
                 record(request.get("method", ""))
                 self.send_response(401 if args.mode == "auth" else 307)
                 self.send_header("Location", "/redirect")
+                self.send_header("WWW-Authenticate", 'Bearer realm="secret-www-auth-do-not-print"')
                 body = b"secret-body-do-not-print"
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -162,9 +170,16 @@ if args.http:
                 return
             body = json.dumps(response, separators=(",", ":")).encode()
             content_type = "application/json"
-            if args.mode in ("sse", "oversize_sse"):
+            if args.mode == "mixed_case_ct":
+                content_type = "Application/JSON; charset=UTF-8"
+            elif args.mode == "jsonp_ct":
+                content_type = "application/jsonp; charset=utf-8"
+            elif args.mode in ("sse", "oversize_sse"):
                 body = b"data: " + body + b"\n\n"
                 content_type = "text/event-stream"
+            elif args.mode == "mixed_case_sse":
+                body = b"data: " + body + b"\n\n"
+                content_type = "TEXT/EVENT-STREAM; charset=UTF-8"
             self.send_response(200)
             self.send_header("Content-Type", content_type)
             if args.mode == "oversize_chunked":

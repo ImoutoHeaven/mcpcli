@@ -57,7 +57,7 @@ that two independently configured servers intentionally share.
 | skills show NAME | Complete SKILL.md plus its base directory | No |
 | skills files NAME | Relative resource paths, without file contents | No |
 | skills read NAME PATH | One bounded UTF-8 resource | No |
-| reset SERVER | Close that connection and discard its client state | No new connection |
+| reset [--force] SERVER | Close that connection and discard its client state | No new connection |
 | daemon start/status/stop/restart/run | Manage the selected daemon | No downstream connection |
 
 There is no startup scan of all MCP servers. Tool schemas are fetched only for
@@ -74,16 +74,12 @@ connection can handle legacy or unsolicited list-change notifications. Modern
 subscription-based notifications are not subscribed to in 0.1.0. Reading the
 current list does not depend on a notification or a previously cached flag.
 
-A full JSON Schema is not a general command-line flag grammar. Nested objects,
-unions, references, nullable values, unusual property names, and name
-normalization collisions make automatic flags ambiguous. The CLI therefore
-uses one explicit JSON-object input, supplied by exactly one of --args JSON,
---args-file PATH, or --stdin. An omitted input is {}.
-
-The Python PoC validated cross-process state retention and dynamic discovery.
-Independent probes also reproduced collisions between fooBar and foo_bar,
-incorrect union/array coercion, and acceptance of unknown flags. These findings
-informed the input contract; the PoC is not an implementation dependency.
+A full JSON Schema is not a general command-line flag grammar. Synthesizing CLI
+flags from arbitrary schemas introduces name-normalization collisions (such as
+`fooBar` versus `foo_bar`), ambiguous union or array coercion, nested-object
+escaping hazards, and brittle behavior when unknown properties appear. The CLI
+therefore uses one explicit JSON-object input, supplied by exactly one of
+--args JSON, --args-file PATH, or --stdin. An omitted input is {}.
 
 ## 4. Configuration and environment
 
@@ -109,9 +105,12 @@ directly to the executable, without shell evaluation.
 Only complete env/header values of the form ${NAME} are expanded. Missing or
 non-UTF-8 variables are errors. There is no expansion in command arguments and
 no recursive interpolation. HTTP URLs cannot contain userinfo or fragments.
-Transport-owned headers cannot be overridden. Headers are checked
-case-insensitively; values are validated without echoing credentials.
-Configuration shape errors do not print rejected values.
+Transport-owned headers (including Host, Content-Length, Content-Type, Accept,
+Connection, Transfer-Encoding, Upgrade, TE, Trailer, Last-Event-Id, and Mcp-*
+headers) cannot be overridden. Headers are checked case-insensitively at both
+configuration load and connection setup; values are validated without echoing
+credentials. Configuration shape errors report field paths and value kinds
+without printing rejected scalar values.
 
 The daemon inherits its launch environment and applies each server's explicit
 overrides. This environment is fixed until restart. The effective configuration,
@@ -160,14 +159,17 @@ carries exactly one request and one response.
 
 Two sockets separate admission:
 
-- sock: at most 32 data connections and eight active server operations.
-- control.sock: at most eight control connections, accepting only status/stop.
+- sock: at most 32 active data connections and eight active server operations.
+- control.sock: at most eight active control connections, accepting only status/stop.
 
-Five-second read/write deadlines bound unfinished framing and slow output.
-The control listener remains available when all data connections are occupied.
-Requests for one server serialize on its mutex. The server mutex is acquired
-before a global work permit, so a queue for one slow server does not consume all
-eight active-operation slots. Different servers can proceed concurrently.
+Admission permits are acquired before accepting sockets so bursts beyond 32
+connections wait in the kernel listen queue within the caller's deadline rather
+than being dropped prematurely. Five-second read/write deadlines bound
+unfinished framing and slow output. The control listener remains available when
+all data connections are occupied. Requests for one server serialize on its
+mutex. The server mutex is acquired before a global work permit, so a queue for
+one slow server does not consume all eight active-operation slots. Different
+servers can proceed concurrently.
 
 ## 6. Failure, cancellation, and shutdown
 
@@ -191,15 +193,22 @@ calls report session_lost and require reset SERVER.
 A reset marks the server unavailable before awaiting cleanup and retains the
 connection while cleanup is pending or fails. A canceled reset therefore
 cannot leave an apparently fresh connection slot that silently restarts a
-stateful server. Only confirmed closure clears the slot.
+stateful server. By default, only confirmed closure clears the slot. When the
+local client worker has confirmed termination and only remote HTTP session
+deletion (DELETE) failed or timed out, `reset --force SERVER` allows discarding
+the slot with a cleanup diagnostic so other servers in the same daemon session
+remain undisturbed.
 
 Shutdown closes admission, cancels active requests, drains handlers, and closes
-all connections. The state record is atomically replaced and synced. clean_stop
-is set only when the required cleanup results succeed. Cleanup errors are
-recorded and surfaced by daemon stop. An unexpected death is not interpreted
-as proof that a particular supervisor killed it; it reports lost state and
-requires an explicit start/restart. Foreground daemon run is available for
-ordinary process supervision.
+all connections. The state record is atomically replaced via a single owned
+`state.json.tmp` file and synced. clean_stop is set only when the required
+cleanup results succeed. Cleanup errors are recorded and surfaced by daemon
+stop. `daemon restart` stops the running daemon and, once its exit is confirmed,
+starts a replacement instance even if remote cleanup reported warnings on
+stderr. An unexpected death is not interpreted as proof that a particular
+supervisor killed it; it reports lost state and requires an explicit
+start/restart. Foreground daemon run is available for ordinary process
+supervision.
 
 The SDK can discard close errors or detach a private task if its own timeout
 helper is used. mcpcli instead retains the owned close future inside the
@@ -247,7 +256,9 @@ the CLI does not promise arbitrary vendor-field preservation.
 --text is an explicit presentation mode. It emits text blocks, reports omitted
 non-text blocks on stderr, and reports structured content availability when
 text has already been emitted. If there is only structured content, it prints
-that JSON. Terminal control characters are escaped in readable output.
+that JSON. CRLF line endings are normalized to LF while standalone carriage
+returns and other terminal control characters are escaped; empty text results
+produce no blank line.
 
 A successful tool result followed by an --oneshot cleanup failure remains on
 stdout; the cleanup diagnostic goes to stderr and the exit status is nonzero.
@@ -289,12 +300,15 @@ base directory. files lists resource paths. read returns one UTF-8 text file.
 No command runs scripts, interprets allowed-tools as permission, follows remote
 references, or modifies installed skills.
 
-Resource access walks directory components with openat and NOFOLLOW/NONBLOCK,
-using held directory descriptors. Absolute paths, traversal, symlinks,
-special files, excessive directory depth, and binary/non-UTF-8 resources are
-rejected. Directory enumeration uses /proc/self/fd. Discovery records a canonical
-root path; each read reopens and validates its directory components. A symlink
-replacement is rejected. Ordinary file changes remain visible on the next read.
+Resource access walks intermediate directory components with openat using
+O_PATH | O_NOFOLLOW | O_DIRECTORY (allowing traversal beneath 0711 execute-only
+ancestor directories for unprivileged users) and opens only the target directory
+or regular file with O_RDONLY | O_NOFOLLOW | O_NONBLOCK. Absolute paths,
+traversal, symlinks, special files, excessive directory depth, and
+binary/non-UTF-8 resources are rejected. Directory enumeration uses
+/proc/self/fd. Discovery records a canonical root path; each read reopens and
+validates its directory components. A symlink replacement is rejected. Ordinary
+file changes remain visible on the next read.
 
 | Limit | Value |
 | --- | --- |

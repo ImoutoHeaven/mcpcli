@@ -269,7 +269,14 @@ async fn failed_handshake_kills_child_and_crashed_server_is_not_restarted() {
 
 #[tokio::test]
 async fn http_supports_legacy_modern_json_and_sse() {
-    for (modern, mode) in [(false, "normal"), (true, "normal"), (true, "sse")] {
+    for (modern, mode) in [
+        (false, "normal"),
+        (true, "normal"),
+        (true, "sse"),
+        (true, "mixed_case_ct"),
+        (true, "mixed_case_sse"),
+        (false, "get_auth_leak"),
+    ] {
         let mut fixture = Fixture::new();
         let config = fixture.http(modern, mode);
         let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
@@ -278,6 +285,10 @@ async fn http_supports_legacy_modern_json_and_sse() {
         assert_eq!(result["structuredContent"]["name"], "get");
         connection.close().await.unwrap();
     }
+    let mut fixture = Fixture::new();
+    let config = fixture.http(true, "jsonp_ct");
+    let error = McpConnection::connect(&config, BUDGET).await.err().unwrap();
+    assert_eq!(kind(&error), FailureKind::Transport);
 }
 
 #[tokio::test]
@@ -328,13 +339,15 @@ async fn http_rejects_oversize_json_and_reserved_header_overrides() {
         assert_eq!(kind(&error), FailureKind::Transport, "{mode}: {error}");
         connection.close().await.unwrap();
     }
-    let config = ServerConfig::Http {
-        url: "http://127.0.0.1:1/mcp".into(),
-        headers: BTreeMap::from([("Mcp-Session-Id".into(), "user-supplied".into())]),
-        description: None,
-    };
-    let error = McpConnection::connect(&config, BUDGET).await.err().unwrap();
-    assert_eq!(kind(&error), FailureKind::Protocol);
+    for header in ["Mcp-Session-Id", "Last-Event-Id"] {
+        let config = ServerConfig::Http {
+            url: "http://127.0.0.1:1/mcp".into(),
+            headers: BTreeMap::from([(header.into(), "user-supplied".into())]),
+            description: None,
+        };
+        let error = McpConnection::connect(&config, BUDGET).await.err().unwrap();
+        assert_eq!(kind(&error), FailureKind::Protocol);
+    }
 }
 
 #[tokio::test]
@@ -459,6 +472,7 @@ async fn close_joins_local_worker_and_reports_unconfirmed_remote_cleanup() {
         assert!(error.to_string().contains("Local MCP client stopped"));
         assert!(error.to_string().contains("remote session deletion"));
         assert!(connection.is_closed());
+        assert!(connection.is_local_closed());
         assert_eq!(fixture.count("DELETE"), 1);
         let repeated = connection.close().await.unwrap_err();
         assert_eq!(repeated.to_string(), error.to_string());
@@ -478,7 +492,9 @@ async fn cancelled_close_resumes_the_same_owned_join() {
             .await
             .is_err()
     );
+    assert!(!connection.is_local_closed());
     let error = connection.close().await.unwrap_err();
+    assert!(connection.is_local_closed());
     assert_eq!(kind(&error), FailureKind::Timeout);
     assert!(error.to_string().contains("Local MCP client stopped"));
     assert_eq!(fixture.count("DELETE"), 1);
