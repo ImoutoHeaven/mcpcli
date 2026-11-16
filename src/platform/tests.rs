@@ -106,6 +106,115 @@ fn runtime_dacls_and_reparse_points_are_checked() {
 
 #[cfg(windows)]
 #[test]
+fn windows_ancestor_reparse_permissions_are_rejected() {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_APPEND_DATA, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
+        FILE_WRITE_DATA,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    let target = base.join("target");
+    std::fs::create_dir(&target).unwrap();
+    let target = target.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
+    let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
+    let print: Vec<u16> = target.encode_utf16().collect();
+    let data_length = 8 + (substitute.len() + print.len() + 2) * 2;
+    let mut junction = Vec::with_capacity(data_length + 8);
+    junction.extend_from_slice(&IO_REPARSE_TAG_MOUNT_POINT.to_le_bytes());
+    for field in [
+        data_length as u16,
+        0,
+        0,
+        (substitute.len() * 2) as u16,
+        ((substitute.len() + 1) * 2) as u16,
+        (print.len() * 2) as u16,
+    ] {
+        junction.extend_from_slice(&field.to_le_bytes());
+    }
+    for unit in substitute
+        .iter()
+        .chain([0].iter())
+        .chain(&print)
+        .chain([0].iter())
+    {
+        junction.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    for (right, mask, safe) in [
+        ("AD", FILE_APPEND_DATA, true),
+        ("WD", FILE_WRITE_DATA, false),
+        ("WA", FILE_WRITE_ATTRIBUTES, false),
+    ] {
+        let parent = base.join(right);
+        private_dir(&parent).unwrap();
+        let grant = std::process::Command::new("icacls")
+            .arg(&parent)
+            .args(["/grant", &format!("*S-1-1-0:({right})")])
+            .output()
+            .unwrap();
+        assert!(
+            grant.status.success(),
+            "{}",
+            String::from_utf8_lossy(&grant.stderr)
+        );
+        let child = parent.join("private");
+        let result = private_dir(&child);
+        if safe {
+            result.unwrap();
+            std::fs::remove_dir(&child).unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(
+                format!("{error:#}").contains("unsafe runtime ancestor"),
+                "{error:#}"
+            );
+            assert!(!child.exists());
+        }
+
+        // MS-FSA 2.1.5.10.37 permits this without DELETE, despite the live no-delete-share guard.
+        let guard = open_skill_root(&parent).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .access_mode(mask)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&parent)
+            .unwrap();
+        let mut returned = 0;
+        let changed = unsafe {
+            DeviceIoControl(
+                writer.as_raw_handle(),
+                FSCTL_SET_REPARSE_POINT,
+                junction.as_ptr().cast(),
+                junction.len() as u32,
+                std::ptr::null_mut(),
+                0,
+                &mut returned,
+                std::ptr::null_mut(),
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        if safe {
+            assert_eq!(changed, 0);
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        } else {
+            assert_ne!(changed, 0, "{right}: {error}");
+            assert_eq!(parent.canonicalize().unwrap(), base.join("target"));
+        }
+        drop(writer);
+        drop(guard);
+        std::fs::remove_dir(parent).unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
 fn skill_resources_refuse_alternate_data_streams() {
     let base = tempfile::tempdir().unwrap();
     let root = base.path().canonicalize().unwrap();

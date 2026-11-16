@@ -119,8 +119,15 @@ fn check_security(file: &File, private: bool) -> io::Result<()> {
         if privileged(&sid) || matches!(sid.as_str(), "S-1-3-0" | "S-1-3-4") {
             continue;
         }
-        const MUTATES_ANCESTOR: u32 =
-            0x10000000 | 0x40000000 | WRITE_DAC | WRITE_OWNER | DELETE | FILE_DELETE_CHILD;
+        // Either write-data or write-attributes can turn an empty directory into a junction.
+        const MUTATES_ANCESTOR: u32 = 0x10000000
+            | 0x40000000
+            | WRITE_DAC
+            | WRITE_OWNER
+            | DELETE
+            | FILE_DELETE_CHILD
+            | FILE_WRITE_DATA
+            | FILE_WRITE_ATTRIBUTES;
         if private || allowed.Mask & MUTATES_ANCESTOR != 0 {
             return Err(refuse("runtime object grants access to another user"));
         }
@@ -153,7 +160,7 @@ pub fn private_dir(path: &Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("runtime directory must be absolute");
     }
-    // Keeping ancestors open without delete sharing prevents junction swaps during creation.
+    // Pin each ancestor against replacement; its ACL also excludes conversion into a junction.
     let mut guards = Vec::new();
     let parents: Vec<_> = path.ancestors().skip(1).collect();
     for parent in parents.into_iter().rev() {
