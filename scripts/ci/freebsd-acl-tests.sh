@@ -30,7 +30,8 @@ cleanup() {
         fi
     fi
     if [ -n "$device" ] && [ "$failed" = 0 ]; then
-        owned=$(mdconfig -l -f "$fixture_image")
+        # mdconfig list mode emits a trailing separator after each device.
+        owned=$(mdconfig -l -f "$fixture_image" | awk '{$1=$1; print}')
         if [ "$owned" = "$device" ]; then
             mdconfig -d -u "$device" || failed=1
         else
