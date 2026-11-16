@@ -26,6 +26,7 @@
 | R6 | Medium | 新增 macOS/FreeBSD 实现的中间检查点 | 只检查祖先模式位会漏掉额外 ACL 修改授权。现在检查 native ACL 的 mutation grant，允许无害 deny/read 权限；macOS 原生测试和 FreeBSD 专用 NFSv4 文件系统测试必须执行。 |
 | R7 | Medium | 新增 Release CI 的中间检查点 | `release-*` 同时匹配旧日志和聚合包，失败重跑可污染严格七包集合。改为 `release-archive-*`，证据与聚合包分离，并明确替换本次 run 的旧同名产物。 |
 | R8 | Medium | R3 修复后的 C2 检查点 | oneshot inspect 在工具不存在时，经 `?` 提前返回会丢弃连接；reviewer 5 次独立复现中 4 次缺少 DELETE，基线与合法 inspect 对照均正常。现在将元数据转换错误连同连接交给统一输出/清理路径；保留 unknown_tool 和退出码 2，清理失败仅追加诊断。 |
+| R9 | Medium | 新增 Windows 实现的 C2 检查点 | 祖先 DACL 检查遗漏 FILE_WRITE_DATA 与 FILE_WRITE_ATTRIBUTES；任一权限即可把空目录转换为 junction，持有不共享 DELETE 的句柄不足以阻止此操作。现在拒绝这两类外部授权，保留仅创建子目录的权限；原生测试用精确受限句柄证明转换能力与拒绝规则。 |
 
 此外完成 Windows 命令路径解析、drive-relative 路径拒绝、Windows 环境变量名大小写碰撞拒绝、原生 endpoint 身份稳定化，以及过期请求连接/写帧前短路。这些属于新增平台必须补齐的行为。
 
@@ -48,6 +49,10 @@
 
 C2：`cf62d0ff93ee3117a00fb4e1c48c336d42f4e964`，tree `d9f25083d23caba46dc0490eecb37f81d2f533ef`。主代理和 reviewer 各自独立通过 fmt、Clippy、45 单元 + 19 协议 + 23 CLI E2E；reviewer 独立确认技能 root 竞态和尾缀 symlink 两个外部复现均已被拒绝。其后发现 R8，因此双方仍为 **NO-SHIP**。
 
-真实平台 CI 另发现并修复 Windows SYSTEM 测试临时目录/DACL 句柄/CRLF 夹具、macOS HTTP 测试服务器反向 DNS 启动阻塞，以及 Debian Python 3.11 解包 API 差异。这些测试和打包修复均须纳入下一冻结提交重新验收。
+真实平台 CI 另发现并修复 Windows SYSTEM 测试临时目录/DACL 句柄/CRLF 夹具、macOS HTTP 测试服务器反向 DNS 启动阻塞，以及 Debian Python 3.11 解包 API 差异。这些测试和打包修复已纳入 C3 候选，须在新冻结提交重新验收。FreeBSD 的必跑 NFSv4 回归本身通过，另修正 mdconfig 尾随空格导致的夹具清理失败。
+
+R8 独立复验：reviewer 重建 `4ec42aa9c74fc2acdf60c836bce6fd4f990ecec8`，5 次正常缺失工具查询、HTTP 500 清理、DELETE 超时、清理中断共 8 项均保留原错误且恰好发送一次 DELETE；主代理新增后 CLI 25/25 通过。
+
+R9 源码依据：[Microsoft MS-FSA §2.1.5.10.37](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/4aeefef8-92c3-4abc-af7a-a610caf8a165)。主代理与 reviewer 均确认修复范围和原生回归设计；Windows 两架构实际运行仍是最终门禁。
 
 最终冻结 SHA 和双方 SHIP 将在原生 CI 与完整回归完成后记录；当前任何局部绿色结果均不构成发布门禁通过。

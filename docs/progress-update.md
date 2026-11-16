@@ -1,6 +1,6 @@
 # mcpcli 0.1.0 工作进度
 
-更新时间：2026-11-16 18:09（Asia/Shanghai）
+更新时间：2026-11-16 18:14（Asia/Shanghai）
 
 ## 目标与发布门禁
 
@@ -41,7 +41,10 @@
 - 首轮 CI 已验证 Ubuntu、Alpine 两架构、Debian 两架构、FreeBSD 和真实 fastexec+Playwright 套件；Windows 测试环境问题已修复后进入 C2。macOS 揭示测试 HTTPServer 的反向 DNS 查询会阻塞启动，已改为纯回环绑定。
 - C2 发版预演 FreeBSD 归档/解包 E2E 已通过；Linux 归档在 Debian 上暴露 Python 3.11 解包参数差异，正在修复。
 - reviewer 新发现 R8：oneshot inspect 不存在的工具时，元数据错误路径可能跳过 DELETE。主代理正在统一结果与错误的清理所有权，CI 子代理补充正常、超时及中断清理回归。
-- 当前双方 **NO-SHIP**。上述改动将形成新冻结提交，重新审查完整仓库并重跑全部 CI 与七包发版预演。
+- R8 已修复；reviewer 独立 8 项定向复验通过，主代理扩展后 CLI 25/25 通过。
+- R9：Windows 祖先权限遗漏可设置 junction 的写权限，已增加拒绝规则和原生证明测试；主代理/reviewer 源码复核认可，等待 Windows 两架构实际执行。
+- macOS DNS 夹具、Debian 归档提取、FreeBSD mdconfig 清理修复均已整合；归档安全自测 3/3 通过。
+- 当前双方仍 **NO-SHIP**，因为 C3 候选尚未完成冻结后的全树审查与所有平台 CI。接下来冻结 C3，重跑完整 CI 与七包发版预演。
 
 ## 发布状态
 
