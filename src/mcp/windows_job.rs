@@ -14,7 +14,10 @@ use windows_sys::Win32::{
             JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
         },
-        Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME},
+        Threading::{
+            GetProcessIdOfThread, OpenThread, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+            THREAD_SUSPEND_RESUME,
+        },
     },
 };
 
@@ -102,17 +105,7 @@ fn resume(pid: u32) -> io::Result<()> {
     let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
     while more {
         if entry.th32OwnerProcessID == pid {
-            // SAFETY: this thread ID belongs to the still-suspended owned child.
-            let raw = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
-            if raw.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: OpenThread returned a new owned handle.
-            let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
-            // SAFETY: the thread was opened with the required resume access.
-            if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
-                return Err(io::Error::last_os_error());
-            }
+            resume_owned_thread(pid, entry.th32ThreadID)?;
             found = true;
         }
         // SAFETY: the snapshot and output buffer remain live.
@@ -124,4 +117,40 @@ fn resume(pid: u32) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+fn resume_owned_thread(pid: u32, tid: u32) -> io::Result<()> {
+    // A snapshot is only a hint: an exited thread's ID may already have been reused.
+    let raw = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            0,
+            tid,
+        )
+    };
+    if raw.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: OpenThread returned a new owned handle.
+    let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
+    // SAFETY: the live handle has THREAD_QUERY_LIMITED_INFORMATION access.
+    if unsafe { GetProcessIdOfThread(thread.as_raw_handle()) } != pid {
+        return Err(io::Error::other("MCP child thread ownership changed"));
+    }
+    // SAFETY: the verified child thread handle has THREAD_SUSPEND_RESUME access.
+    if unsafe { ResumeThread(thread.as_raw_handle()) } == u32::MAX {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn refuses_thread_outside_owned_child_before_resuming() {
+        // SAFETY: GetCurrentThreadId has no preconditions; PID zero cannot own this thread.
+        let tid = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+        assert!(resume_owned_thread(0, tid).is_err());
+    }
 }
