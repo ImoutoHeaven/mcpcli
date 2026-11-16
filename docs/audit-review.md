@@ -10,7 +10,13 @@ C5 `196e0baeec7ceaa3dac75e1690579064b0917fde`（tree `386421b8e8cc83d9a1476f2792
 
 级别 Medium；来源为既有 HTTP 清理适配。`BoundedHttp::delete_session` 委托 rmcp 3.9.0 的 reqwest 实现，后者调用 `Response::error_for_status`；reqwest 0.13.5 仅将 4xx/5xx 转为错误。因此关闭重定向跟随时，DELETE 307 仍返回成功，reset/stop 可错误确认清理。修复要求：自行检查 DELETE 响应，仅接受 2xx 和协议允许的 404/405，保留两秒期限、错误脱敏和清理记录；回归验证 307 报告清理失败、保留已知调用结果且不跟随重定向。修复已集成为 `c74b61ec7576027b856783e286192c21f28ed902`；实现代理在修复前确认两条回归失败，修复后 fmt/Clippy、45 单元、19 协议、26 CLI（0 skip）、3 归档及 6 Windows 依赖自测通过。主代理已复核补丁及调用方；最终结论取决于包含状态记录的 C6 全树复核和全平台 CI。
 
-当前版本和后续验收步骤见 [progress-update.md](progress-update.md)。
+### R15：Linux 测试进程观察遗漏 ESRCH
+
+C6 `3abf3dc7ef0505919878fcc6b7633891128c5ea8` 的直接原生 CI 在 Alpine amd64 读取刚退出进程的 `/proc/PID/stat` 时收到 ProcessLookupError；辅助函数只捕获 FileNotFoundError，导致正确退出被报为测试失败。同一提交的七包预演全部通过，不能代替修复这个已确认的测试竞态。
+
+测试修复已集成为 `3e75a3fa3fcc03eb7ca4a077650186881e2e0b75`：仅 ENOENT/ESRCH 视为已退出，其他观察错误继续失败。4 项 Python 回归覆盖真实当前进程、消失状态、权限/I/O 错误传播和 zombie/live 解析，并接入原生 runner。修复前 ESRCH 用例失败，修复后完整本地 runner、只读 Alpine 与主代理 Debian 容器的辅助回归均通过。生产代码无变化。
+
+当前 C7 等待同一冻结提交的双方最终 SHIP、原生 CI 和七包预演。当前版本和后续验收步骤见 [progress-update.md](progress-update.md)。
 
 ## 基线
 
