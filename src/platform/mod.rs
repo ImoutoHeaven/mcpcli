@@ -113,9 +113,11 @@ fn canonical_skill_root_with(
     path: &Path,
     canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
 ) -> io::Result<PathBuf> {
+    // Trailing separators or '/.' must not turn a symlink leaf into an ancestor.
+    let path: PathBuf = path.components().collect();
     // Pin the configured leaf before canonicalization can follow a replacement link.
-    let original = open_skill_root(path)?;
-    let resolved = canonicalize(path)?;
+    let original = open_skill_root(&path)?;
+    let resolved = canonicalize(&path)?;
     let verified = open_skill_root(&resolved)?;
     if !same_file(&original, &verified)? {
         return Err(io::Error::new(

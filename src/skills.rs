@@ -524,7 +524,23 @@ mod tests {
         let root = create_skill(temp.path(), "source");
         let linked = temp.path().join("linked");
         symlink(&root, &linked).unwrap();
-        assert!(discover(&[linked]).is_err());
+        for suffix in ["", "/", "/."] {
+            let mut alias = linked.as_os_str().to_os_string();
+            alias.push(suffix);
+            assert!(
+                discover(&[PathBuf::from(alias)]).is_err(),
+                "symlink suffix {suffix:?}"
+            );
+        }
+        #[cfg(windows)]
+        for suffix in [r"\", r"\."] {
+            let mut alias = linked.as_os_str().to_os_string();
+            alias.push(suffix);
+            assert!(
+                discover(&[PathBuf::from(alias)]).is_err(),
+                "symlink suffix {suffix:?}"
+            );
+        }
         fs::remove_file(root.join("SKILL.md")).unwrap();
         fs::write(temp.path().join("outside"), "secret").unwrap();
         symlink(temp.path().join("outside"), root.join("SKILL.md")).unwrap();
