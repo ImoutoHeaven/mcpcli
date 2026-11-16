@@ -1,0 +1,387 @@
+use crate::config::LoadedConfig;
+use crate::ipc::{self, Failure, Operation, Request, Response};
+use crate::mcp::{FailureKind, McpConnection, McpFailure};
+use crate::runtime::{Lock, Paths, State, uid};
+use anyhow::{Context, Result};
+use serde_json::{Value, json};
+use std::collections::BTreeMap;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::task::JoinSet;
+use tokio::time::{Instant, timeout};
+use tokio_util::sync::CancellationToken;
+
+const MAX_CONNECTIONS: usize = 32;
+const MAX_CONTROL_CONNECTIONS: usize = 8;
+const MAX_IN_FLIGHT: usize = 8;
+const MAX_CONNECT: Duration = Duration::from_secs(30);
+const FRAME_WAIT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+struct ServerState {
+    connection: Option<McpConnection>,
+    lost: bool,
+    calls: u64,
+}
+struct App {
+    paths: Paths,
+    config: LoadedConfig,
+    state: State,
+    servers: BTreeMap<String, Arc<Mutex<ServerState>>>,
+    work: Semaphore,
+    shutdown: CancellationToken,
+}
+
+pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
+    if let Some(error) = error.downcast_ref::<McpFailure>() {
+        let (code, kind) = match error.kind {
+            FailureKind::Timeout => (5, "timeout"),
+            FailureKind::Protocol => (4, "mcp_protocol"),
+            FailureKind::Transport => (4, "mcp_transport"),
+        };
+        Failure::new(code, kind, error.message.clone()).uncertain(error.outcome_unknown)
+    } else {
+        Failure::new(4, "mcp_error", "MCP operation failed").uncertain(calling)
+    }
+}
+
+impl App {
+    fn response(&self, result: std::result::Result<Value, Failure>) -> Response {
+        let (result, error) = match result {
+            Ok(v) => (Some(v), None),
+            Err(e) => (None, Some(e)),
+        };
+        Response {
+            protocol: ipc::PROTOCOL,
+            namespace: self.paths.namespace.clone(),
+            build: self.paths.build.clone(),
+            epoch: self.state.epoch.clone(),
+            result,
+            error,
+        }
+    }
+    fn status(&self) -> Value {
+        let servers: BTreeMap<_,_> = self.servers.iter().map(|(name,state)| {
+            let value = match state.try_lock() {
+                Ok(state) => json!({
+                    "state": if state.lost { "lost" } else {
+                        match &state.connection {Some(c) if c.is_closed()=>"lost",Some(_)=>"connected",None=>"lazy"}
+                    },
+                    "calls":state.calls
+                }),
+                Err(_) => json!({"state":"busy"}),
+            };
+            (name.clone(),value)
+        }).collect();
+        json!({"running":true,"pid":self.state.pid,"epoch":self.state.epoch,
+            "session":self.paths.session,"namespace":self.paths.namespace,"version":env!("CARGO_PKG_VERSION"),
+            "config_digest":self.config.digest,"build":self.paths.build,
+            "started_unix_ms":self.state.started_unix_ms,"servers":servers})
+    }
+    fn validate(&self, request: &Request) -> std::result::Result<(), Failure> {
+        if request.protocol != ipc::PROTOCOL || request.namespace != self.paths.namespace {
+            return Err(Failure::new(
+                6,
+                "daemon_mismatch",
+                "daemon protocol or namespace does not match",
+            ));
+        }
+        if !request.operation.management()
+            && (request.build != self.paths.build || request.digest != self.config.digest)
+        {
+            return Err(Failure::new(
+                6,
+                "daemon_mismatch",
+                "daemon configuration or binary changed; run daemon restart (this discards session state)",
+            ));
+        }
+        if !(1..=3_600_000).contains(&request.timeout_ms) {
+            return Err(Failure::new(
+                2,
+                "invalid_timeout",
+                "timeout must be between 1ms and one hour",
+            ));
+        }
+        if let Operation::Call {
+            tool, arguments, ..
+        } = &request.operation
+        {
+            if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
+                return Err(Failure::new(2, "invalid_tool", "invalid tool name"));
+            }
+            let size = serde_json::to_vec(arguments)
+                .map_err(|_| Failure::new(2, "invalid_arguments", "cannot encode arguments"))?
+                .len();
+            if size > ipc::ARGUMENT_LIMIT {
+                return Err(Failure::new(
+                    2,
+                    "invalid_arguments",
+                    "arguments exceed the 1 MiB limit",
+                ));
+            }
+        }
+        Ok(())
+    }
+    async fn execute(
+        &self,
+        operation: &Operation,
+        deadline: Instant,
+        dispatched: &AtomicBool,
+    ) -> std::result::Result<Value, Failure> {
+        let server = match operation {
+            Operation::Status => return Ok(self.status()),
+            Operation::Stop => return Ok(json!({"stopping":true})),
+            Operation::Tools { server }
+            | Operation::Call { server, .. }
+            | Operation::Reset { server } => server,
+        };
+        let state = self.servers.get(server).ok_or_else(|| {
+            Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
+        })?;
+        let mut state = state.lock().await;
+        let _work = self
+            .work
+            .acquire()
+            .await
+            .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
+        if let Operation::Reset { .. } = operation {
+            state.lost = true;
+            if let Some(connection) = state.connection.as_mut() {
+                connection.close().await.map_err(|error| {
+                    Failure::new(
+                        1,
+                        "cleanup",
+                        format!(
+                            "server {server:?} cleanup failed: {error}; session remains unavailable"
+                        ),
+                    )
+                })?;
+            }
+            state.connection = None;
+            state.lost = false;
+            return Ok(json!({"server":server,"reset":true,"state":"lazy"}));
+        }
+        if state.lost
+            || state
+                .connection
+                .as_ref()
+                .is_some_and(McpConnection::is_closed)
+        {
+            state.lost = true;
+            return Err(Failure::new(
+                6,
+                "session_lost",
+                format!(
+                    "server {server:?} disconnected; state may be lost. Run reset {server} before opening a new connection"
+                ),
+            ));
+        }
+        if state.connection.is_none() {
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(MAX_CONNECT);
+            let config = &self.config.config.servers[server];
+            state.connection = Some(
+                McpConnection::connect(config, budget)
+                    .await
+                    .map_err(|e| mcp_error(e, false))?,
+            );
+        }
+        let budget = deadline.saturating_duration_since(Instant::now());
+        let calling = operation.is_call();
+        if calling {
+            state.calls += 1;
+        }
+        let connection = state
+            .connection
+            .as_ref()
+            .expect("connection was established");
+        let result = match operation {
+            Operation::Tools { .. } => connection
+                .list_tools(budget)
+                .await
+                .map(|tools| json!(tools)),
+            Operation::Call {
+                tool, arguments, ..
+            } => {
+                connection
+                    .call_with_dispatch(tool, arguments.clone(), budget, dispatched)
+                    .await
+            }
+            _ => unreachable!(),
+        };
+        if connection.is_closed() {
+            state.lost = true;
+        }
+        result.map_err(|e| mcp_error(e, calling))
+    }
+}
+
+async fn send(stream: &mut UnixStream, app: &App, result: std::result::Result<Value, Failure>) {
+    let response = app.response(result);
+    let write = async {
+        if let Err(error) = ipc::write_frame(stream, &response, ipc::RESPONSE_LIMIT).await
+            && error.kind() == std::io::ErrorKind::InvalidData
+        {
+            let fallback = app.response(Err(Failure::new(
+                4,
+                "result_too_large",
+                "result exceeds the 32 MiB IPC output limit; the operation is not replayed",
+            )
+            .uncertain(true)));
+            let _ = ipc::write_frame(stream, &fallback, ipc::RESPONSE_LIMIT).await;
+        }
+    };
+    let _ = timeout(FRAME_WAIT, write).await;
+}
+
+async fn handle(mut stream: UnixStream, app: Arc<App>, control: bool) {
+    if !matches!(stream.peer_cred(),Ok(peer) if peer.uid()==uid()) {
+        return;
+    }
+    let request = match timeout(
+        FRAME_WAIT,
+        ipc::read_frame::<_, Request>(&mut stream, ipc::REQUEST_LIMIT),
+    )
+    .await
+    {
+        Ok(Ok(Some(request))) => request,
+        _ => return,
+    };
+    if control && !request.operation.management() {
+        send(
+            &mut stream,
+            &app,
+            Err(Failure::new(
+                2,
+                "control_only",
+                "control endpoint only accepts status and stop",
+            )),
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = app.validate(&request) {
+        send(&mut stream, &app, Err(error)).await;
+        return;
+    }
+    if matches!(request.operation, Operation::Stop) {
+        send(&mut stream, &app, Ok(json!({"stopping":true}))).await;
+        app.shutdown.cancel();
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_millis(request.timeout_ms);
+    let dispatched = AtomicBool::new(false);
+    let execute = timeout(
+        Duration::from_millis(request.timeout_ms),
+        app.execute(&request.operation, deadline, &dispatched),
+    );
+    let mut extra = [0u8; 1];
+    let result = tokio::select! {
+        result = execute => match result {
+            Ok(result)=>result,
+            Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
+                .uncertain(dispatched.load(Ordering::Acquire))),
+        },
+        // One request per connection; EOF or extra input abandons the in-flight operation.
+        _ = stream.read(&mut extra) => return,
+        _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
+            .uncertain(dispatched.load(Ordering::Acquire))),
+    };
+    send(&mut stream, &app, result).await;
+}
+
+pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
+    let _lifetime =
+        Lock::try_acquire(&paths.daemon_lock())?.context("daemon is already running")?;
+    paths.remove_socket()?;
+    let listener = UnixListener::bind(&paths.socket)?;
+    let control_listener = UnixListener::bind(&paths.control_socket)?;
+    for socket in [&paths.socket, &paths.control_socket] {
+        std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
+    }
+    let mut state = State::fresh();
+    state.store(&paths)?;
+    let servers = config
+        .config
+        .servers
+        .keys()
+        .map(|name| (name.clone(), Arc::new(Mutex::new(ServerState::default()))))
+        .collect();
+    let app = Arc::new(App {
+        paths: paths.clone(),
+        config,
+        state: state.clone(),
+        servers,
+        work: Semaphore::new(MAX_IN_FLIGHT),
+        shutdown: CancellationToken::new(),
+    });
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let control_connections = Arc::new(Semaphore::new(MAX_CONTROL_CONNECTIONS));
+    let mut tasks = JoinSet::new();
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    loop {
+        tokio::select! {
+            _ = app.shutdown.cancelled() => break,
+            _ = term.recv() => break,
+            _ = interrupt.recv() => break,
+            _ = tasks.join_next(), if !tasks.is_empty() => {},
+            accepted = listener.accept() => {
+                let (stream,_) = accepted?;
+                if let Ok(permit) = connections.clone().try_acquire_owned() {
+                    let app = app.clone();
+                    tasks.spawn(async move { let _permit=permit; handle(stream,app,false).await; });
+                }
+            }
+            accepted = control_listener.accept() => {
+                let (stream,_) = accepted?;
+                if let Ok(permit) = control_connections.clone().try_acquire_owned() {
+                    let app = app.clone();
+                    tasks.spawn(async move { let _permit=permit; handle(stream,app,true).await; });
+                }
+            }
+        }
+    }
+    drop(listener);
+    drop(control_listener);
+    app.shutdown.cancel();
+    let drained = timeout(Duration::from_secs(6), async {
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    if drained.is_err() {
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+    let cleanup =
+        futures_util::future::join_all(app.servers.iter().map(|(name, server)| async move {
+            let mut state = server.lock().await;
+            if let Some(connection) = state.connection.as_mut() {
+                connection
+                    .close()
+                    .await
+                    .map_err(|error| format!("server {name:?}: {error}"))?;
+            }
+            state.connection = None;
+            Ok::<_, String>(())
+        }));
+    state.cleanup_errors = match timeout(Duration::from_secs(10), cleanup).await {
+        Ok(results) => results.into_iter().filter_map(Result::err).collect(),
+        Err(_) => vec!["daemon cleanup exceeded its deadline".into()],
+    };
+    paths.remove_socket()?;
+    state.clean_stop = state.cleanup_errors.is_empty();
+    state.store(&paths)?;
+    if !state.clean_stop {
+        anyhow::bail!("daemon cleanup failed: {}", state.cleanup_errors.join("; "));
+    }
+    Ok(())
+}

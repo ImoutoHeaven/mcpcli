@@ -1,0 +1,16 @@
+/target/
+/dist/
+/mcpcli.json
+/docs/progress-update.md
+/docs/update.md
+/docs/final-reply.md
+*.log
+
+# Local development and verification records
+/docs/*
+!/docs/mcpcli-design.md
+/examples/skills/
+
+# Python test runner caches
+__pycache__/
+*.py[cod]

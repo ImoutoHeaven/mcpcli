@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "servers": {
+    "fastexec": {
+      "transport": "stdio",
+      "command": "fastexec",
+      "env": {
+        "FASTEXEC_DAEMON": "off"
+      },
+      "description": "Local files and background command execution"
+    },
+    "browser": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "--yes",
+        "@playwright/mcp@0.0.85",
+        "--headless",
+        "--isolated"
+      ],
+      "description": "Microsoft Playwright browser automation"
+    }
+  },
+  "skills": []
+}
