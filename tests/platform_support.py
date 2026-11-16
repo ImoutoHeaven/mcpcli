@@ -126,7 +126,42 @@ class IdleConnection:
             self.socket.close()
 
 
+def interrupt(process, signum):
+    if not WINDOWS:
+        process.send_signal(signum)
+        return
+    # Scheduled tasks may have no console; only the helper attaches to the child's console.
+    subprocess.run([sys.executable, str(Path(__file__).resolve()), "--interrupt", str(process.pid)],
+                   check=True, capture_output=True, text=True, timeout=5)
+
+
+def windows_interrupt(pid):
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    handler = handler_type(lambda _: True)
+    kernel.AttachConsole.argtypes = [wintypes.DWORD]
+    kernel.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
+    kernel.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.FreeConsole()
+    if not kernel.AttachConsole(int(pid)):
+        raise OSError(ctypes.get_last_error(), "AttachConsole")
+    try:
+        if not kernel.SetConsoleCtrlHandler(handler, True):
+            raise OSError(ctypes.get_last_error(), "SetConsoleCtrlHandler")
+        if not kernel.GenerateConsoleCtrlEvent(1, 0):  # CTRL_BREAK_EVENT to this dedicated console.
+            raise OSError(ctypes.get_last_error(), "GenerateConsoleCtrlEvent")
+        time.sleep(0.1)
+    finally:
+        kernel.FreeConsole()
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "--running":
-        raise SystemExit("usage: platform_support.py --running PID")
-    raise SystemExit(0 if running(int(sys.argv[2])) else 1)
+    if len(sys.argv) != 3:
+        raise SystemExit("usage: platform_support.py --running/--interrupt PID")
+    if sys.argv[1] == "--interrupt" and WINDOWS:
+        windows_interrupt(int(sys.argv[2]))
+    elif sys.argv[1] == "--running":
+        raise SystemExit(0 if running(int(sys.argv[2])) else 1)
+    else:
+        raise SystemExit("unsupported platform probe")

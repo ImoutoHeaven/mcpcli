@@ -17,7 +17,7 @@ import threading
 import time
 import traceback
 
-from platform_support import IdleConnection, LINUX, WINDOWS, kill_owned, readline_with_timeout, running
+from platform_support import IdleConnection, LINUX, WINDOWS, interrupt, kill_owned, readline_with_timeout, running
 
 
 class CaseSkipped(Exception):
@@ -141,11 +141,17 @@ class Fixture:
             args.extend(["--args", json.dumps(arguments)])
         return self.value(*args, **options)
 
-    def start(self, *args, session="default", timeout=10, open_stdin=False):
+    def start(self, *args, session="default", timeout=10, open_stdin=False, signal_console=False):
+        startup = {}
+        if WINDOWS and signal_console:
+            info = subprocess.STARTUPINFO()
+            info.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            info.wShowWindow = subprocess.SW_HIDE
+            startup = {"creationflags": subprocess.CREATE_NEW_CONSOLE, "startupinfo": info}
         process = subprocess.Popen(self.command(*args, session=session, timeout=timeout), env=self.env,
             stdin=subprocess.PIPE if open_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if WINDOWS else 0)
+            **startup)
         self.processes.append(process)
         return process
 
@@ -374,7 +380,7 @@ def timeout_and_disconnect(f):
 
 
 def interrupted_stdin(f):
-    process = f.start("call", "state", "echo", "--stdin", open_stdin=True)
+    process = f.start("call", "state", "echo", "--stdin", open_stdin=True, signal_console=True)
     process.stdin.write('{"unfinished":')
     process.stdin.flush()
 
@@ -391,7 +397,7 @@ def interrupted_stdin(f):
     else:
         time.sleep(1)
         assert process.poll() is None, "stdin reader exited before interruption"
-    process.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+    interrupt(process, signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
     assert process.wait(timeout=5) == (143 if WINDOWS else 130), "stdin ignored interruption"
     stdout, stderr = process.communicate()
     parsed_error = json.loads(stderr)["error"]
@@ -431,11 +437,11 @@ def oneshot_signals_clean_process_group(f):
     for signum, expected in signals:
         previous = len(f.events("child"))
         process = f.start("--oneshot", "call", "state", "spawn_wait", "--args",
-                          '{"seconds":30}', timeout=40)
+                          '{"seconds":30}', timeout=40, signal_console=True)
         wait_for(lambda: len(f.events("child")) > previous, "oneshot did not spawn descendant")
         child = f.events("child")[-1]
         wait_for(lambda: f.events("waiting", pid=child["pid"]), "oneshot call did not start waiting")
-        process.send_signal(signum)
+        interrupt(process, signum)
         assert process.wait(timeout=6) == expected
         process.communicate()
         wait_for(lambda: not running(child["pid"]), "oneshot cancellation leaked MCP server")
@@ -548,10 +554,10 @@ def http_delete_timeout_is_reported(f):
 
 def interrupt_after_result_preserves_known_outcome(f):
     log = f.use_http("delete_hang")
-    process = f.start("--oneshot", "call", "state", "get", timeout=20)
+    process = f.start("--oneshot", "call", "state", "get", timeout=20, signal_console=True)
     wait_for(lambda: log.exists() and "DELETE" in log.read_text().splitlines(),
              "tool result did not enter remote cleanup", seconds=8)
-    process.send_signal(signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
+    interrupt(process, signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
     stdout, stderr = process.communicate(timeout=6)
     assert process.returncode == (143 if WINDOWS else 130), (process.returncode, stderr)
     assert json.loads(stdout)["structuredContent"] == {"name": "get"}, stdout
