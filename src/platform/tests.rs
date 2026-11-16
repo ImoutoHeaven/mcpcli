@@ -105,23 +105,17 @@ fn runtime_dacls_and_reparse_points_are_checked() {
 }
 
 #[cfg(windows)]
-#[test]
-fn windows_ancestor_reparse_permissions_are_rejected() {
+fn convert_to_junction(path: &Path, access: u32, target: &Path) -> std::io::Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_APPEND_DATA, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES,
-        FILE_WRITE_DATA,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     use windows_sys::Win32::System::IO::DeviceIoControl;
     use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
     use windows_sys::Win32::System::SystemServices::IO_REPARSE_TAG_MOUNT_POINT;
 
-    let temporary = tempfile::tempdir().unwrap();
-    let base = temporary.path().canonicalize().unwrap();
-    let target = base.join("target");
-    std::fs::create_dir(&target).unwrap();
     let target = target.to_str().unwrap().strip_prefix(r"\\?\").unwrap();
     let substitute: Vec<u16> = format!(r"\??\{target}").encode_utf16().collect();
     let print: Vec<u16> = target.encode_utf16().collect();
@@ -146,7 +140,41 @@ fn windows_ancestor_reparse_permissions_are_rejected() {
     {
         junction.extend_from_slice(&unit.to_le_bytes());
     }
+    let writer = std::fs::OpenOptions::new()
+        .access_mode(access)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    let mut returned = 0;
+    if unsafe {
+        DeviceIoControl(
+            writer.as_raw_handle(),
+            FSCTL_SET_REPARSE_POINT,
+            junction.as_ptr().cast(),
+            junction.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
+#[cfg(windows)]
+#[test]
+fn windows_ancestor_reparse_permissions_are_rejected() {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_APPEND_DATA, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+    };
+
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    let target = base.join("target");
+    std::fs::create_dir(&target).unwrap();
     for (right, mask, safe) in [
         ("AD", FILE_APPEND_DATA, true),
         ("WD", FILE_WRITE_DATA, false),
@@ -180,35 +208,68 @@ fn windows_ancestor_reparse_permissions_are_rejected() {
 
         // MS-FSA 2.1.5.10.37 permits this without DELETE, despite the live no-delete-share guard.
         let guard = open_skill_root(&parent).unwrap();
-        let writer = std::fs::OpenOptions::new()
-            .access_mode(mask)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(&parent)
-            .unwrap();
-        let mut returned = 0;
-        let changed = unsafe {
-            DeviceIoControl(
-                writer.as_raw_handle(),
-                FSCTL_SET_REPARSE_POINT,
-                junction.as_ptr().cast(),
-                junction.len() as u32,
-                std::ptr::null_mut(),
-                0,
-                &mut returned,
-                std::ptr::null_mut(),
-            )
-        };
-        let error = std::io::Error::last_os_error();
+        let changed = convert_to_junction(&parent, mask, &target);
         if safe {
-            assert_eq!(changed, 0);
-            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(
+                changed.unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
         } else {
-            assert_ne!(changed, 0, "{right}: {error}");
-            assert_eq!(parent.canonicalize().unwrap(), base.join("target"));
+            changed.unwrap();
+            assert_eq!(parent.canonicalize().unwrap(), target);
         }
-        drop(writer);
         drop(guard);
+        std::fs::remove_dir(parent).unwrap();
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn skill_traversal_and_enumeration_stay_pinned_during_junction_conversion() {
+    use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let base = temporary.path().canonicalize().unwrap();
+    let root = base.join("skills");
+    let outside = base.join("outside");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::create_dir(outside.join("nested")).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"outside secret").unwrap();
+    std::fs::write(outside.join("nested/secret.txt"), b"outside secret").unwrap();
+    for (name, resource, directory) in [
+        ("read", "read/secret.txt", false),
+        ("list", "list/nested", true),
+        ("opened", "opened", true),
+    ] {
+        let parent = root.join(name);
+        std::fs::create_dir(&parent).unwrap();
+        let mut converted = false;
+        let result =
+            windows::open_beneath_with(&root, Path::new(resource), directory, |path, _file| {
+                if path == parent {
+                    convert_to_junction(path, FILE_WRITE_ATTRIBUTES, &outside).unwrap();
+                    converted = true;
+                }
+            });
+        assert!(
+            converted,
+            "the race hook must run after opening its directory"
+        );
+        if name == "opened" {
+            let file = result.unwrap();
+            if let Ok(entries) = directory_entries(&file, 10) {
+                assert!(
+                    entries.is_empty(),
+                    "enumeration followed the replacement junction"
+                );
+            }
+        } else {
+            assert!(
+                result.is_err(),
+                "traversal followed the replacement junction"
+            );
+        }
         std::fs::remove_dir(parent).unwrap();
     }
 }

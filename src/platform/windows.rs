@@ -329,46 +329,132 @@ pub fn open_input(path: &Path) -> io::Result<File> {
 }
 
 pub fn open_beneath(root: &Path, relative: &Path, directory: bool) -> io::Result<File> {
+    open_beneath_with(root, relative, directory, |_, _| {})
+}
+
+pub(super) fn open_beneath_with(
+    root: &Path,
+    relative: &Path,
+    directory: bool,
+    mut opened: impl FnMut(&Path, &File),
+) -> io::Result<File> {
     let combined = root.join(relative);
     let mut path = PathBuf::new();
     let mut guards = Vec::new();
     let parts: Vec<_> = combined.components().collect();
     for (index, component) in parts.iter().enumerate() {
         path.push(component.as_os_str());
-        match component {
-            Component::Prefix(_) => continue,
-            Component::RootDir | Component::Normal(_) => {}
-            _ => return Err(refuse("resource path is not normalized")),
-        }
-        if let Component::Normal(name) = component
-            && name.encode_wide().any(|unit| unit == u16::from(b':'))
-        {
-            return Err(refuse("alternate data streams are not skill resources"));
-        }
         let intermediate = index + 1 < parts.len();
-        if intermediate || directory {
-            let file = open_directory(&path, !intermediate)?;
-            if !intermediate {
-                return Ok(file);
+        let file = match component {
+            Component::Prefix(_) => continue,
+            Component::RootDir => open_directory(&path, !intermediate)?,
+            Component::Normal(name) => {
+                if name.encode_wide().any(|unit| unit == u16::from(b':')) {
+                    return Err(refuse("alternate data streams are not skill resources"));
+                }
+                let parent = guards
+                    .last()
+                    .ok_or_else(|| refuse("skill root must be absolute"))?;
+                open_relative(parent, name, intermediate || directory, !intermediate)?
             }
-            guards.push(file);
-        } else {
-            let file = OpenOptions::new()
-                .read(true)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-                .open(&path)?;
-            let meta = file.metadata()?;
-            if !meta.is_file() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                return Err(refuse("resource is not a regular file"));
-            }
+            _ => return Err(refuse("resource path is not normalized")),
+        };
+        opened(&path, &file);
+        if !intermediate {
             return Ok(file);
         }
+        guards.push(file);
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         "empty skill root",
     ))
+}
+
+/// Resolve one child from the live directory object, even if its name was changed into a junction.
+fn open_relative(
+    parent: &File,
+    name: &OsStr,
+    directory: bool,
+    enumerate: bool,
+) -> io::Result<File> {
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, RtlNtStatusToDosError, UNICODE_STRING,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name = wide(name)?;
+    let length = u16::try_from((name.len() - 1) * 2)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "resource name is too long"))?;
+    let mut name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: parent.as_raw_handle(),
+        ObjectName: &mut name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        ..Default::default()
+    };
+    let access = READ_CONTROL
+        | FILE_READ_ATTRIBUTES
+        | SYNCHRONIZE
+        | if directory {
+            if enumerate {
+                FILE_LIST_DIRECTORY
+            } else {
+                FILE_TRAVERSE
+            }
+        } else {
+            FILE_READ_DATA
+        };
+    let mut handle = std::ptr::null_mut();
+    let mut status_block = IO_STATUS_BLOCK::default();
+    // The single component, parent handle, and synchronous status buffer stay live through open.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &attributes,
+            &mut status_block,
+            std::ptr::null(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            FILE_OPEN,
+            FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status != 0 {
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            unsafe { CloseHandle(handle) };
+        }
+        return Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ));
+    }
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::other("resource open returned no handle"));
+    }
+    let file = unsafe { File::from_raw_handle(handle) };
+    let meta = file.metadata()?;
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || if directory {
+            !meta.is_dir()
+        } else {
+            !meta.is_file()
+        }
+    {
+        return Err(refuse("resource type changed or is a reparse point"));
+    }
+    Ok(file)
 }
 
 pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::DirectoryEntry>> {
