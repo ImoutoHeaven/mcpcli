@@ -21,9 +21,10 @@ set PYTHONUTF8=1
 set PYTHONUNBUFFERED=1
 cd /d $env:GITHUB_WORKSPACE
 "$python" "$PythonScript" $quotedArguments > "$log" 2>&1
-echo %ERRORLEVEL% > "$done"
+echo %ERRORLEVEL% > "$done.tmp"
+move /y "$done.tmp" "$done" > nul
 "@ | Set-Content -Encoding ASCII $cmd
-Remove-Item $log, $done -ErrorAction SilentlyContinue
+Remove-Item $log, $done, "$done.tmp" -ErrorAction SilentlyContinue
 $logReader = $null
 function Write-NewLog {
     if (-not $script:logReader -and (Test-Path $log)) {
@@ -66,7 +67,11 @@ try {
         Start-Sleep -Seconds 5
     }
     Write-NewLog
-    if ([int](Get-Content $done) -ne 0) { throw "native Windows tests failed" }
+    $exitCode = 0
+    if (-not [int]::TryParse([string](Get-Content $done -Raw), [ref]$exitCode)) {
+        throw "test task returned an invalid exit-code file"
+    }
+    if ($exitCode -ne 0) { throw "native Windows tests failed: exit $exitCode" }
 } finally {
     schtasks /end /tn $taskName 2>&1 | Out-Null
     schtasks /delete /tn $taskName /f 2>&1 | Out-Null
