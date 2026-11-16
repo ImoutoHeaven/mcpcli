@@ -106,6 +106,11 @@ def main():
                 raise AssertionError("ignored tests must have an explicit CI gate, not a silent pass")
         except Exception as error:
             failures.append(str(error))
+    try:
+        run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-t", "tests", "-v"],
+            options.timeout, Path("ci-python-tests.log"), env)
+    except Exception as error:
+        failures.append(str(error))
     release = run(["cargo", "build", "--release", "--locked", "--message-format=json"],
                   options.timeout, Path("ci-build-release.log"), env, True)
     binaries = []

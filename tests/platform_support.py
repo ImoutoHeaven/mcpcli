@@ -66,7 +66,7 @@ def running(pid):
     if LINUX:
         try:
             return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0] != "Z"
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             return False
     result = subprocess.run(["ps", "-o", "stat=", "-p", str(int(pid))],
                             text=True, capture_output=True, timeout=5)
