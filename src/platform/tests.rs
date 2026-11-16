@@ -222,3 +222,91 @@ fn freebsd_ancestor_acl_mutation_is_rejected() {
     assert!(format!("{error:#}").contains("ancestor ACL"), "{error:#}");
     assert!(!parent.join("must-not-exist").exists());
 }
+
+#[cfg(windows)]
+#[test]
+fn daemon_spawn_respects_job_breakaway_policy() {
+    use std::io::{Read, Write};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::process::{Command, Stdio};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+    if let Ok(mode) = std::env::var("MCPCLI_TEST_JOB_PROBE") {
+        std::io::stdin().read_exact(&mut [0u8; 1]).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", "no_such_test"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let result = spawn_daemon(&mut command);
+        if mode == "allow" {
+            assert!(result.unwrap().wait().unwrap().success());
+        } else {
+            assert!(result.unwrap_err().to_string().contains("Job"));
+        }
+        return;
+    }
+    for allow in [false, true] {
+        let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(!raw.is_null());
+        let job = unsafe { OwnedHandle::from_raw_handle(raw) };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | if allow {
+                JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            } else {
+                0
+            };
+        assert_ne!(
+            unsafe {
+                SetInformationJobObject(
+                    job.as_raw_handle(),
+                    JobObjectExtendedLimitInformation,
+                    (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                    std::mem::size_of_val(&limits) as u32,
+                )
+            },
+            0
+        );
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::tests::daemon_spawn_respects_job_breakaway_policy",
+                "--nocapture",
+            ])
+            .env(
+                "MCPCLI_TEST_JOB_PROBE",
+                if allow { "allow" } else { "deny" },
+            )
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert_ne!(
+            unsafe { AssignProcessToJobObject(job.as_raw_handle(), child.as_raw_handle()) },
+            0
+        );
+        child.stdin.take().unwrap().write_all(b"x").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("job breakaway probe did not finish");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
