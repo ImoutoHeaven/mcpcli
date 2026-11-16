@@ -1,5 +1,17 @@
 # 0.1.0 提交与全仓审查
 
+## 当前验收状态
+
+C5 `196e0baeec7ceaa3dac75e1690579064b0917fde`（tree `386421b8e8cc83d9a1476f2792466ed912453c40`）已纳入 R9、R12、R13 的最终修复及测试。以下各检查点记录属于历史证据，其中“工作区未提交”“执行阻断”不代表当前状态。
+
+主代理和独立只读 reviewer 均已复核完整受跟踪树，并各自通过隔离 Alpine 的 fmt、Clippy、45 单元、19 协议、26 CLI（0 skip）、3 归档及 6 Windows 依赖检查自测。原生 CI [43856257333](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43856257333) 与七包预演 [43856257349](https://github.com/ImoutoHeaven/mcpcli/actions/runs/43856257349) 均成功。依赖交叉核对确认 R14，双方维持 **NO-SHIP**，等待修复及新冻结提交全部门禁。
+
+### R14：DELETE 重定向被误记为成功清理
+
+级别 Medium；来源为既有 HTTP 清理适配。`BoundedHttp::delete_session` 委托 rmcp 3.9.0 的 reqwest 实现，后者调用 `Response::error_for_status`；reqwest 0.13.5 仅将 4xx/5xx 转为错误。因此关闭重定向跟随时，DELETE 307 仍返回成功，reset/stop 可错误确认清理。修复要求：自行检查 DELETE 响应，仅接受 2xx 和协议允许的 404/405，保留两秒期限、错误脱敏和清理记录；回归验证 307 报告清理失败、保留已知调用结果且不跟随重定向。修复已集成为 `c74b61ec7576027b856783e286192c21f28ed902`；实现代理在修复前确认两条回归失败，修复后 fmt/Clippy、45 单元、19 协议、26 CLI（0 skip）、3 归档及 6 Windows 依赖自测通过。主代理已复核补丁及调用方；最终结论取决于包含状态记录的 C6 全树复核和全平台 CI。
+
+当前版本和后续验收步骤见 [progress-update.md](progress-update.md)。
+
 ## 基线
 
 - Commit：`285b0f19c85ef6deba34991baa131be6365a76e4`
