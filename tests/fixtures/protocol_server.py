@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import queue
+import socketserver
 import subprocess
 import sys
 import threading
@@ -229,7 +230,14 @@ if args.http:
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class LoopbackServer(ThreadingHTTPServer):
+        def server_bind(self):
+            # HTTPServer's reverse DNS lookup can stall macOS CI before the readiness line.
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
+    server = LoopbackServer(("127.0.0.1", 0), Handler)
     print(server.server_port, flush=True)
     server.serve_forever()
 else:
