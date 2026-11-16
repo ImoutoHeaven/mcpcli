@@ -12,6 +12,10 @@ const ACL_FIRST_ENTRY: libc::c_int = 0;
 const ACL_FLAG_NO_INHERIT: libc::c_int = 1 << 17;
 
 unsafe extern "C" {
+    fn acl_get_tag_type(entry: *mut c_void, tag: *mut libc::c_int) -> libc::c_int;
+    fn acl_get_permset_mask_np(entry: *mut c_void, mask: *mut u64) -> libc::c_int;
+    fn acl_get_qualifier(entry: *mut c_void) -> *mut c_void;
+    fn mbr_uid_to_uuid(uid: libc::uid_t, uuid: *mut u8) -> libc::c_int;
     fn acl_init(count: libc::c_int) -> *mut c_void;
     fn acl_free(object: *mut c_void) -> libc::c_int;
     fn acl_get_flagset_np(object: *mut c_void, flags: *mut *mut c_void) -> libc::c_int;
@@ -89,7 +93,7 @@ pub(super) fn create_leaf(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
+fn read_acl(file: &File, dir: &Path) -> io::Result<Option<Acl>> {
     let fd = file.as_raw_fd();
     let refuse = |reason: &str| {
         io::Error::new(
@@ -112,7 +116,7 @@ pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
         libc::fpathconf(fd, libc::_PC_EXTENDED_SECURITY_NP)
     };
     if extended == 0 {
-        return Ok(());
+        return Ok(None);
     }
     if extended < 0 {
         return Err(refuse("extended ACL support could not be determined"));
@@ -123,12 +127,19 @@ pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
         let error = io::Error::last_os_error();
         // Darwin's fstatx/filesec reports ENOENT for an absent ACL on a live descriptor.
         return if error.raw_os_error() == Some(libc::ENOENT) {
-            Ok(())
+            Ok(None)
         } else {
             Err(error)
         };
     }
-    let acl = Acl(acl);
+    Ok(Some(Acl(acl)))
+}
+
+pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
+    let Some(acl) = read_acl(file, dir)? else {
+        return Ok(());
+    };
+    let refuse = |reason: &str| io::Error::new(io::ErrorKind::PermissionDenied, reason);
     let mut entry = std::ptr::null_mut();
     // SAFETY: acl is a live returned allocation and entry is a writable output pointer.
     let found = unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &mut entry) };
@@ -143,5 +154,75 @@ pub(super) fn check_acl(file: &File, dir: &Path) -> io::Result<()> {
         Ok(())
     } else {
         Err(error)
+    }
+}
+
+/// Darwin ACL grants are independent of mode bits; deny/read-only entries are harmless here.
+pub(super) fn check_ancestor(file: &File, path: &Path) -> io::Result<()> {
+    let Some(acl) = read_acl(file, path)? else {
+        return Ok(());
+    };
+    let mut position = ACL_FIRST_ENTRY;
+    loop {
+        let mut entry = std::ptr::null_mut();
+        let found = unsafe { acl_get_entry(acl.0, position, &mut entry) };
+        if found != 0 {
+            let error = io::Error::last_os_error();
+            return if found == -1 && error.raw_os_error() == Some(libc::EINVAL) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        // Darwin's ACL_NEXT_ENTRY is -1, unlike FreeBSD's value 1.
+        position = -1;
+        let mut tag = 0;
+        let mut permissions = 0u64;
+        if unsafe { acl_get_tag_type(entry, &mut tag) } != 0
+            || unsafe { acl_get_permset_mask_np(entry, &mut permissions) } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if tag == 2 {
+            continue;
+        } // ACL_EXTENDED_DENY
+        if tag != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime ancestor has an unsupported ACL entry",
+            ));
+        }
+        const MUTATING: u64 = (1 << 2)
+            | (1 << 4)
+            | (1 << 5)
+            | (1 << 6)
+            | (1 << 8)
+            | (1 << 10)
+            | (1 << 12)
+            | (1 << 13);
+        if permissions & MUTATING == 0 {
+            continue;
+        }
+        let qualifier = unsafe { acl_get_qualifier(entry) };
+        if qualifier.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let qualifier = Acl(qualifier);
+        let uuid: [u8; 16] = unsafe { *qualifier.0.cast::<[u8; 16]>() };
+        let mut trusted = false;
+        for uid in [0, unsafe { libc::geteuid() }] {
+            let mut expected = [0u8; 16];
+            let result = unsafe { mbr_uid_to_uuid(uid, expected.as_mut_ptr()) };
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result));
+            }
+            trusted |= uuid == expected;
+        }
+        if !trusted {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "runtime ancestor ACL grants mutation to another user",
+            ));
+        }
     }
 }

@@ -111,3 +111,114 @@ fn skill_resources_refuse_alternate_data_streams() {
     std::fs::write(root.join("file:secret"), "hidden").unwrap();
     assert!(open_beneath(&root, Path::new("file:secret"), false).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn canonical_skill_root_detects_replacement_during_resolution() {
+    let base = tempfile::tempdir().unwrap();
+    let original = base.path().join("original");
+    let outside = base.path().join("outside");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&outside).unwrap();
+    let error = canonical_skill_root_with(&original, |path| {
+        std::fs::rename(path, base.path().join("old")).unwrap();
+        std::os::unix::fs::symlink(&outside, path).unwrap();
+        path.canonicalize()
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+#[cfg(windows)]
+#[test]
+fn canonical_skill_root_pins_the_leaf_against_replacement() {
+    let base = tempfile::tempdir().unwrap();
+    let original = base.path().join("original");
+    std::fs::create_dir(&original).unwrap();
+    canonical_skill_root_with(&original, |path| {
+        assert!(std::fs::rename(path, base.path().join("old")).is_err());
+        path.canonicalize()
+    })
+    .unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_ancestor_acl_mutation_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir_in("/tmp").unwrap();
+    let parent = base.path().canonicalize().unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let chmod = |rule: &str| {
+        let output = std::process::Command::new("/bin/chmod")
+            .args(["+a", rule])
+            .arg(&parent)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    chmod("user:nobody allow readattr,readsecurity");
+    private_dir(&parent.join("read-only-parent")).unwrap();
+    chmod("group:everyone deny delete");
+    private_dir(&parent.join("deny-parent")).unwrap();
+    chmod("user:nobody allow delete_child");
+    let mode = std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777;
+    let rejected = private_dir(&parent.join("must-not-exist"));
+    let cleared = std::process::Command::new("/bin/chmod")
+        .arg("-N")
+        .arg(&parent)
+        .status()
+        .unwrap();
+    assert!(cleared.success());
+    assert_eq!(mode, 0o755);
+    let error = rejected.unwrap_err();
+    assert!(format!("{error:#}").contains("ancestor ACL"), "{error:#}");
+    assert!(!parent.join("must-not-exist").exists());
+}
+
+#[cfg(target_os = "freebsd")]
+#[test]
+fn freebsd_ancestor_acl_mutation_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = tempfile::tempdir().unwrap();
+    let parent = base.path().canonicalize().unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let acl = |rule: &str| {
+        std::process::Command::new("setfacl")
+            .args(["-m", rule])
+            .arg(&parent)
+            .output()
+            .unwrap()
+    };
+    let read = acl("u:65534:raRc::allow");
+    if !read.status.success() {
+        assert_ne!(
+            std::env::var("MCPCLI_REQUIRE_NFS4_ACL").as_deref(),
+            Ok("1"),
+            "required NFSv4 ACL fixture is unavailable: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+        eprintln!(
+            "NFSv4 ancestor ACL regression runs in the required disposable-filesystem CI lane"
+        );
+        return;
+    }
+    private_dir(&parent.join("read-only-parent")).unwrap();
+    let added = acl("u:65534:D::allow");
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let error = private_dir(&parent.join("must-not-exist")).unwrap_err();
+    assert!(format!("{error:#}").contains("ancestor ACL"), "{error:#}");
+    assert!(!parent.join("must-not-exist").exists());
+}

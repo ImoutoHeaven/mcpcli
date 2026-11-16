@@ -25,7 +25,8 @@ pub fn uid() -> u32 {
 
 fn check_ancestors(path: &Path) -> Result<()> {
     for ancestor in path.ancestors().skip(1) {
-        let meta = std::fs::symlink_metadata(ancestor)?;
+        let file = open_skill_root(ancestor)?;
+        let meta = file.metadata()?;
         if !meta.is_dir() || meta.file_type().is_symlink() {
             bail!("runtime ancestor is not a real directory");
         }
@@ -34,6 +35,10 @@ fn check_ancestors(path: &Path) -> Result<()> {
         {
             bail!("runtime ancestor has unsafe ownership or permissions");
         }
+        #[cfg(target_os = "macos")]
+        macos_acl::check_ancestor(&file, ancestor)?;
+        #[cfg(target_os = "freebsd")]
+        freebsd_acl::check_ancestor(&file)?;
     }
     Ok(())
 }
@@ -316,4 +321,17 @@ pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::Dir
 
 pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
+}
+
+pub(super) fn open_skill_root(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(TRAVERSE | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(path)
+}
+
+pub(super) fn same_file(first: &File, second: &File) -> io::Result<bool> {
+    let first = first.metadata()?;
+    let second = second.metadata()?;
+    Ok(first.dev() == second.dev() && first.ino() == second.ino())
 }

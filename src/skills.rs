@@ -37,13 +37,8 @@ pub fn discover(roots: &[PathBuf]) -> Result<SkillCatalog> {
     let mut seen_roots = BTreeSet::new();
     let mut scanned_entries = 0;
     for configured in roots {
-        let metadata = fs::symlink_metadata(configured)
-            .with_context(|| format!("read configured skill directory {configured:?}"))?;
-        ensure!(
-            metadata.is_dir() && !crate::platform::is_link(&metadata),
-            "configured skill root must be a directory, not a symlink: {configured:?}"
-        );
-        let root = fs::canonicalize(configured)?;
+        let root = crate::platform::canonical_skill_root(configured)
+            .with_context(|| format!("open configured skill directory {configured:?}"))?;
         if !seen_roots.insert(root.clone()) {
             catalog
                 .warnings

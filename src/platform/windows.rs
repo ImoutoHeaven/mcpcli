@@ -432,3 +432,22 @@ pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::Dir
     }
     Ok(entries)
 }
+
+pub(super) fn open_skill_root(path: &Path) -> io::Result<File> {
+    open_directory(path, false)
+}
+
+pub(super) fn same_file(first: &File, second: &File) -> io::Result<bool> {
+    let info = |file: &File| -> io::Result<BY_HANDLE_FILE_INFORMATION> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(info)
+    };
+    let a = info(first)?;
+    let b = info(second)?;
+    Ok(a.dwVolumeSerialNumber == b.dwVolumeSerialNumber
+        && a.nFileIndexHigh == b.nFileIndexHigh
+        && a.nFileIndexLow == b.nFileIndexLow)
+}

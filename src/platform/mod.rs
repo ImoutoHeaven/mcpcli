@@ -105,16 +105,23 @@ pub struct DirectoryEntry {
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn is_link(metadata: &std::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        metadata.file_type().is_symlink()
+pub(crate) fn canonical_skill_root(path: &Path) -> io::Result<PathBuf> {
+    canonical_skill_root_with(path, |path| path.canonicalize())
+}
+
+fn canonical_skill_root_with(
+    path: &Path,
+    canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    // Pin the configured leaf before canonicalization can follow a replacement link.
+    let original = open_skill_root(path)?;
+    let resolved = canonicalize(path)?;
+    let verified = open_skill_root(&resolved)?;
+    if !same_file(&original, &verified)? {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "skill root changed during canonicalization",
+        ));
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        metadata.file_attributes()
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-    }
+    Ok(resolved)
 }
