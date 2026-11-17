@@ -371,7 +371,9 @@ def global_agents(f):
         assert unmatched["agents"] is None and unmatched["servers"] == [] and unmatched["skills"] == []
         assert f.invoke("--text", "search", absent).stdout == ""
 
-    for help_args in (["-h"], ["--help", "--timeout", "not-a-number", "--text", "--text"]):
+    for help_args in (["-h"], ["--help", "--timeout", "not-a-number", "--text", "--text"],
+                      ["--help", "catalog"], ["--help", "--version"], ["-hV"],
+                      ["--help", "--unknown"]):
         help_with_agents = subprocess.run([str(f.binary), *help_args], env=scoped_env, cwd=project_dir,
                                           text=True, encoding="utf-8", capture_output=True, timeout=3)
         assert help_with_agents.returncode == 0
@@ -380,9 +382,10 @@ def global_agents(f):
         assert "Spoof\\rGuard\\r" in help_with_agents.stdout
         assert "PROJECT_SCOPED_SENTINEL" not in help_with_agents.stdout
 
-    sub_help = subprocess.run([str(f.binary), "--config", str(f.config), "call", "--help"],
-                              env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=3)
-    assert sub_help.returncode == 0 and "Global AGENTS.md (" not in sub_help.stdout
+    for other_args in (["call", "--help"], ["catalog", "--help"], ["--version", "--help"], ["-Vh"]):
+        other_output = subprocess.run([str(f.binary), "--config", str(f.config), *other_args],
+                                      env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=3)
+        assert other_output.returncode == 0 and "Global AGENTS.md (" not in other_output.stdout
 
     nested_cfg_dir = f.root / "nested-config"
     nested_cfg_dir.mkdir()
@@ -826,6 +829,11 @@ def text_mode_crlf_and_empty_outputs(f):
         b"---\r\nname: crlf-doc\r\ndescription: CRLF skill\r\n---\r\nLine 1\r\nSpoof\rCheck\r\n"
     )
     assert f.invoke("--text", "skills", "files", "crlf-doc").stdout == ""
+    if not WINDOWS:
+        for name in ("first\r", "second"):
+            (crlf_skill / name).write_text("resource", encoding="utf-8")
+        assert f.value("skills", "files", "crlf-doc")["files"] == ["first\r", "second"]
+        assert f.invoke("--text", "skills", "files", "crlf-doc").stdout == "first\\r\nsecond\n"
     shown = f.invoke("--text", "skills", "show", "crlf-doc").stdout
     assert "\\r\n" not in shown and "\r" not in shown
     assert "Line 1\nSpoof\\rCheck\n" in shown

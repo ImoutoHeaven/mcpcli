@@ -56,6 +56,7 @@ struct Cli {
 #[allow(dead_code)]
 #[derive(Parser)]
 #[command(
+    ignore_errors = true,
     disable_help_flag = true,
     disable_version_flag = true,
     disable_help_subcommand = true
@@ -446,7 +447,9 @@ fn tool_text(result: &Value) -> String {
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for block in content {
             if block["type"] == "text" {
-                if let Some(text) = block["text"].as_str() {
+                if let Some(text) = block["text"].as_str()
+                    && !text.is_empty()
+                {
                     texts.push(safe_text(text));
                 }
             } else {
@@ -697,7 +700,11 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 SkillCommand::Files { .. } => {
                     let files =
                         skills::files(skill).map_err(|e| usage("skill_files", format!("{e:#}")))?;
-                    let text = files.join("\n");
+                    let text = files
+                        .iter()
+                        .map(|path| safe_text(path))
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     Ok(Output::with_text(
                         json!({"name":name,"root":skill.root,"files":files}),
                         text,
@@ -850,6 +857,25 @@ fn main() -> std::process::ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn empty_tool_text_blocks_preserve_structured_output_without_blank_lines() {
+        for count in [1, 2] {
+            let mut result = json!({
+                "content": vec![json!({"type": "text", "text": ""}); count]
+            });
+            assert_eq!(tool_text(&result), "");
+            result["structuredContent"] = json!({"answer": 42});
+            assert_eq!(
+                tool_text(&result),
+                serde_json::to_string_pretty(&result["structuredContent"]).unwrap()
+            );
+        }
+        assert_eq!(
+            tool_text(&json!({"content": [{"type": "text", "text": " \n"}]})),
+            " \n"
+        );
+    }
 
     #[test]
     fn cli_and_help_probe_definitions_are_consistent() {
