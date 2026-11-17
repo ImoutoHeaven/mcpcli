@@ -54,6 +54,8 @@ fn version_one() -> u32 {
 pub struct Config {
     #[serde(default = "version_one")]
     pub version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<PathBuf>,
     #[serde(default, alias = "mcpServers")]
     pub servers: BTreeMap<String, ServerConfig>,
     #[serde(default, alias = "skillDirs")]
@@ -132,7 +134,7 @@ fn diagnose_config_shape(value: &serde_json::Value) -> String {
     for key in root.keys() {
         if !matches!(
             key.as_str(),
-            "version" | "servers" | "mcpServers" | "skills" | "skillDirs"
+            "version" | "agents" | "servers" | "mcpServers" | "skills" | "skillDirs"
         ) {
             return format!(
                 "invalid configuration shape: unknown top-level field {}",
@@ -149,6 +151,15 @@ fn diagnose_config_shape(value: &serde_json::Value) -> String {
         return format!(
             "invalid configuration shape at version: expected unsigned integer, got {}",
             json_kind(version)
+        );
+    }
+    if let Some(agents) = root.get("agents")
+        && !agents.is_string()
+        && !agents.is_null()
+    {
+        return format!(
+            "invalid configuration shape at agents: expected string, got {}",
+            json_kind(agents)
         );
     }
     for skills_field in ["skills", "skillDirs"] {
@@ -330,7 +341,8 @@ fn diagnose_config_shape(value: &serde_json::Value) -> String {
             }
         }
     }
-    "invalid configuration shape; check version, servers, skills and transport fields".into()
+    "invalid configuration shape; check version, agents, servers, skills and transport fields"
+        .into()
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -393,7 +405,14 @@ fn from_config_directory(parent: &Path, path: &Path) -> Result<PathBuf> {
     Ok(if path.is_absolute() {
         path.to_owned()
     } else {
-        parent.join(path)
+        let mut resolved = parent.to_owned();
+        for component in path.components() {
+            match component {
+                std::path::Component::CurDir => {}
+                other => resolved.push(other.as_os_str()),
+            }
+        }
+        resolved
     })
 }
 
@@ -529,6 +548,10 @@ impl LoadedConfig {
                 }
             }
         }
+        if let Some(agents) = &mut config.agents {
+            crate::agents::validate_path(agents)?;
+            *agents = from_config_directory(parent, agents)?;
+        }
         for root in &mut config.skills {
             if root.as_os_str().is_empty() {
                 bail!("skill root path must not be empty");
@@ -572,6 +595,25 @@ mod tests {
         assert!(LoadedConfig::load(&path).is_err());
         std::fs::write(&path, r#"{"servers":{},"servers":{}}"#).unwrap();
         assert!(LoadedConfig::load(&path).is_err());
+
+        let base = LoadedConfig::load({
+            std::fs::write(&path, r#"{"agents":null}"#).unwrap();
+            &path
+        })
+        .unwrap();
+        assert!(base.config.agents.is_none());
+        std::fs::write(&path, r#"{"agents":"./docs/AGENTS.md"}"#).unwrap();
+        let with_agents = LoadedConfig::load(&path).unwrap();
+        assert_eq!(
+            with_agents.config.agents.as_deref(),
+            Some(canonical.join("docs").join("AGENTS.md").as_path())
+        );
+        assert_ne!(base.digest, with_agents.digest);
+        for invalid in ["", ".", "..", "AGENTS.md/", "docs/."] {
+            let body = serde_json::json!({"agents": invalid});
+            std::fs::write(&path, serde_json::to_vec(&body).unwrap()).unwrap();
+            assert!(LoadedConfig::load(&path).is_err(), "{invalid:?}");
+        }
     }
     #[test]
     fn invalid_config_shape_does_not_echo_credentials() {
@@ -596,6 +638,12 @@ mod tests {
         std::fs::write(&path, r#"{"servers":{},"mcpServers":{}}"#).unwrap();
         let error = LoadedConfig::load(&path).err().unwrap();
         assert!(format!("{error:#}").contains("mcpServers"));
+
+        std::fs::write(&path, r#"{"agents":["AGENT_SECRET"]}"#).unwrap();
+        let error = LoadedConfig::load(&path).err().unwrap();
+        let text = format!("{error:#}");
+        assert!(!text.contains("AGENT_SECRET"));
+        assert!(text.contains("at agents:"));
     }
     #[test]
     fn missing_config_can_be_located_for_stop() {
@@ -630,6 +678,11 @@ mod tests {
         for command in ["C:server.exe", r"\server.exe"] {
             let config =
                 serde_json::json!({"servers":{"x":{"transport":"stdio","command":command}}});
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            assert!(LoadedConfig::load(&path).is_err());
+        }
+        for agents in ["C:AGENTS.md", r"\AGENTS.md"] {
+            let config = serde_json::json!({"agents": agents});
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
             assert!(LoadedConfig::load(&path).is_err());
         }

@@ -14,8 +14,8 @@ import tempfile
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tests"))
-from cli_e2e import (Fixture, offline_skills, state_and_discovery, json_inputs_and_outputs,
-                     session_and_restart, http_optional_session_delete)
+from cli_e2e import (Fixture, offline_skills, global_agents, state_and_discovery,
+                     json_inputs_and_outputs, session_and_restart, http_optional_session_delete)
 from platform_support import test_temp_base
 from windows_pe import MACHINES, check_windows_image
 
@@ -75,8 +75,9 @@ def main():
         version = subprocess.check_output([str(binary), "--version"], text=True,
                                           encoding="utf-8", timeout=5).strip()
         assert version == f"mcpcli {options.version}", version
-        for case in [offline_skills, state_and_discovery, json_inputs_and_outputs,
-                     session_and_restart, http_optional_session_delete]:
+        cases = [offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs,
+                 session_and_restart, http_optional_session_delete]
+        for case in cases:
             fixture = Fixture(binary, root, case.__name__)
             try:
                 print("START " + case.__name__, flush=True)
@@ -85,7 +86,7 @@ def main():
                 errors = fixture.cleanup()
                 assert not errors, errors
             print("PASS " + case.__name__, flush=True)
-        print(json.dumps({"archive": str(options.archive), "version": version, "passed": 5}))
+        print(json.dumps({"archive": str(options.archive), "version": version, "passed": len(cases)}))
 
 
 if __name__ == "__main__":

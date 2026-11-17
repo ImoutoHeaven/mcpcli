@@ -1,6 +1,6 @@
 # mcpcli
 
-A Rust CLI for MCP tools and local [Agent Skills](https://agentskills.io).
+A Rust CLI for MCP tools, global `AGENTS.md` instructions, and local [Agent Skills](https://agentskills.io).
 A local daemon keeps stdio and Streamable HTTP connections alive between commands.
 
 ## Install
@@ -27,6 +27,7 @@ Create `mcpcli.json`, or select a file with `--config PATH` or `MCPCLI_CONFIG`:
 ~~~json
 {
   "version": 1,
+  "agents": "./AGENTS.md",
   "servers": {
     "filesystem": {
       "transport": "stdio",
@@ -51,6 +52,12 @@ Paths resolve from the config directory. On Windows, use `npx.cmd`; explicit
 executable paths accept either separator, but drive-relative paths such as
 `C:server.exe` are rejected. Configured commands run with your user permissions.
 
+Optional `agents` references one global `AGENTS.md` file (set `null` or omit the
+field when unused). `mcpcli` exposes the complete file contents in `catalog`,
+`agents`, matching `search` results, and top-level `--help`. `mcpcli` never
+searches working directories or ancestor repositories for project-scoped
+`AGENTS.md` files; repository instructions remain owned by each repository.
+
 Each `skills` entry mounts a directory containing `SKILL.md`, or a parent whose
 immediate subdirectories contain skills. For example, `"skills": ["./skills"]`
 loads `./skills/example-skill/SKILL.md`.
@@ -59,6 +66,7 @@ loads `./skills/example-skill/SKILL.md`.
 
 ~~~sh
 mcpcli catalog
+mcpcli agents
 mcpcli search file
 mcpcli tools filesystem
 mcpcli inspect filesystem read_file

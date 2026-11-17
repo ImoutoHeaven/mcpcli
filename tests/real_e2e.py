@@ -244,6 +244,8 @@ class Acceptance:
         return result
 
     def configure(self):
+        (self.root / "AGENTS.md").write_text(
+            "# Global Agent Guidance\nInspect schemas and skill references before mutating state.\n")
         (self.root / "skills/check-browser/SKILL.md").write_text(
             "---\nname: check-browser\ndescription: Verify a local browser counter.\n---\n"
             "# Browser check\nRead references/check.md, then inspect browser_snapshot.\n")
@@ -279,6 +281,7 @@ class Acceptance:
                 time.sleep(0.1)
         config = {
             "version": 1,
+            "agents": str(self.root / "AGENTS.md"),
             "servers": {
                 "fastexec": {
                     "transport": "stdio", "command": str(Path(self.args.fastexec).resolve()),
@@ -310,6 +313,11 @@ class Acceptance:
 
     def check_discovery_and_skills(self):
         catalog = self.command("catalog")
+        require("# Global Agent Guidance" in (catalog.get("agents") or {}).get("content", ""),
+                "catalog omits full global AGENTS.md content")
+        agents_doc = self.command("agents")
+        require(agents_doc["agents"] == catalog["agents"],
+                "agents command disagrees with catalog global AGENTS.md")
         require({entry["name"] for entry in catalog["servers"]} ==
                 {"fastexec", "browser", "browser-http"}, "catalog omits configured servers")
         require([entry["name"] for entry in catalog["skills"]] == ["check-browser"],

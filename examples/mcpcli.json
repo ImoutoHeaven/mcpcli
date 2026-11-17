@@ -1,5 +1,6 @@
 {
   "version": 1,
+  "agents": null,
   "servers": {
     "filesystem": {
       "transport": "stdio",

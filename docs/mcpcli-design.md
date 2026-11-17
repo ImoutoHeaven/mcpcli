@@ -2,10 +2,11 @@
 
 ## 1. Product contract
 
-mcpcli is a native command-line client for configured MCP tools and local Agent
-Skills. Each CLI process discovers tools, inspects metadata, invokes a tool, or
-reads a skill resource. A local daemon keeps connections and application state
-alive between commands.
+mcpcli is a native command-line client for configured MCP tools, a global
+AGENTS.md document, and local Agent Skills. Each CLI process reads global
+instructions, discovers tools, inspects metadata, invokes a tool, or reads a
+skill resource. A local daemon keeps connections and application state alive
+between commands.
 
 Version 0.1.0 supports stdio and Streamable HTTP, including the modern
 2026-07-28 protocol and legacy lifecycle negotiation through rmcp 3.9.0. The
@@ -46,8 +47,9 @@ that two independently configured servers intentionally share.
 
 | Command | Work performed | Starts an MCP connection |
 | --- | --- | --- |
-| catalog | Configured server descriptions and skill metadata | No |
-| search QUERY | Offline substring search of those names/descriptions | No |
+| catalog | Full global AGENTS.md (when configured), server descriptions, and skill metadata | No |
+| agents | Full configured global AGENTS.md document | No |
+| search QUERY | Offline substring search across global AGENTS.md, server descriptions, and skill metadata | No |
 | tools SERVER | Fresh names and bounded description summaries | Yes, if needed |
 | inspect SERVER TOOL | Full tool metadata and input/output schemas | Yes, if needed |
 | call SERVER TOOL | One tool invocation | Yes, if needed |
@@ -82,10 +84,13 @@ Configuration is JSON. The default path is ./mcpcli.json; --config and
 MCPCLI_CONFIG select another file. The CLI reads only that file, without searching
 ancestor projects or importing another application's configuration.
 
-The version field defaults to 1. servers is a map of aliases to tagged transport
+The version field defaults to 1. Optional agents references one global AGENTS.md
+file (or null when unset). servers is a map of aliases to tagged transport
 definitions. skills is a list of explicit directory paths. mcpServers and
-skillDirs are accepted aliases for those two top-level fields; other unknown
-configuration fields are rejected.
+skillDirs are accepted aliases for servers and skills; other unknown
+configuration fields are rejected. Global AGENTS.md scope belongs strictly to
+the selected mcpcli configuration; mcpcli never walks working directories or
+ancestor repositories for project-scoped AGENTS.md files.
 
 | Transport | Fields |
 | --- | --- |
@@ -302,10 +307,19 @@ from encouraging an unsafe replay.
 
 Operational failures use a JSON error object on stderr with code, kind,
 message, and outcome_unknown when applicable. Clap's argument/help diagnostics
-use its conventional text format. Skill validation warnings and explicit text
+use its conventional text format; top-level `--help` also appends the full
+configured global AGENTS.md when the selected configuration and file are valid. Skill validation warnings and explicit text
 mode notices also go to stderr. Exit status alone is not a retry policy.
 
-## 8. Agent Skills
+## 8. Global AGENTS.md and Agent Skills
+
+When `agents` is set, `catalog`, `agents`, matching `search` results, and
+top-level `--help` return the complete UTF-8 contents of that single global
+file rather than a truncated summary. Unlike skills, global instructions apply
+across every `mcpcli` invocation and carry no YAML frontmatter requirement.
+The configured parent directory is pinned and canonicalized, and the leaf file
+is opened without following symlinks, reparse points, special files, or Windows
+alternate data streams. Ordinary edits to the file are visible on the next read.
 
 A skill root is a local directory containing SKILL.md, or a directory whose
 immediate children contain skills. References and other Markdown files remain
@@ -349,6 +363,7 @@ file changes remain visible on the next read.
 | HTTP POST response | 16 MiB total, including streamed SSE bytes |
 | Background HTTP SSE | 16 MiB per event |
 | Tool catalog | 256 pages, 10,000 tools, 16 MiB |
+| Global AGENTS.md | 1 MiB |
 | Skill manifest/resource | 1 MiB |
 | YAML frontmatter | 64 KiB, with node/depth/alias budgets |
 | Skills / scanned entries | 1,024 / 4,096 |

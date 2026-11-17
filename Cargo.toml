@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
-description = "A persistent MCP client and local Agent Skills CLI"
+description = "A persistent MCP client with global AGENTS.md and local Agent Skills"
 readme = "README.md"
 
 [dependencies]

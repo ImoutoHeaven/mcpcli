@@ -134,8 +134,20 @@ pub(crate) fn canonical_skill_root(path: &Path) -> io::Result<PathBuf> {
     canonical_skill_root_with(path, |path| path.canonicalize())
 }
 
+pub(crate) fn canonical_directory(path: &Path) -> io::Result<PathBuf> {
+    canonical_directory_with(path, "configured directory", |path| path.canonicalize())
+}
+
 fn canonical_skill_root_with(
     path: &Path,
+    canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
+) -> io::Result<PathBuf> {
+    canonical_directory_with(path, "skill root", canonicalize)
+}
+
+fn canonical_directory_with(
+    path: &Path,
+    label: &str,
     canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
 ) -> io::Result<PathBuf> {
     // Trailing separators or '/.' must not turn a symlink leaf into an ancestor.
@@ -147,7 +159,7 @@ fn canonical_skill_root_with(
     if !same_file(&original, &verified)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "skill root changed during canonicalization",
+            format!("{label} changed during canonicalization"),
         ));
     }
     Ok(resolved)

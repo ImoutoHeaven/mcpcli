@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpcli::{
+    agents,
     config::{self, LoadedConfig},
     daemon,
     discovery::{self, safe_text},
@@ -21,7 +22,7 @@ use tokio::time::{Instant, timeout};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Call MCP tools and read local Agent Skills",
+    about = "Call MCP tools and read global AGENTS.md and local Agent Skills",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -52,11 +53,34 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+#[allow(dead_code)]
+#[derive(Parser)]
+#[command(
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true
+)]
+struct TopLevelHelpProbe {
+    #[arg(short, long, env = "MCPCLI_CONFIG", default_value = "mcpcli.json")]
+    config: PathBuf,
+    #[arg(long, env = "MCPCLI_SESSION", default_value = "default")]
+    session: String,
+    #[arg(long, default_value_t = 60)]
+    timeout: u64,
+    #[arg(long)]
+    oneshot: bool,
+    #[arg(long)]
+    text: bool,
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Count)]
+    help: u8,
+}
 #[derive(Subcommand)]
 enum Command {
-    /// List configured servers and skill metadata without starting servers.
+    /// Read global AGENTS.md, configured server descriptions, and skill metadata without starting servers.
     Catalog,
-    /// Search configured server and skill names/descriptions, offline.
+    /// Read the configured global AGENTS.md document without starting servers.
+    Agents,
+    /// Search global AGENTS.md and configured server and skill metadata, offline.
     Search { query: String },
     /// List current tool names and descriptions for a server.
     Tools { server: String },
@@ -193,6 +217,8 @@ fn load(cli: &Cli) -> Result<LoadedConfig> {
     LoadedConfig::load(&cli.config).map_err(|error| usage("configuration", format!("{error:#}")))
 }
 fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
+    let agents_doc = agents::load(loaded.config.agents.as_deref())
+        .map_err(|error| usage("agents", format!("{error:#}")))?;
     let skill_catalog = skills::discover(&loaded.config.skills)
         .map_err(|error| usage("skills", format!("{error:#}")))?;
     for warning in &skill_catalog.warnings {
@@ -204,8 +230,26 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
             .as_ref()
             .is_none_or(|q| format!("{name} {description}").to_lowercase().contains(q))
     };
-    let servers:Vec<_>=loaded.config.servers.iter().filter(|(name,server)|matches(name,server.description().unwrap_or("")))
-        .map(|(name,server)|json!({"name":name,"transport":server.transport(),"description":server.description().unwrap_or("")})).collect();
+    let selected_agents = agents_doc.filter(|doc| {
+        query.as_ref().is_none_or(|q| {
+            format!("agents {} {}", doc.path.display(), doc.content)
+                .to_lowercase()
+                .contains(q)
+        })
+    });
+    let servers: Vec<_> = loaded
+        .config
+        .servers
+        .iter()
+        .filter(|(name, server)| matches(name, server.description().unwrap_or("")))
+        .map(|(name, server)| {
+            json!({
+                "name": name,
+                "transport": server.transport(),
+                "description": server.description().unwrap_or("")
+            })
+        })
+        .collect();
     let selected_skills: Vec<_> = skill_catalog
         .skills
         .into_iter()
@@ -226,9 +270,26 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
             brief(&skill.description)
         ));
     }
+    let mut sections = Vec::new();
+    if let Some(doc) = &selected_agents {
+        let body = doc.content.trim_end_matches(['\r', '\n']);
+        if body.is_empty() {
+            sections.push(format!("agents {}", doc.path.display()));
+        } else {
+            sections.push(format!("agents {}\n\n{body}", doc.path.display()));
+        }
+    }
+    if !lines.is_empty() {
+        sections.push(lines.join("\n"));
+    }
     Ok(Output::with_text(
-        json!({"servers":servers,"skills":selected_skills,"warnings":skill_catalog.warnings}),
-        lines.join("\n"),
+        json!({
+            "agents": selected_agents,
+            "servers": servers,
+            "skills": selected_skills,
+            "warnings": skill_catalog.warnings,
+        }),
+        sections.join("\n\n"),
     ))
 }
 
@@ -471,6 +532,15 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     let loaded = load(cli)?;
     match &cli.command {
         Command::Catalog => catalog(&loaded, None),
+        Command::Agents => {
+            let doc = agents::load(loaded.config.agents.as_deref())
+                .map_err(|error| usage("agents", format!("{error:#}")))?;
+            let text = doc
+                .as_ref()
+                .map(|doc| doc.content.clone())
+                .unwrap_or_default();
+            Ok(Output::with_text(json!({ "agents": doc }), text))
+        }
         Command::Search { query } => {
             if query.is_empty() || query.len() > 1024 {
                 return Err(usage("query", "query must contain 1-1024 bytes"));
@@ -719,7 +789,35 @@ fn main() -> std::process::ExitCode {
         eprintln!("mcpcli: cannot initialize standard handles: {error}");
         return std::process::ExitCode::FAILURE;
     }
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let is_help = error.kind() == clap::error::ErrorKind::DisplayHelp;
+            if error.print().is_err() {
+                return std::process::ExitCode::FAILURE;
+            }
+            if is_help
+                && let Ok(probe) = TopLevelHelpProbe::try_parse()
+                && probe.help > 0
+                && let Ok(loaded) = LoadedConfig::load(&probe.config)
+                && let Ok(Some(doc)) = agents::load(loaded.config.agents.as_deref())
+            {
+                let rendered = safe_text(&doc.content);
+                let body = rendered.trim_end_matches('\n');
+                let mut stdout = std::io::stdout().lock();
+                let _ = if body.is_empty() {
+                    writeln!(stdout, "\nGlobal AGENTS.md ({})", doc.path.display())
+                } else {
+                    writeln!(
+                        stdout,
+                        "\nGlobal AGENTS.md ({}):\n\n{body}",
+                        doc.path.display()
+                    )
+                };
+            }
+            return std::process::ExitCode::from(error.exit_code() as u8);
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
