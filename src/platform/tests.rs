@@ -65,9 +65,12 @@ fn open_beneath_enforces_root_and_relative_invariants_directly() {
     assert!(open_beneath(&root, Path::new("./ok.txt"), false).is_err());
     assert!(open_beneath(&root, &root.join("ok.txt"), false).is_err());
     assert!(open_beneath(Path::new("relative-root"), Path::new("ok.txt"), false).is_err());
-    let unnormalized = root.join("sub").join("..");
     std::fs::create_dir(root.join("sub")).unwrap();
+    let unnormalized = base.path().join("sub").join("..");
     assert!(open_beneath(&unnormalized, Path::new("ok.txt"), false).is_err());
+    let mut raw_unnormalized = root.as_os_str().to_os_string();
+    raw_unnormalized.push(if cfg!(windows) { r"\sub\.." } else { "/sub/.." });
+    assert!(open_beneath(&PathBuf::from(raw_unnormalized), Path::new("ok.txt"), false).is_err());
     #[cfg(windows)]
     {
         for invalid in ["C:ok.txt", r"\ok.txt", r"ok.txt\"] {
