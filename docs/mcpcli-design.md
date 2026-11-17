@@ -1,4 +1,4 @@
-# mcpcli 0.1.0 design
+# mcpcli 0.2.0 design
 
 ## 1. Product contract
 
@@ -8,7 +8,7 @@ instructions, discovers tools, inspects metadata, invokes a tool, or reads a
 skill resource. A local daemon keeps connections and application state alive
 between commands.
 
-Version 0.1.0 supports stdio and Streamable HTTP, including the modern
+Version 0.2.0 supports stdio and Streamable HTTP, including the modern
 2026-07-28 protocol and legacy lifecycle negotiation through rmcp 3.9.0. The
 preferred modern version is 2026-07-28; the requested legacy version is
 2025-11-25. Compatibility with older revisions follows the SDK's negotiation.
@@ -69,7 +69,7 @@ There is no persistent schema cache. The SDK response cache is disabled. The SDK
 still retains internal per-tool metadata for HTTP header mapping; fresh
 discovery and current-list membership checks govern dispatch. The persistent
 connection can handle legacy or unsolicited list-change notifications. Modern
-subscription-based notifications are not subscribed to in 0.1.0. Reading the
+subscription-based notifications are not subscribed to in 0.2.0. Reading the
 current list does not depend on a notification or a previously cached flag.
 
 Tool arguments use one JSON object, supplied by exactly one of --args JSON,
