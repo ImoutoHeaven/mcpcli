@@ -63,14 +63,14 @@ struct Cli {
 struct TopLevelHelpProbe {
     #[arg(short, long, env = "MCPCLI_CONFIG", default_value = "mcpcli.json")]
     config: PathBuf,
-    #[arg(long, env = "MCPCLI_SESSION", default_value = "default")]
-    session: String,
-    #[arg(long, default_value_t = 60)]
-    timeout: u64,
     #[arg(long)]
-    oneshot: bool,
+    session: Option<std::ffi::OsString>,
     #[arg(long)]
-    text: bool,
+    timeout: Option<std::ffi::OsString>,
+    #[arg(long, action = clap::ArgAction::Count)]
+    oneshot: u8,
+    #[arg(long, action = clap::ArgAction::Count)]
+    text: u8,
     #[arg(short = 'h', long = "help", action = clap::ArgAction::Count)]
     help: u8,
 }
@@ -232,7 +232,12 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
     };
     let selected_agents = agents_doc.filter(|doc| {
         query.as_ref().is_none_or(|q| {
-            format!("agents {} {}", doc.path.display(), doc.content)
+            let file_name = doc
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            format!("{file_name} {}", doc.content)
                 .to_lowercase()
                 .contains(q)
         })
@@ -272,11 +277,13 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
     }
     let mut sections = Vec::new();
     if let Some(doc) = &selected_agents {
-        let body = doc.content.trim_end_matches(['\r', '\n']);
+        let path = safe_text(&doc.path.display().to_string());
+        let rendered = safe_text(&doc.content);
+        let body = rendered.trim_end_matches('\n');
         if body.is_empty() {
-            sections.push(format!("agents {}", doc.path.display()));
+            sections.push(format!("agents {path}"));
         } else {
-            sections.push(format!("agents {}\n\n{body}", doc.path.display()));
+            sections.push(format!("agents {path}\n\n{body}"));
         }
     }
     if !lines.is_empty() {
@@ -440,7 +447,7 @@ fn tool_text(result: &Value) -> String {
         for block in content {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str() {
-                    texts.push(text.to_owned());
+                    texts.push(safe_text(text));
                 }
             } else {
                 omitted += 1;
@@ -680,7 +687,8 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 SkillCommand::Show { .. } => {
                     let content =
                         skills::show(skill).map_err(|e| usage("skill_read", format!("{e:#}")))?;
-                    let text = format!("Base directory: {}\n\n{content}", skill.root.display());
+                    let root = safe_text(&skill.root.display().to_string());
+                    let text = format!("Base directory: {root}\n\n{content}");
                     Ok(Output::with_text(
                         json!({"name":name,"root":skill.root,"path":skill.path,"content":content}),
                         text,
@@ -802,18 +810,21 @@ fn main() -> std::process::ExitCode {
                 && let Ok(loaded) = LoadedConfig::load(&probe.config)
                 && let Ok(Some(doc)) = agents::load(loaded.config.agents.as_deref())
             {
+                let path = safe_text(&doc.path.display().to_string());
                 let rendered = safe_text(&doc.content);
                 let body = rendered.trim_end_matches('\n');
                 let mut stdout = std::io::stdout().lock();
-                let _ = if body.is_empty() {
-                    writeln!(stdout, "\nGlobal AGENTS.md ({})", doc.path.display())
+                let written = if body.is_empty() {
+                    writeln!(stdout, "\nGlobal AGENTS.md ({path})")
                 } else {
-                    writeln!(
-                        stdout,
-                        "\nGlobal AGENTS.md ({}):\n\n{body}",
-                        doc.path.display()
-                    )
+                    writeln!(stdout, "\nGlobal AGENTS.md ({path}):\n\n{body}")
                 };
+                if let Err(io_error) = written
+                    && io_error.kind() != std::io::ErrorKind::BrokenPipe
+                {
+                    eprintln!("mcpcli: stdout failed: {io_error}");
+                    return std::process::ExitCode::FAILURE;
+                }
             }
             return std::process::ExitCode::from(error.exit_code() as u8);
         }
@@ -833,4 +844,16 @@ fn main() -> std::process::ExitCode {
     // Drop async transports before exit, while bounding an interrupted stdin blocking reader.
     runtime.shutdown_timeout(Duration::from_secs(3));
     std::process::ExitCode::from(code as u8)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_and_help_probe_definitions_are_consistent() {
+        Cli::command().debug_assert();
+        TopLevelHelpProbe::command().debug_assert();
+    }
 }

@@ -20,6 +20,12 @@ pub(crate) fn validate_path(path: &Path) -> Result<()> {
     if raw.contains(&0) {
         bail!("agents path must not contain NUL");
     }
+    #[cfg(windows)]
+    if !path.is_absolute()
+        && (path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))))
+    {
+        bail!("agents path must be absolute or relative, not drive-relative");
+    }
     let is_sep = |b: u8| b == b'/' || (cfg!(windows) && b == b'\\');
     if raw.last().copied().is_some_and(is_sep) {
         bail!("agents path must name a regular file, not a directory");
@@ -31,27 +37,18 @@ pub(crate) fn validate_path(path: &Path) -> Result<()> {
     if matches!(tail, b"." | b"..") {
         bail!("agents path must name a regular file, not '.' or '..'");
     }
+    #[cfg(windows)]
+    if tail.contains(&b':')
+        || path.components().any(|part| {
+            matches!(part, Component::Normal(name) if name.as_encoded_bytes().contains(&b':'))
+        })
+    {
+        bail!("alternate data streams are not supported");
+    }
     if !matches!(path.components().next_back(), Some(Component::Normal(_))) {
         bail!("agents path must name a regular file");
     }
     Ok(())
-}
-
-#[cfg(windows)]
-fn normalize_windows_parent(path: &Path) -> PathBuf {
-    if path
-        .components()
-        .any(|part| matches!(part, Component::ParentDir | Component::CurDir))
-        && let Some(text) = path.to_str()
-    {
-        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-            return PathBuf::from(format!(r"\\{rest}"));
-        }
-        if let Some(rest) = text.strip_prefix(r"\\?\") {
-            return PathBuf::from(rest);
-        }
-    }
-    path.to_owned()
 }
 
 /// Read the explicitly configured global AGENTS.md file without project-directory discovery.
@@ -67,10 +64,6 @@ pub fn load(configured: Option<&Path>) -> Result<Option<AgentsDocument>> {
         Some(parent) if !parent.as_os_str().is_empty() => parent,
         _ => Path::new("."),
     };
-    #[cfg(windows)]
-    let parent_buf = normalize_windows_parent(raw_parent);
-    #[cfg(windows)]
-    let raw_parent = parent_buf.as_path();
     let parent = crate::platform::canonical_directory(raw_parent)
         .with_context(|| format!("open configured agents parent directory {raw_parent:?}"))?;
     let relative = Path::new(file_name);
@@ -198,6 +191,12 @@ mod tests {
         {
             fs::write(dir.join("AGENTS.md:secret"), "hidden").unwrap();
             assert!(load(Some(&dir.join("AGENTS.md:secret"))).is_err());
+            for drive_relative in ["C:AGENTS.md", r"\AGENTS.md"] {
+                assert!(
+                    load(Some(Path::new(drive_relative))).is_err(),
+                    "{drive_relative:?}"
+                );
+            }
         }
         #[cfg(unix)]
         {

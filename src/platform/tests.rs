@@ -51,6 +51,36 @@ fn monotonic_deadlines_advance() {
     assert!(after >= before + 10);
 }
 
+#[test]
+fn open_beneath_enforces_root_and_relative_invariants_directly() {
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().canonicalize().unwrap();
+    std::fs::write(root.join("ok.txt"), "ok").unwrap();
+    std::fs::write(base.path().join("outside.txt"), "outside").unwrap();
+    assert!(open_beneath(&root, Path::new("ok.txt"), false).is_ok());
+    assert!(open_beneath(&root, Path::new(""), true).is_ok());
+    assert!(open_beneath(&root, Path::new(""), false).is_err());
+    assert!(open_beneath(&root, Path::new("ok.txt/"), false).is_err());
+    assert!(open_beneath(&root, Path::new("../outside.txt"), false).is_err());
+    assert!(open_beneath(&root, Path::new("./ok.txt"), false).is_err());
+    assert!(open_beneath(&root, &root.join("ok.txt"), false).is_err());
+    assert!(open_beneath(Path::new("relative-root"), Path::new("ok.txt"), false).is_err());
+    let unnormalized = root.join("sub").join("..");
+    std::fs::create_dir(root.join("sub")).unwrap();
+    assert!(open_beneath(&unnormalized, Path::new("ok.txt"), false).is_err());
+    #[cfg(windows)]
+    {
+        for invalid in ["C:ok.txt", r"\ok.txt", r"ok.txt\"] {
+            assert!(
+                open_beneath(&root, Path::new(invalid), false).is_err(),
+                "{invalid:?}"
+            );
+        }
+        assert!(canonical_directory(Path::new("C:sub")).is_err());
+        assert!(canonical_directory(Path::new(r"\sub")).is_err());
+    }
+}
+
 #[cfg(windows)]
 #[test]
 fn runtime_dacls_and_reparse_points_are_checked() {

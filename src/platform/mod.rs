@@ -145,12 +145,50 @@ fn canonical_skill_root_with(
     canonical_directory_with(path, "skill root", canonicalize)
 }
 
+#[cfg(windows)]
+fn normalize_directory_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+    if !path.is_absolute()
+        && (path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "directory path must not be drive-relative",
+        ));
+    }
+    let is_verbatim = matches!(
+        path.components().next(),
+        Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    );
+    if !is_verbatim {
+        return Ok(path.components().collect());
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(part) if part == "." => {}
+            Component::Normal(part) if part == ".." => {
+                let _ = normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
 fn canonical_directory_with(
     path: &Path,
     label: &str,
     canonicalize: impl FnOnce(&Path) -> io::Result<PathBuf>,
 ) -> io::Result<PathBuf> {
     // Trailing separators or '/.' must not turn a symlink leaf into an ancestor.
+    #[cfg(windows)]
+    let path = normalize_directory_path(path)?;
+    #[cfg(not(windows))]
     let path: PathBuf = path.components().collect();
     // Pin the configured leaf before canonicalization can follow a replacement link.
     let original = open_skill_root(&path)?;

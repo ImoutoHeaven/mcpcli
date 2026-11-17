@@ -409,6 +409,10 @@ fn from_config_directory(parent: &Path, path: &Path) -> Result<PathBuf> {
         for component in path.components() {
             match component {
                 std::path::Component::CurDir => {}
+                #[cfg(windows)]
+                std::path::Component::ParentDir => {
+                    let _ = resolved.pop();
+                }
                 other => resolved.push(other.as_os_str()),
             }
         }
@@ -681,11 +685,55 @@ mod tests {
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
             assert!(LoadedConfig::load(&path).is_err());
         }
-        for agents in ["C:AGENTS.md", r"\AGENTS.md"] {
+        for agents in ["C:AGENTS.md", r"\AGENTS.md", "AGENTS.md:secret"] {
             let config = serde_json::json!({"agents": agents});
             std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
-            assert!(LoadedConfig::load(&path).is_err());
+            assert!(LoadedConfig::load(&path).is_err(), "{agents:?}");
         }
+
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(dir.path().join("skills").join("ops")).unwrap();
+        std::fs::write(
+            dir.path().join("skills").join("ops").join("SKILL.md"),
+            "---\nname: ops\ndescription: Parent relative skill\n---\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "# Parent Global\n").unwrap();
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_config = sub.join("mcpcli.json");
+        std::fs::write(
+            &sub_config,
+            r#"{"agents":"../AGENTS.md","servers":{"x":{"transport":"stdio","command":"../bin/server.exe","cwd":".."}},"skills":["../skills"]}"#,
+        )
+        .unwrap();
+        let parent_loaded = LoadedConfig::load(&sub_config).unwrap();
+        let root_canonical = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            parent_loaded.config.agents.as_deref(),
+            Some(root_canonical.join("AGENTS.md").as_path())
+        );
+        let ServerConfig::Stdio { command, cwd, .. } = &parent_loaded.config.servers["x"] else {
+            panic!()
+        };
+        assert_eq!(
+            Path::new(command),
+            root_canonical.join("bin").join("server.exe")
+        );
+        assert_eq!(cwd.as_deref(), Some(root_canonical.as_path()));
+        assert_eq!(
+            crate::agents::load(parent_loaded.config.agents.as_deref())
+                .unwrap()
+                .unwrap()
+                .content,
+            "# Parent Global\n"
+        );
+        assert_eq!(
+            crate::skills::discover(&parent_loaded.config.skills)
+                .unwrap()
+                .skills
+                .len(),
+            1
+        );
     }
     #[cfg(windows)]
     #[test]

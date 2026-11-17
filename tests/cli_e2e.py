@@ -331,12 +331,12 @@ def global_agents(f):
     project_dir.mkdir()
     (project_dir / "AGENTS.md").write_bytes(b"PROJECT_SCOPED_SENTINEL_DO_NOT_READ\n")
 
-    agents_dir = f.root / "global-docs"
-    agents_dir.mkdir()
+    agents_dir = f.root / "ancestor-path-only-token" / "global-docs"
+    agents_dir.mkdir(parents=True)
     agents_file = agents_dir / "AGENTS.md"
-    raw_content = "# Global MCP Guide\r\nAlways inspect tool schemas before calling.\r\nSpoof\rGuard\r\n"
+    raw_content = "# Global MCP Guide\r\nAlways inspect tool schemas before calling.\r\nSpoof\rGuard\r"
     agents_file.write_bytes(raw_content.encode("utf-8"))
-    f.settings["agents"] = "./global-docs/AGENTS.md"
+    f.settings["agents"] = "./ancestor-path-only-token/global-docs/AGENTS.md"
     f.save_config()
 
     scoped_env = dict(f.env, MCPCLI_CONFIG=str(f.config))
@@ -351,33 +351,69 @@ def global_agents(f):
 
     text_catalog = f.invoke("--text", "catalog").stdout
     assert "agents " in text_catalog
-    assert "# Global MCP Guide\nAlways inspect tool schemas before calling.\nSpoof\\rGuard" in text_catalog
+    assert "# Global MCP Guide\nAlways inspect tool schemas before calling.\nSpoof\\rGuard\\r" in text_catalog
     assert "server state\t" in text_catalog and "skill ops\t" in text_catalog
 
     direct = f.value("agents")
     assert Path(direct["agents"]["path"]).samefile(agents_file)
     assert direct["agents"]["content"] == raw_content
     assert f.invoke("--text", "agents").stdout == (
-        "# Global MCP Guide\nAlways inspect tool schemas before calling.\nSpoof\\rGuard\n"
+        "# Global MCP Guide\nAlways inspect tool schemas before calling.\nSpoof\\rGuard\\r\n"
     )
 
     matched = f.value("search", "inspect tool schemas")
     assert matched["agents"]["content"] == raw_content
     assert matched["servers"] == [] and matched["skills"] == []
-    unmatched = f.value("search", "absent-capability")
-    assert unmatched["agents"] is None and unmatched["servers"] == [] and unmatched["skills"] == []
-    assert f.invoke("--text", "search", "absent-capability").stdout == ""
+    by_filename = f.value("search", "agents.md")
+    assert by_filename["agents"]["content"] == raw_content
+    for absent in ("absent-capability", "ancestor-path-only-token"):
+        unmatched = f.value("search", absent)
+        assert unmatched["agents"] is None and unmatched["servers"] == [] and unmatched["skills"] == []
+        assert f.invoke("--text", "search", absent).stdout == ""
 
-    help_with_agents = subprocess.run([str(f.binary), "-h"], env=scoped_env, cwd=project_dir,
-                                      text=True, encoding="utf-8", capture_output=True, timeout=3)
-    assert help_with_agents.returncode == 0
-    assert "Global AGENTS.md (" in help_with_agents.stdout
-    assert "Always inspect tool schemas before calling." in help_with_agents.stdout
-    assert "PROJECT_SCOPED_SENTINEL" not in help_with_agents.stdout
+    for help_args in (["-h"], ["--help", "--timeout", "not-a-number", "--text", "--text"]):
+        help_with_agents = subprocess.run([str(f.binary), *help_args], env=scoped_env, cwd=project_dir,
+                                          text=True, encoding="utf-8", capture_output=True, timeout=3)
+        assert help_with_agents.returncode == 0
+        assert "Global AGENTS.md (" in help_with_agents.stdout
+        assert "Always inspect tool schemas before calling." in help_with_agents.stdout
+        assert "Spoof\\rGuard\\r" in help_with_agents.stdout
+        assert "PROJECT_SCOPED_SENTINEL" not in help_with_agents.stdout
 
     sub_help = subprocess.run([str(f.binary), "--config", str(f.config), "call", "--help"],
                               env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=3)
     assert sub_help.returncode == 0 and "Global AGENTS.md (" not in sub_help.stdout
+
+    nested_cfg_dir = f.root / "nested-config"
+    nested_cfg_dir.mkdir()
+    nested_cfg = nested_cfg_dir / "mcpcli.json"
+    nested_cfg.write_text(json.dumps({
+        "version": 1,
+        "agents": "../ancestor-path-only-token/global-docs/AGENTS.md",
+        "servers": {"state": {
+            "transport": "stdio", "command": sys.executable,
+            "args": [str(f.script), "--log", str(f.log)], "cwd": "..",
+        }},
+        "skills": ["../skills"],
+    }), encoding="utf-8")
+    nested_cat = subprocess.run([str(f.binary), "--config", str(nested_cfg), "catalog"],
+                                env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=5)
+    assert nested_cat.returncode == 0, nested_cat.stderr
+    nested_payload = json.loads(nested_cat.stdout)
+    assert nested_payload["agents"]["content"] == raw_content
+    assert [s["name"] for s in nested_payload["skills"]] == ["ops"]
+
+    if not WINDOWS:
+        ctrl_dir = f.root / "dir\rspoof"
+        ctrl_dir.mkdir()
+        ctrl_agents = ctrl_dir / "AGENTS.md"
+        ctrl_agents.write_bytes(b"# Safe Path Help\n")
+        ctrl_cfg = f.root / "ctrl-mcpcli.json"
+        ctrl_cfg.write_text(json.dumps({"version": 1, "agents": str(ctrl_agents)}), encoding="utf-8")
+        ctrl_help = subprocess.run([str(f.binary), "--config", str(ctrl_cfg), "--help"],
+                                   env=f.env, text=True, encoding="utf-8", capture_output=True, timeout=3)
+        assert ctrl_help.returncode == 0
+        assert "\r" not in ctrl_help.stdout and "dir\\rspoof" in ctrl_help.stdout
 
     agents_file.write_bytes(b"# Updated Global Guide\nSecond version.\n")
     assert f.value("agents")["agents"]["content"] == "# Updated Global Guide\nSecond version.\n"
@@ -830,7 +866,7 @@ def unprivileged_execute_only_ancestors(f):
             for name in files_list:
                 os.chown(Path(cur) / name, 65534, 65534)
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "MCPCLI_RUNTIME_DIR": str(user_dir / "rt")}
-        for cmd in (["catalog"], ["agents"], ["skills", "list"], ["skills", "show", "ops"],
+        for cmd in (["catalog"], ["agents"], ["--help"], ["skills", "list"], ["skills", "show", "ops"],
                     ["skills", "files", "ops"], ["skills", "read", "ops", "references/doc.md"]):
             res = subprocess.run(
                 [str(user_bin), "--config", str(cfg), *cmd],
@@ -838,6 +874,8 @@ def unprivileged_execute_only_ancestors(f):
                 user=65534, group=65534,
             )
             assert res.returncode == 0, f"{cmd} failed under 0711 ancestor: {res.stderr}"
+            if cmd == ["--help"]:
+                assert "# Global Traverse" in res.stdout
     finally:
         shutil.rmtree(outer, ignore_errors=True)
 

@@ -195,6 +195,33 @@ const TRAVERSE: i32 = libc::O_PATH;
 const TRAVERSE: i32 = libc::O_SEARCH;
 
 pub fn open_beneath(root: &Path, relative: &Path, directory: bool) -> io::Result<File> {
+    if !root.is_absolute()
+        || !root
+            .components()
+            .all(|part| matches!(part, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "root directory must be absolute and normalized",
+        ));
+    }
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative path must contain only normal components",
+        ));
+    }
+    let raw_rel = relative.as_os_str().as_bytes();
+    if !directory && (raw_rel.is_empty() || raw_rel.last() == Some(&b'/')) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file path must name a regular file",
+        ));
+    }
     let path = root.join(relative);
     let names: Vec<_> = path
         .components()

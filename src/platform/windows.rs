@@ -360,6 +360,37 @@ pub(super) fn open_beneath_with(
     directory: bool,
     mut opened: impl FnMut(&Path, &File),
 ) -> io::Result<File> {
+    if !root.is_absolute()
+        || !root.components().all(|part| {
+            matches!(
+                part,
+                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
+            )
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "root directory must be absolute and normalized",
+        ));
+    }
+    if relative.is_absolute()
+        || relative.has_root()
+        || !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "relative path must contain only normal components",
+        ));
+    }
+    let raw_rel = relative.as_os_str().as_encoded_bytes();
+    if !directory && (raw_rel.is_empty() || matches!(raw_rel.last(), Some(b'/' | b'\\'))) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file path must name a regular file",
+        ));
+    }
     let combined = root.join(relative);
     let mut path = PathBuf::new();
     let mut guards = Vec::new();
