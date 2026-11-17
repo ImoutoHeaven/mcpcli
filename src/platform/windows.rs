@@ -360,12 +360,12 @@ pub(super) fn open_beneath_with(
     directory: bool,
     mut opened: impl FnMut(&Path, &File),
 ) -> io::Result<File> {
+    let normal_component = |name: &OsStr| name != "." && name != "..";
     if !root.is_absolute()
-        || !root.components().all(|part| {
-            matches!(
-                part,
-                Component::Prefix(_) | Component::RootDir | Component::Normal(_)
-            )
+        || !root.components().all(|part| match part {
+            Component::Prefix(_) | Component::RootDir => true,
+            Component::Normal(name) => normal_component(name),
+            _ => false,
         })
     {
         return Err(io::Error::new(
@@ -377,7 +377,7 @@ pub(super) fn open_beneath_with(
         || relative.has_root()
         || !relative
             .components()
-            .all(|part| matches!(part, Component::Normal(_)))
+            .all(|part| matches!(part, Component::Normal(name) if normal_component(name)))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -439,6 +439,9 @@ fn open_relative(
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
+    if name == "." || name == ".." {
+        return Err(refuse("dot directory entries are not supported"));
+    }
     if name.encode_wide().any(|unit| unit == u16::from(b':')) {
         return Err(refuse("alternate data streams are not supported"));
     }
