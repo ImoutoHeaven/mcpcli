@@ -11,7 +11,8 @@ def raw_semantic_disclosure(f):
                 continue
             for oneshot in [False, True]:
                 label = f"raw-{modern}-{transport}-{oneshot}"
-                case = Fixture(f.binary, f.root, label)
+                # Keep each case beside the outer fixture: nested paths exceed BSD socket limits.
+                case = Fixture(f.binary, f.root.parent, label)
                 try:
                     if not transport.startswith("stdio"):
                         mode = {"http": "raw_semantics", "post_sse": "raw_post_sse", "get_sse": "raw_get_sse"}[transport]
