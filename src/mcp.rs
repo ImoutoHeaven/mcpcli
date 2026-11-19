@@ -660,11 +660,6 @@ struct ChildTransport {
 }
 
 impl ChildTransport {
-    #[cfg(test)]
-    fn spawn(command: Command, cleanup: CleanupState) -> std::io::Result<Self> {
-        Self::spawn_observed(command, cleanup, Ingress::default())
-    }
-
     fn spawn_observed(
         mut command: Command,
         cleanup: CleanupState,
@@ -1327,7 +1322,9 @@ mod tests {
     async fn observing_exit_does_not_reap_leader_before_group_cleanup() {
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        let mut transport = ChildTransport::spawn(command, CleanupState::default()).unwrap();
+        let mut transport =
+            ChildTransport::spawn_observed(command, CleanupState::default(), Ingress::default())
+                .unwrap();
         assert!(transport.wait_unreaped().await.unwrap());
         // A second WNOWAIT observation must still find our waitable leader.
         assert!(transport.exited_unreaped().unwrap());
@@ -1341,7 +1338,9 @@ mod tests {
     async fn blocked_stdio_writer_cannot_prevent_owned_child_shutdown() {
         let mut command = Command::new("sh");
         command.args(["-c", "trap '' TERM; sleep 60"]);
-        let mut transport = ChildTransport::spawn(command, CleanupState::default()).unwrap();
+        let mut transport =
+            ChildTransport::spawn_observed(command, CleanupState::default(), Ingress::default())
+                .unwrap();
         let message = serde_json::from_value(serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": {"name": "blocked", "arguments": {"data": "x".repeat(2 * 1024 * 1024)}}
@@ -1362,7 +1361,9 @@ mod tests {
     async fn cancelling_shutdown_keeps_group_owned_until_drop() {
         let mut command = Command::new("sh");
         command.args(["-c", "trap '' TERM; cat >/dev/null; sleep 60"]);
-        let mut transport = ChildTransport::spawn(command, CleanupState::default()).unwrap();
+        let mut transport =
+            ChildTransport::spawn_observed(command, CleanupState::default(), Ingress::default())
+                .unwrap();
         let pid = transport.group.unwrap();
         assert!(
             timeout(Duration::from_millis(25), transport.shutdown())
