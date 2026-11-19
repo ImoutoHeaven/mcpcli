@@ -70,8 +70,8 @@ There is no persistent schema cache. The SDK response cache is disabled. The SDK
 still retains internal per-tool metadata for HTTP header mapping; fresh
 discovery and current-list membership checks govern dispatch. The persistent
 connection can handle legacy or unsolicited list-change notifications. Modern
-subscription-based notifications are not subscribed to in 0.2.0. Reading the
-current list does not depend on a notification or a previously cached flag.
+subscription-based notifications are not subscribed to. Reading the current
+list does not depend on a notification or a previously cached flag.
 
 Tool arguments use one JSON object, supplied by exactly one of --args JSON,
 --args-file PATH, or --stdin. An omitted input is {}. Fields retain their schema
