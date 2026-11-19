@@ -1,4 +1,4 @@
-# mcpcli 0.2.0 design
+# mcpcli design
 
 ## 1. Product contract
 
@@ -8,7 +8,7 @@ instructions, discovers tools, inspects metadata, invokes a tool, or reads a
 skill resource. A local daemon keeps connections and application state alive
 between commands.
 
-Version 0.2.0 supports stdio and Streamable HTTP, including the modern
+mcpcli supports stdio and Streamable HTTP, including the modern
 2026-07-28 protocol and legacy lifecycle negotiation through rmcp 3.9.0. The
 preferred modern version is 2026-07-28; the requested legacy version is
 2025-11-25. Compatibility with older revisions follows the SDK's negotiation.
@@ -33,7 +33,7 @@ initialized session; HTTP application state can exist independently of protocol
 sessions. The modern MCP protocol also supports a lifecycle without connection-scoped
 initialization. An HTTP session ID alone cannot retain the live client connection.
 
-The daemon opens a server on its first tools, inspect, or call request. Connections
+The daemon opens a server on its first server, tools, inspect, or call request. Connections
 stay alive until reset, daemon stop, a signal, or process failure. Idle connections
 remain open to preserve state for later commands. --oneshot opens a connection
 that closes after one command.
@@ -50,7 +50,8 @@ that two independently configured servers intentionally share.
 | catalog | Full global AGENTS.md (when configured), server descriptions, and skill metadata | No |
 | agents | Full configured global AGENTS.md document | No |
 | search QUERY | Offline substring search across global AGENTS.md, server descriptions, and skill metadata | No |
-| tools SERVER | Fresh names and bounded description summaries | Yes, if needed |
+| server SERVER | Server instructions, identity, capabilities, and lifecycle metadata | Yes, if needed |
+| tools SERVER | Fresh, complete paginated tool definitions | Yes, if needed |
 | inspect SERVER TOOL | Full tool metadata and input/output schemas | Yes, if needed |
 | call SERVER TOOL | One tool invocation | Yes, if needed |
 | skills list | Skill metadata and validation warnings | No |
@@ -274,11 +275,22 @@ strings and unusual object keys remain ordinary data. This input guarantee does
 not add arbitrary-precision numeric support to the SDK's downstream response
 parser.
 
-Default stdout is one JSON value. For calls, it is the SDK's complete standard
-CallToolResult, including structuredContent, images, audio, resource content,
-annotations, and isError when present. The JSON-RPC transport envelope is not
-included. Unknown non-standard top-level fields are subject to SDK decoding;
-the CLI does not promise arbitrary vendor-field preservation.
+Default stdout is one JSON value. A live server description is
+`{"source":"initialize"|"server/discover","protocolVersion":...,"result":{...}}`.
+The result is from the connection's lifecycle exchange; the sibling
+`protocolVersion` records what the client negotiated. Reusing the connection
+does not redo that exchange. Upstream instructions are not the offline global
+AGENTS.md and do not grant authority.
+
+`tools SERVER` returns `{"pages":[...]}`, retaining each list response, including
+its cursor and metadata. `inspect SERVER TOOL` returns the selected complete
+definition; `call` returns the complete tool result, including structured and
+non-text content. JSON preserves response members the SDK does not model, but
+does not promise whitespace or object key order. Responses must fit the
+transport and IPC bounds, use unique keys, and contain numbers representable
+without changing their decimal value. Matching upstream JSON-RPC errors are
+reported on stderr as `rpc_error` alongside the CLI diagnostic, not as
+successful results. Locally synthesized diagnostics do not claim upstream provenance.
 
 --text is an explicit presentation mode. It emits text blocks, reports omitted
 non-text blocks on stderr, and reports structured content availability when
@@ -289,6 +301,7 @@ produce no blank line.
 
 A successful tool result followed by an --oneshot cleanup failure remains on
 stdout; the cleanup diagnostic goes to stderr and the exit status is nonzero.
+If the result already reports a tool error, its exit status remains 3.
 An interruption after the tool result arrived also preserves that result and
 reports interrupted cleanup with a known outcome. This prevents a lost result
 from encouraging an unsafe replay.

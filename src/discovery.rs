@@ -1,26 +1,5 @@
 use serde_json::Value;
 
-/// Compact display only; callers retain the original MCP metadata for JSON output.
-pub fn tool_summary(tool: &Value) -> String {
-    let name = single_line(
-        tool.get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("<unnamed>"),
-        128,
-    );
-    let description = single_line(
-        tool.get("description")
-            .and_then(Value::as_str)
-            .unwrap_or(""),
-        200,
-    );
-    if description.is_empty() {
-        name
-    } else {
-        format!("{name}\t{description}")
-    }
-}
-
 /// Inspect the exact schemas rather than synthesizing an incomplete flag interface.
 pub fn render_tool(tool: &Value) -> String {
     let Some(object) = tool.as_object() else {
@@ -88,20 +67,6 @@ fn single_line(text: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn summary_is_bounded_and_does_not_expose_schema_or_terminal_controls() {
-        let tool = json!({
-            "name": "read\u{1b}[31m",
-            "description": format!("line one\n{}", "x".repeat(400)),
-            "inputSchema": {"properties": {"private": {"description":"details"}}}
-        });
-        let summary = tool_summary(&tool);
-        assert!(!summary.contains('\u{1b}'));
-        assert!(!summary.contains('\n'));
-        assert!(!summary.contains("private"));
-        assert!(summary.ends_with('…'));
-    }
 
     #[test]
     fn inspect_preserves_exact_complex_schema_and_other_metadata() {

@@ -45,7 +45,9 @@ use tokio::{
 
 use crate::config::ServerConfig;
 
+mod ingress;
 mod sse;
+use ingress::{Ingress, ObservedRead};
 #[cfg(windows)]
 mod windows_job;
 
@@ -67,6 +69,7 @@ pub struct McpFailure {
     pub kind: FailureKind,
     pub message: String,
     pub outcome_unknown: bool,
+    pub rpc_error: Option<Value>,
 }
 
 impl fmt::Display for McpFailure {
@@ -89,6 +92,7 @@ fn failure_with_outcome(
         kind,
         message: message.into(),
         outcome_unknown,
+        rpc_error: None,
     }
     .into()
 }
@@ -115,6 +119,7 @@ fn record_cleanup_failure(
                     kind,
                     message: message.into(),
                     outcome_unknown: false,
+                    rpc_error: None,
                 },
                 local_confirmed,
             });
@@ -124,6 +129,7 @@ fn record_cleanup_failure(
                 kind,
                 message: message.into(),
                 outcome_unknown: false,
+                rpc_error: None,
             };
             existing.local_confirmed = false;
         }
@@ -131,7 +137,62 @@ fn record_cleanup_failure(
     }
 }
 
-fn service_failure(error: ServiceError, calling: bool) -> anyhow::Error {
+fn observed_result(
+    response: Option<(&'static str, Result<Value>)>,
+    expected: Option<&str>,
+    calling: bool,
+) -> Result<(&'static str, Value)> {
+    if let Some((method, Ok(mut response))) = response
+        && expected.map_or(
+            matches!(method, "initialize" | "server/discover"),
+            |expected| expected == method,
+        )
+        && let Some(result) = response.get_mut("result")
+    {
+        return Ok((method, result.take()));
+    }
+    Err(failure_with_outcome(
+        FailureKind::Protocol,
+        "MCP response metadata could not be captured",
+        calling,
+    ))
+}
+
+fn busy_capture() -> anyhow::Error {
+    failure(
+        FailureKind::Protocol,
+        "MCP connection already has an operation in progress; request was not dispatched",
+    )
+}
+
+fn rpc_failure(code: i32, diagnostic: String, calling: bool, ingress: &Ingress) -> anyhow::Error {
+    let (message, rpc_error) = match ingress.take() {
+        Some((_, Ok(mut response))) if response.get("error").is_some() => {
+            (diagnostic, response.get_mut("error").map(Value::take))
+        }
+        Some((_, Err(_))) => (
+            format!(
+                "MCP error {code}: response rejected because its JSON cannot be represented losslessly"
+            ),
+            None,
+        ),
+        _ => (diagnostic, None),
+    };
+    let suffix = if calling {
+        "; outcome unknown, the call was not retried"
+    } else {
+        ""
+    };
+    McpFailure {
+        kind: FailureKind::Protocol,
+        message: format!("{message}{suffix}"),
+        outcome_unknown: calling,
+        rpc_error,
+    }
+    .into()
+}
+
+fn service_failure(error: ServiceError, calling: bool, ingress: &Ingress) -> anyhow::Error {
     let suffix = if calling {
         "; outcome unknown, the call was not retried"
     } else {
@@ -139,9 +200,11 @@ fn service_failure(error: ServiceError, calling: bool) -> anyhow::Error {
     };
     let fail = |kind, message| failure_with_outcome(kind, message, calling);
     match error {
-        ServiceError::McpError(e) => fail(
-            FailureKind::Protocol,
-            format!("MCP error {}: {}{suffix}", e.code.0, e.message),
+        ServiceError::McpError(e) => rpc_failure(
+            e.code.0,
+            format!("MCP error {}: {}", e.code.0, e.message),
+            calling,
+            ingress,
         ),
         ServiceError::Timeout { .. } => fail(
             FailureKind::Timeout,
@@ -183,6 +246,8 @@ type CloseFuture = Pin<
 pub struct McpConnection {
     service: Option<RunningService<RoleClient, Handler>>,
     peer: Peer<RoleClient>,
+    ingress: Ingress,
+    server: Vec<u8>,
     closing: Option<CloseFuture>,
     cleanup: CleanupState,
     tools_changed: Arc<AtomicBool>,
@@ -192,6 +257,8 @@ impl McpConnection {
     pub async fn connect(config: &ServerConfig, budget: Duration) -> Result<Self> {
         let tools_changed = Arc::new(AtomicBool::new(false));
         let cleanup = CleanupState::default();
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().ok_or_else(busy_capture)?;
         let handler = Handler {
             tools_changed: tools_changed.clone(),
         };
@@ -213,16 +280,18 @@ impl McpConnection {
                     if let Some(cwd) = cwd {
                         child.current_dir(cwd);
                     }
-                    let transport = ChildTransport::spawn(child, cleanup.clone()).map_err(|e| {
-                        failure(
-                            FailureKind::Transport,
-                            format!("Cannot start MCP server: {e}"),
-                        )
-                    })?;
+                    let transport =
+                        ChildTransport::spawn_observed(child, cleanup.clone(), ingress.clone())
+                            .map_err(|e| {
+                                failure(
+                                    FailureKind::Transport,
+                                    format!("Cannot start MCP server: {e}"),
+                                )
+                            })?;
                     handler
                         .serve_with_lifecycle(transport, lifecycle)
                         .await
-                        .map_err(init_failure)
+                        .map_err(|error| init_failure(error, &ingress))
                 }
                 ServerConfig::Http { url, headers, .. } => {
                     let mut parsed_headers = HashMap::new();
@@ -274,13 +343,14 @@ impl McpConnection {
                         BoundedHttp {
                             client,
                             cleanup: cleanup.clone(),
+                            ingress: ingress.clone(),
                         },
                         transport_config,
                     );
                     handler
                         .serve_with_lifecycle(transport, lifecycle)
                         .await
-                        .map_err(init_failure)
+                        .map_err(|error| init_failure(error, &ingress))
                 }
             }
         };
@@ -292,7 +362,15 @@ impl McpConnection {
             .peer()
             .set_response_cache_config(ClientCacheConfig::disabled())
             .await;
+        let (source, result) = observed_result(ingress.take(), None, false)?;
+        let protocol = service
+            .peer()
+            .peer_info()
+            .ok_or_else(|| failure(FailureKind::Protocol, "MCP peer info is missing"))?;
+        let server = serde_json::json!({"source":source,"protocolVersion":protocol.protocol_version,"result":result});
         Ok(Self {
+            ingress,
+            server: serde_json::to_vec(&server)?,
             peer: service.peer().clone(),
             service: Some(service),
             closing: None,
@@ -321,9 +399,32 @@ impl McpConnection {
         self.tools_changed.swap(false, Ordering::AcqRel)
     }
 
+    pub fn server_info(&self) -> Result<Value> {
+        Ok(serde_json::from_slice(&self.server)?)
+    }
+
     pub async fn list_tools(&self, budget: Duration) -> Result<Vec<Value>> {
+        let (pages, _) = self.walk_tools(budget).await?;
+        Ok(pages
+            .into_iter()
+            .flat_map(|mut page| {
+                page["tools"]
+                    .take()
+                    .as_array_mut()
+                    .map(std::mem::take)
+                    .unwrap_or_default()
+            })
+            .collect())
+    }
+
+    pub async fn list_tool_pages(&self, budget: Duration) -> Result<Vec<Value>> {
+        self.walk_tools(budget).await.map(|(pages, _)| pages)
+    }
+    async fn walk_tools(&self, budget: Duration) -> Result<(Vec<Value>, HashSet<String>)> {
+        let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
         let listing = async {
-            let mut tools = Vec::new();
+            let mut pages = Vec::new();
+            let mut count = 0usize;
             let mut cursor = None;
             let mut cursors = HashSet::new();
             let mut names = HashSet::new();
@@ -335,7 +436,9 @@ impl McpConnection {
                     .peer
                     .list_tools(Some(params))
                     .await
-                    .map_err(|e| service_failure(e, false))?;
+                    .map_err(|e| service_failure(e, false, &self.ingress))?;
+                let (_, raw_page) =
+                    observed_result(self.ingress.take(), Some("tools/list"), false)?;
                 for tool in page.tools {
                     if tool.name.is_empty() || !names.insert(tool.name.to_string()) {
                         return Err(failure(
@@ -343,19 +446,25 @@ impl McpConnection {
                             "Tool catalog contains an empty or duplicate name",
                         ));
                     }
-                    let value = serde_json::to_value(tool)?;
-                    bytes = bytes.saturating_add(serde_json::to_vec(&value)?.len());
-                    if tools.len() >= MAX_TOOLS || bytes > MAX_RESPONSE_BYTES {
+                    count += 1;
+                    if count > MAX_TOOLS {
                         return Err(failure(
                             FailureKind::Protocol,
                             "Tool catalog exceeds the size limit",
                         ));
                     }
-                    tools.push(value);
                 }
+                bytes = bytes.saturating_add(serde_json::to_vec(&raw_page)?.len());
+                if bytes > MAX_RESPONSE_BYTES {
+                    return Err(failure(
+                        FailureKind::Protocol,
+                        "Tool catalog exceeds the size limit",
+                    ));
+                }
+                pages.push(raw_page);
                 cursor = page.next_cursor;
                 match &cursor {
-                    None => return Ok(tools),
+                    None => return Ok((pages, names)),
                     Some(c) if !cursors.insert(c.clone()) => {
                         return Err(failure(
                             FailureKind::Protocol,
@@ -396,16 +505,20 @@ impl McpConnection {
         let started = tokio::time::Instant::now();
         // HTTP header annotations need the SDK's current catalog; fresh discovery
         // also prevents invoking tools rejected by the transport or withdrawn.
-        let tools = self.list_tools(budget).await.map_err(|error| {
-            let kind = error
-                .downcast_ref::<McpFailure>()
-                .map_or(FailureKind::Transport, |error| error.kind);
-            failure(
-                kind,
-                format!("Tool was not dispatched: discovery failed: {error}"),
-            )
-        })?;
-        if !tools.iter().any(|tool| tool["name"].as_str() == Some(name)) {
+        let (_, names) = self
+            .walk_tools(budget)
+            .await
+            .map_err(|error| -> anyhow::Error {
+                let previous = error.downcast_ref::<McpFailure>();
+                McpFailure {
+                    kind: previous.map_or(FailureKind::Transport, |error| error.kind),
+                    message: format!("Tool was not dispatched: discovery failed: {error}"),
+                    outcome_unknown: false,
+                    rpc_error: previous.and_then(|error| error.rpc_error.clone()),
+                }
+                .into()
+            })?;
+        if !names.contains(name) {
             return Err(failure(
                 FailureKind::Protocol,
                 "Tool was not dispatched: not present in the current catalog",
@@ -420,6 +533,7 @@ impl McpConnection {
         }
         let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
         // This conservative boundary is also visible to the daemon's outer deadline.
+        let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
         dispatched.store(true, Ordering::Release);
         // call_tool_once cancels on future drop; it does not drive interactive MRTR rounds.
         let response = timeout(remaining, self.peer.call_tool_once(request)).await
@@ -427,9 +541,12 @@ impl McpConnection {
                 FailureKind::Timeout,
                 "MCP call timed out; cancellation requested; outcome unknown, the call was not retried", true,
             ))?
-            .map_err(|e| service_failure(e, true))?;
+            .map_err(|e| service_failure(e, true, &self.ingress))?;
         match response {
-            CallToolResponse::Complete(result) => Ok(serde_json::to_value(result)?),
+            CallToolResponse::Complete(_) => {
+                observed_result(self.ingress.take(), Some("tools/call"), true)
+                    .map(|(_, value)| value)
+            }
             CallToolResponse::InputRequired(_) => Err(failure_with_outcome(
                 FailureKind::Protocol,
                 "The tool requires unsupported interactive input; side effects may have occurred, the call was not retried",
@@ -488,15 +605,31 @@ impl McpConnection {
     }
 }
 
-fn init_failure(error: rmcp::service::ClientInitializeError) -> anyhow::Error {
+fn init_failure(error: rmcp::service::ClientInitializeError, ingress: &Ingress) -> anyhow::Error {
     use rmcp::service::ClientInitializeError as E;
     match error {
-        E::JsonRpcError(e) => failure(
-            FailureKind::Protocol,
+        E::JsonRpcError(e) => rpc_failure(
+            e.code.0,
             format!("MCP initialization error {}: {}", e.code.0, e.message),
+            false,
+            ingress,
         ),
         E::NoCompatibleProtocolVersion { .. } => {
-            failure(FailureKind::Protocol, "No compatible MCP protocol version")
+            let (rpc_error, rejected) = match ingress.take() {
+                Some((_, Ok(mut response))) => (response.get_mut("error").map(Value::take), false),
+                Some((_, Err(_))) => (None, true),
+                None => (None, false),
+            };
+            McpFailure {
+                kind: FailureKind::Protocol,
+                message: if rejected {
+                    "No compatible MCP protocol version; response JSON could not be represented losslessly"
+                } else {
+                    "No compatible MCP protocol version"
+                }.into(),
+                outcome_unknown: false,
+                rpc_error,
+            }.into()
         }
         // HTTP transport errors can contain URLs or response bodies. Do not leak them.
         _ => failure(
@@ -516,7 +649,8 @@ fn has_media_type(content_type: &str, expected: &str) -> bool {
 
 /// Own the child throughout shutdown, including cancellation of the close future.
 struct ChildTransport {
-    io: AsyncRwTransport<RoleClient, ChildStdout, ChildStdin>,
+    io: AsyncRwTransport<RoleClient, ObservedRead<ChildStdout>, ChildStdin>,
+    ingress: Ingress,
     child: Option<Child>,
     #[cfg(unix)]
     group: Option<i32>,
@@ -526,7 +660,16 @@ struct ChildTransport {
 }
 
 impl ChildTransport {
-    fn spawn(mut command: Command, cleanup: CleanupState) -> std::io::Result<Self> {
+    #[cfg(test)]
+    fn spawn(command: Command, cleanup: CleanupState) -> std::io::Result<Self> {
+        Self::spawn_observed(command, cleanup, Ingress::default())
+    }
+
+    fn spawn_observed(
+        mut command: Command,
+        cleanup: CleanupState,
+        ingress: Ingress,
+    ) -> std::io::Result<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -597,7 +740,8 @@ impl ChildTransport {
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
         Ok(Self {
-            io: AsyncRwTransport::new(stdout, stdin),
+            io: AsyncRwTransport::new(ObservedRead::new(stdout, ingress.clone()), stdin),
+            ingress,
             child: Some(child),
             #[cfg(unix)]
             group,
@@ -750,6 +894,7 @@ impl Transport<RoleClient> for ChildTransport {
         &mut self,
         item: ClientJsonRpcMessage,
     ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+        self.ingress.track(&item);
         self.io.send(item)
     }
     fn receive(&mut self) -> impl Future<Output = Option<ServerJsonRpcMessage>> + Send {
@@ -776,10 +921,26 @@ impl Transport<RoleClient> for ChildTransport {
 struct BoundedHttp {
     client: reqwest::Client,
     cleanup: CleanupState,
+    ingress: Ingress,
 }
 type HttpError = StreamableHttpError<reqwest::Error>;
 
 impl BoundedHttp {
+    fn observe_sse(
+        &self,
+        stream: BoxStream<'static, Result<Sse, SseError>>,
+    ) -> BoxStream<'static, Result<Sse, SseError>> {
+        let ingress = self.ingress.clone();
+        stream
+            .map(move |event| {
+                if let Ok(sse) = &event {
+                    ingress.observe_sse(sse);
+                }
+                event
+            })
+            .boxed()
+    }
+
     async fn bounded_body(
         mut response: reqwest::Response,
         limit: usize,
@@ -817,6 +978,7 @@ impl BoundedHttp {
         headers: HashMap<HeaderName, HeaderValue>,
         limit: usize,
     ) -> Result<StreamableHttpPostResponse, HttpError> {
+        self.ingress.track(&message);
         let had_session = session_id.is_some();
         let mut request = self
             .client
@@ -889,7 +1051,7 @@ impl BoundedHttp {
                     std::future::ready(output)
                 });
             return Ok(StreamableHttpPostResponse::Sse(
-                SseStream::from_bytes_stream(stream).boxed(),
+                self.observe_sse(SseStream::from_bytes_stream(stream).boxed()),
                 session,
             ));
         }
@@ -932,18 +1094,27 @@ impl BoundedHttp {
                 }
             };
             if let Some(request_id) = discover_request_id {
-                let error = match serde_json::from_slice::<ServerJsonRpcMessage>(&body) {
-                    Ok(ServerJsonRpcMessage::Error(error)) => error.error,
-                    _ => ErrorData::invalid_request("server/discover is unavailable", None),
-                };
+                if is_json
+                    && let Ok(message @ ServerJsonRpcMessage::Error(_)) =
+                        serde_json::from_slice::<ServerJsonRpcMessage>(&body)
+                    && let ServerJsonRpcMessage::Error(ref error) = message
+                    && error.id.as_ref() == Some(&request_id)
+                {
+                    self.ingress.observe(&body);
+                    return Ok(StreamableHttpPostResponse::Json(message, None));
+                }
                 return Ok(StreamableHttpPostResponse::Json(
-                    ServerJsonRpcMessage::error(error, Some(request_id)),
+                    ServerJsonRpcMessage::error(
+                        ErrorData::invalid_request("server/discover is unavailable", None),
+                        Some(request_id),
+                    ),
                     None,
                 ));
             }
             if is_json
                 && let Ok(message @ ServerJsonRpcMessage::Error(_)) = serde_json::from_slice(&body)
             {
+                self.ingress.observe(&body);
                 return Ok(StreamableHttpPostResponse::Json(message, session));
             }
             return Err(HttpError::HttpStatus(HttpStatusError::new(
@@ -959,7 +1130,10 @@ impl BoundedHttp {
             return Err(HttpError::UnexpectedContentType(None));
         }
         match serde_json::from_slice(&body) {
-            Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session)),
+            Ok(message) => {
+                self.ingress.observe(&body);
+                Ok(StreamableHttpPostResponse::Json(message, session))
+            }
             Err(_) if notification => Ok(StreamableHttpPostResponse::Accepted),
             Err(_) => Err(HttpError::UnexpectedServerResponse(Cow::Borrowed(
                 "Invalid JSON-RPC response",
@@ -1077,7 +1251,7 @@ impl StreamableHttpClient for BoundedHttp {
         if !has_media_type(content_type, "text/event-stream") {
             return Err(HttpError::UnexpectedContentType(None));
         }
-        Ok(sse::bounded_stream(response, limit.min(MAX_RESPONSE_BYTES)))
+        Ok(self.observe_sse(sse::bounded_stream(response, limit.min(MAX_RESPONSE_BYTES))))
     }
 
     async fn delete_session(
@@ -1237,5 +1411,37 @@ mod http_tests {
             "text/event-stream-INVALID",
             "text/event-stream"
         ));
+    }
+}
+
+#[cfg(test)]
+mod rpc_fidelity_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_error_fidelity_and_non_lossy_rejection() {
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().unwrap();
+        assert!(ingress.capture().is_none());
+        let request = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0","id":17,"method":"tools/list"
+        }))
+        .unwrap();
+        ingress.track(&request);
+        ingress.observe(br#"{"jsonrpc":"2.0","id":17,"error":{"code":-32603,"message":"failed","data":null,"x-extra":7}}"#);
+        let error = rpc_failure(-32603, "diagnostic".into(), true, &ingress);
+        let failure = error.downcast_ref::<McpFailure>().unwrap();
+        let raw = failure.rpc_error.as_ref().unwrap();
+        assert_eq!(raw.get("data"), Some(&Value::Null));
+        assert_eq!(raw["x-extra"], 7);
+        assert!(failure.outcome_unknown);
+
+        ingress.track(&request);
+        ingress.observe(br#"{"jsonrpc":"2.0","id":17,"error":{"code":-32603,"message":"failed","data":{"x":1,"x":2}}}"#);
+        let error = rpc_failure(-32603, "diagnostic".into(), false, &ingress);
+        let failure = error.downcast_ref::<McpFailure>().unwrap();
+        assert!(failure.rpc_error.is_none());
+        assert!(failure.message.contains("cannot be represented losslessly"));
+        assert!(!failure.outcome_unknown);
     }
 }

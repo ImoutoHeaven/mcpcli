@@ -25,6 +25,9 @@ pub struct Request {
 pub enum Operation {
     Status,
     Stop,
+    Server {
+        server: String,
+    },
     Tools {
         server: String,
     },
@@ -55,6 +58,8 @@ pub struct Failure {
     pub message: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outcome_unknown: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_error: Option<Value>,
 }
 impl Failure {
     pub fn new(code: i32, kind: &str, message: impl Into<String>) -> Self {
@@ -63,6 +68,7 @@ impl Failure {
             kind: kind.into(),
             message: message.into(),
             outcome_unknown: false,
+            rpc_error: None,
         }
     }
     pub fn uncertain(mut self, uncertain: bool) -> Self {

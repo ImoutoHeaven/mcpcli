@@ -47,7 +47,10 @@ pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
             FailureKind::Protocol => (4, "mcp_protocol"),
             FailureKind::Transport => (4, "mcp_transport"),
         };
-        Failure::new(code, kind, error.message.clone()).uncertain(error.outcome_unknown)
+        let mut failure =
+            Failure::new(code, kind, error.message.clone()).uncertain(error.outcome_unknown);
+        failure.rpc_error = error.rpc_error.clone();
+        failure
     } else {
         Failure::new(4, "mcp_error", "MCP operation failed").uncertain(calling)
     }
@@ -140,7 +143,8 @@ impl App {
         let server = match operation {
             Operation::Status => return Ok(self.status()),
             Operation::Stop => return Ok(json!({"stopping":true})),
-            Operation::Tools { server }
+            Operation::Server { server }
+            | Operation::Tools { server }
             | Operation::Call { server, .. }
             | Operation::Reset { server, .. } => server,
         };
@@ -245,10 +249,11 @@ impl App {
             .as_ref()
             .expect("connection was established");
         let result = match operation {
+            Operation::Server { .. } => connection.server_info(),
             Operation::Tools { .. } => connection
-                .list_tools(budget)
+                .list_tool_pages(budget)
                 .await
-                .map(|tools| json!(tools)),
+                .map(|pages| json!({"pages": pages})),
             Operation::Call {
                 tool, arguments, ..
             } => {
@@ -265,7 +270,12 @@ impl App {
     }
 }
 
-async fn send(stream: &mut Conn, app: &App, result: std::result::Result<Value, Failure>) {
+async fn send(
+    stream: &mut Conn,
+    app: &App,
+    result: std::result::Result<Value, Failure>,
+    dispatched: bool,
+) {
     let response = app.response(result);
     let write = async {
         if let Err(error) = ipc::write_frame(stream, &response, ipc::RESPONSE_LIMIT).await
@@ -276,7 +286,7 @@ async fn send(stream: &mut Conn, app: &App, result: std::result::Result<Value, F
                 "result_too_large",
                 "result exceeds the 32 MiB IPC output limit; the operation is not replayed",
             )
-            .uncertain(true)));
+            .uncertain(dispatched)));
             let _ = ipc::write_frame(stream, &fallback, ipc::RESPONSE_LIMIT).await;
         }
     };
@@ -305,12 +315,13 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 "control_only",
                 "control endpoint only accepts status and stop",
             )),
+            false,
         )
         .await;
         return;
     }
     if let Err(error) = app.validate(&request) {
-        send(&mut stream, &app, Err(error)).await;
+        send(&mut stream, &app, Err(error), false).await;
         return;
     }
     let remaining = match platform::monotonic_millis() {
@@ -329,12 +340,13 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 "timeout",
                 "request expired before admission",
             )),
+            false,
         )
         .await;
         return;
     }
     if matches!(request.operation, Operation::Stop) {
-        send(&mut stream, &app, Ok(json!({"stopping":true}))).await;
+        send(&mut stream, &app, Ok(json!({"stopping":true})), false).await;
         app.shutdown.cancel();
         return;
     }
@@ -357,7 +369,13 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 .uncertain(dispatched.load(Ordering::Acquire))),
         },
     };
-    send(&mut stream, &app, result).await;
+    send(
+        &mut stream,
+        &app,
+        result,
+        dispatched.load(Ordering::Acquire),
+    )
+    .await;
 }
 
 pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {

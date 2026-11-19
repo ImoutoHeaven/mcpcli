@@ -11,7 +11,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import raw_semantics
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--http", action="store_true")
@@ -24,6 +27,8 @@ write_lock = threading.Lock()
 state = {}
 unlocked = False
 get_replies = queue.Queue()
+session_replies = {}
+session_lock = threading.Lock()
 
 
 def record(value):
@@ -56,6 +61,23 @@ def dispatch(request):
     global unlocked
     method = request.get("method", "")
     record(method)
+    if args.mode in ("raw_semantics", "raw_post_sse", "raw_get_sse", "raw_crlf"):
+        if "id" not in request:
+            return None
+        if method == "server/discover":
+            return (result(request, raw_semantics.server_result(True)) if args.modern
+                    else error(request, -32601, "Legacy fixture"))
+        if method == "initialize":
+            return result(request, raw_semantics.server_result(False))
+        if method == "tools/list":
+            return result(request, raw_semantics.list_result(request.get("params", {}).get("cursor")))
+        if method == "tools/call":
+            name = request["params"]["name"]
+            if name.startswith("raw_error_"):
+                return {"jsonrpc": "2.0", "id": request["id"],
+                        "error": raw_semantics.rpc_error(name)}
+            return result(request, raw_semantics.call_result(name))
+        return error(request, -32601, "Method not found")
     if method == "server/discover":
         if args.mode == "hang_initialize":
             time.sleep(30)
@@ -118,8 +140,9 @@ def dispatch(request):
 
 def send(message):
     with write_lock:
-        sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-        sys.stdout.flush()
+        body = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        sys.stdout.buffer.write(body + (b"\r\n" if args.mode == "raw_crlf" else b"\n"))
+        sys.stdout.buffer.flush()
 
 
 if args.http:
@@ -142,7 +165,15 @@ if args.http:
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if args.mode in ("get_sse", "get_sse_mixed", "get_sse_invalid", "get_sse_oversize"):
+            if args.mode in ("get_sse", "get_sse_mixed", "get_sse_invalid", "get_sse_oversize", "raw_get_sse"):
+                replies = get_replies
+                session = self.headers.get("Mcp-Session-Id")
+                if args.mode == "raw_get_sse":
+                    with session_lock:
+                        replies = session_replies.get(session)
+                    if replies is None:
+                        self.empty(404)
+                        return
                 self.send_response(200)
                 content_type = {
                     "get_sse_mixed": "TEXT/EVENT-STREAM; charset=UTF-8",
@@ -153,7 +184,11 @@ if args.http:
                 self.end_headers()
                 try:
                     while True:
-                        response = get_replies.get(timeout=10)
+                        response = replies.get(timeout=10)
+                        if response is None:
+                            self.wfile.write(b"0\r\n\r\n")
+                            self.wfile.flush()
+                            return
                         body = b"data: " + json.dumps(response, separators=(",", ":")).encode() + b"\n\n"
                         if args.mode == "get_sse_oversize":
                             body = b"data: " + b"x" * (16 * 1024 * 1024 + 1) + b"\n\n"
@@ -161,12 +196,21 @@ if args.http:
                             chunk = body[offset:offset + 16384]
                             self.wfile.write(("%x\r\n" % len(chunk)).encode() + chunk + b"\r\n")
                             self.wfile.flush()
+                        if args.mode == "raw_get_sse":
+                            record("session:delivered " + session)
                 except (queue.Empty, BrokenPipeError, ConnectionResetError):
                     return
             self.empty(405)
 
         def do_DELETE(self):
             record("DELETE")
+            if args.mode == "raw_get_sse":
+                session = self.headers.get("Mcp-Session-Id")
+                with session_lock:
+                    replies = session_replies.pop(session, None)
+                if replies is not None:
+                    replies.put(None)
+                    record("session:closed " + session)
             if args.mode == "delete_hang":
                 time.sleep(30)
             if args.mode == "delete_redirect":
@@ -200,8 +244,15 @@ if args.http:
             response = dispatch(request)
             if request.get("method") == "tools/call" and args.mode in (
                     "get_sse", "get_sse_mixed", "get_sse_invalid", "get_sse_oversize",
-                    "get_auth_401", "get_auth_403"):
-                get_replies.put(response)
+                    "get_auth_401", "get_auth_403", "raw_get_sse"):
+                replies = get_replies
+                if args.mode == "raw_get_sse":
+                    with session_lock:
+                        replies = session_replies.get(self.headers.get("Mcp-Session-Id"))
+                    if replies is None:
+                        self.empty(404)
+                        return
+                replies.put(response)
                 self.empty(202)
                 return
             if response is None:
@@ -213,7 +264,7 @@ if args.http:
                 content_type = "Application/JSON; charset=UTF-8"
             elif args.mode == "jsonp_ct":
                 content_type = "application/jsonp; charset=utf-8"
-            elif args.mode in ("sse", "oversize_sse"):
+            elif args.mode in ("sse", "oversize_sse", "raw_post_sse"):
                 body = b"data: " + body + b"\n\n"
                 content_type = "text/event-stream"
             elif args.mode == "mixed_case_sse":
@@ -226,7 +277,13 @@ if args.http:
             else:
                 self.send_header("Content-Length", str(len(body)))
             if request.get("method") == "initialize":
-                self.send_header("Mcp-Session-Id", "fixture-session")
+                session = "fixture-session"
+                if args.mode == "raw_get_sse":
+                    session = uuid.uuid4().hex
+                    with session_lock:
+                        session_replies[session] = queue.Queue()
+                    record("session:opened " + session)
+                self.send_header("Mcp-Session-Id", session)
             self.end_headers()
             try:
                 if args.mode == "oversize_chunked":

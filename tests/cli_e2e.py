@@ -17,6 +17,8 @@ import threading
 import time
 import traceback
 
+from raw_output_acceptance import raw_semantic_disclosure
+
 from platform_support import IdleConnection, LINUX, WINDOWS, interrupt, kill_owned, readline_with_timeout, running, test_temp_base
 
 
@@ -94,11 +96,12 @@ class Fixture:
     def save_config(self):
         self.config.write_text(json.dumps(self.settings), encoding="utf-8")
 
-    def use_http(self, mode, tls=False):
+    def use_http(self, mode, tls=False, modern=False):
         script = self.script.with_name("protocol_server.py")
         log = self.root / f"http-{mode}.log"
         process = subprocess.Popen([sys.executable, str(script), "--http", "--mode", mode,
-                                    "--log", str(log), *(["--tls"] if tls else [])], env=self.env,
+                                    "--log", str(log), *(["--tls"] if tls else []),
+                                    *(["--modern"] if modern else [])], env=self.env,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.http_servers.append(process)
         port = int(readline_with_timeout(process.stdout, 5))
@@ -257,15 +260,16 @@ def offline_skills(f):
 
 
 def state_and_discovery(f):
-    tools = f.value("tools", "state")
-    assert all(set(tool) == {"name", "description"} for tool in tools)
+    listing = f.value("tools", "state")
+    tools = [tool for page in listing["pages"] for tool in page["tools"]]
+    assert tools and all({"name", "description", "inputSchema"} <= set(tool) for tool in tools)
     assert "admin" not in [tool["name"] for tool in tools]
     assert f.value("inspect", "state", "set")["inputSchema"]["type"] == "object"
     first = f.call("set", {"stage": "canary"})["structuredContent"]
     second = f.call("get")["structuredContent"]
     assert first["pid"] == second["pid"] and second["state"]["stage"] == "canary"
     f.call("unlock")
-    assert "admin" in [tool["name"] for tool in f.value("tools", "state")]
+    assert "admin" in [tool["name"] for page in f.value("tools", "state")["pages"] for tool in page["tools"]]
     assert f.call("admin")["structuredContent"]["state"]["stage"] == "canary"
     one = f.value("--oneshot", "call", "state", "get")["structuredContent"]
     assert one["state"] == {} and one["pid"] != second["pid"]
@@ -889,7 +893,7 @@ def unprivileged_execute_only_ancestors(f):
 
 
 CASES = [
-    offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, session_and_restart,
+    raw_semantic_disclosure, offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, session_and_restart,
     changed_and_deleted_config, simultaneous_startup, timeout_and_disconnect,
     interrupted_stdin, stdin_deadline, configuration_errors_redact_values,
     oneshot_signals_clean_process_group, saturated_control_channel,

@@ -83,7 +83,9 @@ enum Command {
     Agents,
     /// Search global AGENTS.md and configured server and skill metadata, offline.
     Search { query: String },
-    /// List current tool names and descriptions for a server.
+    /// Read live server information, capabilities, and instructions.
+    Server { server: String },
+    /// List current tool definitions for a server.
     Tools { server: String },
     /// Read complete tool metadata and JSON schemas.
     Inspect { server: String, tool: String },
@@ -184,7 +186,9 @@ impl Output {
             if let Some(original) = &mut self.diagnostic {
                 original.message = format!("{}; additionally: {}", original.message, error.message);
             } else {
-                self.code = error.code;
+                if self.code == 0 {
+                    self.code = error.code;
+                }
                 self.diagnostic = Some(error);
             }
         }
@@ -340,7 +344,8 @@ async fn remote(
     uncertain: &AtomicBool,
 ) -> Result<RemoteOutput> {
     let server = match &operation {
-        Operation::Tools { server }
+        Operation::Server { server }
+        | Operation::Tools { server }
         | Operation::Call { server, .. }
         | Operation::Reset { server, .. } => server,
         _ => unreachable!(),
@@ -363,10 +368,11 @@ async fn remote(
                     .map_err(|error| daemon::mcp_error(error, false))?;
             let remaining = budget.saturating_sub(started.elapsed());
             let result = match &operation {
+                Operation::Server { .. } => connection.server_info(),
                 Operation::Tools { .. } => connection
-                    .list_tools(remaining)
+                    .list_tool_pages(remaining)
                     .await
-                    .map(|tools| json!(tools)),
+                    .map(|pages| json!({"pages": pages})),
                 Operation::Call {
                     tool, arguments, ..
                 } => {
@@ -441,6 +447,50 @@ async fn remote(
         })?
 }
 
+fn server_text(value: &Value) -> Result<String> {
+    let mut metadata = value
+        .as_object()
+        .context("invalid server information")?
+        .clone();
+    let result = metadata
+        .get_mut("result")
+        .and_then(Value::as_object_mut)
+        .context("invalid MCP server result")?;
+    let instructions = result.remove("instructions");
+    let mut text = serde_json::to_string_pretty(&metadata)?;
+    if let Some(instructions) = instructions.as_ref().and_then(Value::as_str) {
+        text.push_str("\n\nInstructions:\n");
+        text.push_str(instructions);
+    }
+    Ok(text)
+}
+
+fn listed_tools(value: &Value) -> Result<impl Iterator<Item = &Value>> {
+    let pages = value["pages"]
+        .as_array()
+        .context("invalid tool list pages")?;
+    anyhow::ensure!(
+        pages.iter().all(|page| page["tools"].is_array()),
+        "invalid tool list page"
+    );
+    Ok(pages
+        .iter()
+        .flat_map(|page| page["tools"].as_array().unwrap()))
+}
+
+fn tools_text(value: &Value) -> Result<String> {
+    Ok(listed_tools(value)?
+        .map(|tool| {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            match tool["description"].as_str() {
+                Some(description) if !description.is_empty() => format!("{name}\n{description}"),
+                _ => name.to_owned(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
 fn tool_text(result: &Value) -> String {
     let mut texts = Vec::new();
     let mut omitted = 0;
@@ -450,7 +500,7 @@ fn tool_text(result: &Value) -> String {
                 if let Some(text) = block["text"].as_str()
                     && !text.is_empty()
                 {
-                    texts.push(safe_text(text));
+                    texts.push(text.to_owned());
                 }
             } else {
                 omitted += 1;
@@ -557,6 +607,27 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             }
             catalog(&loaded, Some(query))
         }
+        Command::Server { server } => {
+            let remote = remote(
+                cli,
+                &loaded,
+                Operation::Server {
+                    server: server.clone(),
+                },
+                uncertain,
+            )
+            .await?;
+            Ok(remote.into_output(|value| {
+                let text = if cli.text {
+                    Some(server_text(&value)?)
+                } else {
+                    None
+                };
+                let mut output = Output::json(value);
+                output.text = text;
+                Ok(output)
+            }))
+        }
         Command::Tools { server } => {
             let remote = remote(
                 cli,
@@ -568,16 +639,14 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             )
             .await?;
             Ok(remote.into_output(|value| {
-                let list = value.as_array().context("invalid tool list")?;
-                let compact: Vec<_> = list.iter().map(|tool| json!({
-                    "name":tool["name"],"description":brief(tool["description"].as_str().unwrap_or(""))
-                })).collect();
-                let text = list
-                    .iter()
-                    .map(discovery::tool_summary)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                Ok(Output::with_text(json!(compact), text))
+                let text = if cli.text {
+                    Some(tools_text(&value)?)
+                } else {
+                    None
+                };
+                let mut output = Output::json(value);
+                output.text = text;
+                Ok(output)
             }))
         }
         Command::Inspect { server, tool } => {
@@ -591,10 +660,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             )
             .await?;
             Ok(remote.into_output(|value| {
-                let found = value
-                    .as_array()
-                    .context("invalid tool list")?
-                    .iter()
+                let found = listed_tools(&value)?
                     .find(|t| t["name"].as_str() == Some(tool))
                     .ok_or_else(|| usage("unknown_tool", format!("unknown tool {tool:?}")))?;
                 Ok(Output::with_text(
@@ -725,6 +791,18 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     }
 }
 
+/// Terminal boundary for all text-mode stdout, including upstream MCP text.
+fn write_text(stdout: &mut impl Write, text: &str) -> std::io::Result<()> {
+    let rendered = safe_text(text);
+    if rendered.is_empty() {
+        Ok(())
+    } else if rendered.ends_with('\n') {
+        stdout.write_all(rendered.as_bytes())
+    } else {
+        writeln!(stdout, "{rendered}")
+    }
+}
+
 async fn entry(cli: Cli) -> i32 {
     let foreground = matches!(
         cli.command,
@@ -776,14 +854,7 @@ async fn entry(cli: Cli) -> i32 {
         let text = output
             .text
             .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap());
-        let rendered = safe_text(&text);
-        if rendered.is_empty() {
-            Ok(())
-        } else if rendered.ends_with('\n') {
-            stdout.write_all(rendered.as_bytes())
-        } else {
-            writeln!(stdout, "{rendered}")
-        }
+        write_text(&mut stdout, &text)
     } else {
         serde_json::to_writer(&mut stdout, &value)
             .map_err(std::io::Error::other)
@@ -791,7 +862,7 @@ async fn entry(cli: Cli) -> i32 {
     };
     if let Err(error) = written {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
-            eprintln!("mcpcli: stdout failed: {error}");
+            eprintln!("mcpcli: stdout failed: {}", safe_text(&error.to_string()));
         }
         1
     } else {
@@ -829,7 +900,10 @@ fn main() -> std::process::ExitCode {
                 if let Err(io_error) = written
                     && io_error.kind() != std::io::ErrorKind::BrokenPipe
                 {
-                    eprintln!("mcpcli: stdout failed: {io_error}");
+                    eprintln!(
+                        "mcpcli: stdout failed: {}",
+                        safe_text(&io_error.to_string())
+                    );
                     return std::process::ExitCode::FAILURE;
                 }
             }
@@ -875,6 +949,70 @@ mod tests {
             tool_text(&json!({"content": [{"type": "text", "text": " \n"}]})),
             " \n"
         );
+    }
+
+    #[test]
+    fn server_text_preserves_full_instruction_body() {
+        let value = json!({
+            "source":"initialize",
+            "protocolVersion":"2025-11-25",
+            "result":{
+                "serverInfo":{"name":"sample","version":"1.0"},
+                "capabilities":{"tools":{}},
+                "instructions":"    first line\nsecond line  \n\n"
+            }
+        });
+        let rendered = server_text(&value).unwrap();
+        assert!(rendered.contains("\"capabilities\""));
+        assert!(rendered.ends_with("\n\nInstructions:\n    first line\nsecond line  \n\n"));
+        assert_eq!(
+            value["result"]["instructions"],
+            "    first line\nsecond line  \n\n"
+        );
+    }
+
+    #[test]
+    fn tools_text_keeps_multiline_and_long_descriptions() {
+        let description = format!("    first\n{}  ", "x".repeat(300));
+        let tools = json!({"pages":[{"tools":[{"name":"sample","description":description,"inputSchema":{}}]}]});
+        let rendered = tools_text(&tools).unwrap();
+        assert_eq!(rendered, format!("sample\n{description}"));
+    }
+
+    #[test]
+    fn text_stdout_sanitizes_server_tools_and_call_results_without_changing_json() {
+        let raw = " \tindented  \nnext\r\nbare\r\u{1b}\u{9b}\u{0}  \n\n";
+        let server = json!({"result":{"instructions":raw}});
+        let tools = json!({"pages":[{"tools":[{"name":"sample","description":raw}]}]});
+        let call = json!({"content":[{"type":"text","text":raw}]});
+        for rendered in [
+            server_text(&server).unwrap(),
+            tools_text(&tools).unwrap(),
+            tool_text(&call),
+        ] {
+            let mut bytes = Vec::new();
+            write_text(&mut bytes, &rendered).unwrap();
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.ends_with(" \tindented  \nnext\nbare\\r\\u{1b}\\u{9b}\\u{0}  \n\n"));
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
+            );
+        }
+        assert_eq!(server["result"]["instructions"], raw);
+        assert_eq!(tools["pages"][0]["tools"][0]["description"], raw);
+        assert_eq!(call["content"][0]["text"], raw);
+    }
+
+    #[test]
+    fn cleanup_failure_does_not_replace_known_tool_error_exit() {
+        let mut output = Output::json(json!({"isError":true}));
+        output.code = 3;
+        let output = output.cleanup(Some(Failure::new(1, "cleanup", "cleanup failed")));
+        assert_eq!(output.code, 3);
+        assert_eq!(output.value, Some(json!({"isError":true})));
+        assert_eq!(output.diagnostic.unwrap().kind, "cleanup");
     }
 
     #[test]

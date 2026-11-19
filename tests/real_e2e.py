@@ -346,7 +346,8 @@ class Acceptance:
         return status
 
     def check_fastexec(self):
-        tools = self.command("tools", "fastexec")
+        tools = [tool for page in self.command("tools", "fastexec")["pages"]
+                 for tool in page["tools"]]
         require({"exec", "read", "write", "edit"} <= {tool["name"] for tool in tools},
                 "fastexec tool catalog is incomplete")
         schema = self.command("inspect", "fastexec", "exec")
@@ -387,7 +388,8 @@ class Acceptance:
         self.passed("real tool isError uses exit 3 and retains MCP result")
 
     def browser_counter(self, server, session):
-        names = {item["name"] for item in self.command("tools", server, session=session)}
+        names = {item["name"] for page in self.command("tools", server, session=session)["pages"]
+                 for item in page["tools"]}
         require({"browser_navigate", "browser_snapshot", "browser_click",
                  "browser_take_screenshot"} <= names, "Playwright catalog incomplete")
         self.call(server, "browser_navigate", {"url": self.page_url}, session=session)
