@@ -305,11 +305,24 @@ def json_inputs_and_outputs(f):
     failure = f.value("call", "state", "error", "--args", '{"failure":"expected"}', code=3)
     assert failure["isError"] is True and failure["structuredContent"]["failure"] == "expected"
     mixed = f.call("mixed", {"ok": True})
-    assert mixed["content"][1]["data"] == "AQID"
+    assert "data" not in mixed["content"][1]
     assert mixed["_meta"]["fixture"] == "cli-acceptance"
+    assert len(mixed["savedMedia"]) == 1
+    saved = mixed["savedMedia"][0]
+    assert saved["contentIndex"] == 1 and saved["kind"] == "image"
+    assert saved["mimeType"] == "image/png" and saved["bytes"] == 3
+    saved_file = Path(saved["savedPath"])
+    assert saved_file.suffix == ".png" and saved_file.read_bytes() == b"\x01\x02\x03"
+    mixed_inline = f.value("call", "state", "mixed", "--inline-media", "--args", '{"ok":true}')
+    assert mixed_inline["content"][1]["data"] == "AQID" and "savedMedia" not in mixed_inline
     text = f.invoke("--text", "call", "state", "mixed", "--args", '{"ok":true}')
-    assert "non-text" in text.stderr and "structuredContent" in text.stderr
-    assert json.loads(text.stdout) == {"ok": True}
+    assert "non-text" not in text.stderr and "structuredContent" in text.stderr
+    text_lines = text.stdout.strip().splitlines()
+    assert len(text_lines) == 2 and json.loads(text_lines[0]) == {"ok": True}
+    assert text_lines[1].startswith("Saved image [image/png] (3 B): ")
+    text_inline = f.invoke("--text", "call", "state", "mixed", "--inline-media", "--args", '{"ok":true}')
+    assert "non-text" in text_inline.stderr and "structuredContent" in text_inline.stderr
+    assert json.loads(text_inline.stdout) == {"ok": True}
 
 
 def session_and_restart(f):
@@ -892,8 +905,66 @@ def unprivileged_execute_only_ancestors(f):
         shutil.rmtree(outer, ignore_errors=True)
 
 
+def multimodal_media_and_inline_flag(f):
+    for flags in ([], ["--oneshot"]):
+        out = f.value(*flags, "call", "state", "multimodal")
+        assert out["_meta"] == {"explicitNull": None}
+        assert out["content"][0] == {"type": "text", "text": "intro", "x-extra": None}
+        assert "data" not in out["content"][1] and out["content"][1]["_meta"] == {"i": 1}
+        assert "data" not in out["content"][2]
+        assert "blob" not in out["content"][3]["resource"]
+        assert out["content"][4]["resource"]["text"] == "keep-text"
+        assert "blob" not in out["content"][5]["resource"]
+        saved = out["savedMedia"]
+        assert [item["contentIndex"] for item in saved] == [1, 2, 3, 5]
+        assert [item["kind"] for item in saved] == ["image", "audio", "resource", "resource"]
+        expected = [
+            (".png", "image/png", b"\x01\x02\x03"),
+            (".m4a", "audio/mp4", b"\x04\x05\x06\x07"),
+            (".mp4", "video/mp4", b"\x09\x0a\x0b\x0c"),
+            (".bin", "application/x-unknown-thing", b"\x0d\x0e"),
+        ]
+        for item, (ext, mime, raw_bytes) in zip(saved, expected):
+            p = Path(item["savedPath"])
+            assert "evil" not in str(p) and "name.jpg" not in p.name
+            assert p.suffix == ext and item["mimeType"] == mime and item["bytes"] == len(raw_bytes)
+            assert p.read_bytes() == raw_bytes
+
+    inline = f.value("call", "state", "multimodal", "--inline-media")
+    assert inline["savedMedia"] == [{"forged": True}]
+    assert inline["content"][1]["data"] == "AQID"
+    assert inline["content"][3]["resource"]["blob"] == "CQoLDA=="
+
+    forged = f.value("call", "state", "multimodal", "--args", '{"mode":"forged_only"}')
+    assert "savedMedia" not in forged and forged["content"] == [{"type": "text", "text": "plain"}]
+
+    media_dir = f.runtime / "media"
+    before_files = {p.name for p in media_dir.iterdir() if not p.name.startswith(".")}
+    bad = f.fail("call", "state", "multimodal", "--args", '{"mode":"bad_base64"}', code=4)
+    assert bad["kind"] == "mcp_protocol"
+    after_files = {p.name for p in media_dir.iterdir() if not p.name.startswith(".")}
+    assert after_files == before_files, f"failed batch leaked media files: {after_files - before_files}"
+
+    if not WINDOWS:
+        xdg_cache = f.root / "xdg-cache"
+        long_rt = f.root / ("long-rt-" + "x" * 160)
+        long_rt.mkdir(parents=True)
+        long_rt.chmod(0o700)
+        env = dict(f.env, XDG_CACHE_HOME=str(xdg_cache), XDG_RUNTIME_DIR=str(long_rt))
+        env.pop("MCPCLI_RUNTIME_DIR", None)
+        res = subprocess.run(
+            [str(f.binary), "--config", str(f.config), "--oneshot", "call", "state", "mixed", "--args", '{"ok":true}'],
+            env=env, text=True, encoding="utf-8", capture_output=True, timeout=15,
+        )
+        assert res.returncode == 0, res.stderr
+        parsed = json.loads(res.stdout)
+        saved_xdg = Path(parsed["savedMedia"][0]["savedPath"])
+        assert saved_xdg.parent.samefile(xdg_cache / "mcpcli" / "media")
+        assert saved_xdg.read_bytes() == b"\x01\x02\x03"
+
+
 CASES = [
-    raw_semantic_disclosure, offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, session_and_restart,
+    raw_semantic_disclosure, offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, multimodal_media_and_inline_flag, session_and_restart,
     changed_and_deleted_config, simultaneous_startup, timeout_and_disconnect,
     interrupted_stdin, stdin_deadline, configuration_errors_redact_values,
     oneshot_signals_clean_process_group, saturated_control_channel,

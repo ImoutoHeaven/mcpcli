@@ -291,10 +291,12 @@ mod tests {
             digest: "test".into(),
             timeout_ms: 1000,
             deadline_ms: 1000,
+            explicit_deadline_ms: None,
             operation: crate::ipc::Operation::Call {
                 server: "server".into(),
                 tool: "echo".into(),
                 arguments: arguments.clone(),
+                inline_media: false,
             },
         };
         let wire = serde_json::to_vec(&request).unwrap();
@@ -333,10 +335,12 @@ mod tests {
                 digest: "test".into(),
                 timeout_ms: 1000,
                 deadline_ms: 1000,
+                explicit_deadline_ms: None,
                 operation: crate::ipc::Operation::Call {
                     server: "server".into(),
                     tool: "echo".into(),
                     arguments: Map::from_iter([("value".into(), value.clone())]),
+                    inline_media: false,
                 },
             };
             let received: crate::ipc::Request =

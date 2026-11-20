@@ -8,7 +8,7 @@ use std::{
 
 use mcpcli::{
     config::ServerConfig,
-    mcp::{FailureKind, McpConnection, McpFailure},
+    mcp::{FailureKind, McpConnection, McpFailure, McpLimits},
 };
 use serde_json::{Map, json};
 use tempfile::TempDir;
@@ -354,12 +354,20 @@ async fn http_rejects_oversize_json_and_reserved_header_overrides() {
     for mode in ["oversize", "oversize_chunked", "oversize_sse"] {
         let mut fixture = Fixture::new();
         let config = fixture.http(true, mode);
-        let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
+        let limits = McpLimits {
+            max_response_bytes: 65_536,
+            ..McpLimits::default()
+        };
+        let mut connection = McpConnection::connect_with_limits(&config, BUDGET, limits)
+            .await
+            .unwrap();
         let error = connection
             .call("get", Map::new(), BUDGET)
             .await
             .unwrap_err();
         assert_eq!(kind(&error), FailureKind::Transport, "{mode}: {error}");
+        assert!(error.to_string().contains("exceeds the"), "{mode}: {error}");
+        assert_eq!(fixture.count("tools/call"), 1);
         connection.close().await.unwrap();
     }
     for header in ["Mcp-Session-Id", "Last-Event-Id"] {
@@ -582,11 +590,22 @@ async fn get_sse_responses_validate_exact_media_types_and_bound_events() {
         if let ServerConfig::Http { url, .. } = &mut config {
             url.push_str("?token=secret-query-do-not-print");
         }
-        let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
+        let limits = McpLimits {
+            max_response_bytes: 65_536,
+            ..McpLimits::default()
+        };
+        let mut connection = McpConnection::connect_with_limits(&config, BUDGET, limits)
+            .await
+            .unwrap();
         let error = connection
             .call("get", Map::new(), Duration::from_millis(800))
             .await
             .expect_err("invalid or oversized GET stream must not deliver a result");
+        if mode == "get_sse_oversize" {
+            assert_eq!(kind(&error), FailureKind::Transport, "{mode}: {error}");
+            assert!(error.to_string().contains("SSE event exceeds"), "{error}");
+            assert_eq!(fixture.count("GET"), 1, "oversize GET stream reconnected");
+        }
         assert!(
             !format!("{error:?}").contains("secret"),
             "{mode}: {error:?}"

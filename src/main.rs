@@ -2,16 +2,19 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpcli::{
     agents,
+    budget::ByteBudget,
     config::{self, LoadedConfig},
     daemon,
     discovery::{self, safe_text},
     ipc::{self, Failure, Operation},
     json as input,
     mcp::McpConnection,
+    media::{InflightBatch, MediaStore},
     runtime::{self, Paths},
     skills,
 };
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -36,8 +39,13 @@ struct Cli {
     config: PathBuf,
     #[arg(long, global = true, env = "MCPCLI_SESSION", default_value = "default")]
     session: String,
-    #[arg(long, global = true, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600), help = "Request deadline in seconds, including queue and connection time")]
-    timeout: u64,
+    #[arg(
+        long,
+        global = true,
+        value_parser = clap::value_parser!(u64).range(1..=3600),
+        help = "Request deadline in seconds, including queue and connection time [default: 60]"
+    )]
+    timeout: Option<u64>,
     #[arg(
         long,
         global = true,
@@ -53,6 +61,17 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+
+impl Cli {
+    fn timeout_secs(&self) -> u64 {
+        self.timeout.unwrap_or(60)
+    }
+
+    fn has_explicit_timeout(&self) -> bool {
+        self.timeout.is_some()
+    }
+}
+
 #[allow(dead_code)]
 #[derive(Parser)]
 #[command(
@@ -75,6 +94,7 @@ struct TopLevelHelpProbe {
     #[arg(short = 'h', long = "help", action = clap::ArgAction::Count)]
     help: u8,
 }
+
 #[derive(Subcommand)]
 enum Command {
     /// Read global AGENTS.md, configured server descriptions, and skill metadata without starting servers.
@@ -99,6 +119,11 @@ enum Command {
         args_file: Option<PathBuf>,
         #[arg(long, conflicts_with_all = ["args", "args_file"])]
         stdin: bool,
+        #[arg(
+            long,
+            help = "Keep base64 media inline instead of saving to the local media cache"
+        )]
+        inline_media: bool,
     },
     /// Close a server connection and discard its session state.
     Reset {
@@ -121,6 +146,7 @@ enum Command {
         command: DaemonCommand,
     },
 }
+
 #[derive(Subcommand)]
 enum SkillCommand {
     List,
@@ -128,6 +154,7 @@ enum SkillCommand {
     Files { name: String },
     Read { name: String, path: PathBuf },
 }
+
 #[derive(Subcommand)]
 enum DaemonCommand {
     Start,
@@ -145,6 +172,8 @@ struct Output {
     code: i32,
     diagnostic: Option<Failure>,
     connection: Option<McpConnection>,
+    inflight: Option<InflightBatch>,
+    lease: Option<mcpcli::budget::ByteLease>,
 }
 impl Output {
     fn json(value: Value) -> Self {
@@ -154,6 +183,8 @@ impl Output {
             code: 0,
             diagnostic: None,
             connection: None,
+            inflight: None,
+            lease: None,
         }
     }
     fn with_text(value: Value, text: String) -> Self {
@@ -163,6 +194,8 @@ impl Output {
             code: 0,
             diagnostic: None,
             connection: None,
+            inflight: None,
+            lease: None,
         }
     }
     fn failure(error: anyhow::Error) -> Self {
@@ -175,10 +208,20 @@ impl Output {
             code: failure.code,
             diagnostic: Some(failure),
             connection: None,
+            inflight: None,
+            lease: None,
         }
     }
     fn with_connection(mut self, connection: Option<McpConnection>) -> Self {
         self.connection = connection;
+        self
+    }
+    fn with_inflight(mut self, inflight: Option<InflightBatch>) -> Self {
+        self.inflight = inflight;
+        self
+    }
+    fn with_lease(mut self, lease: Option<mcpcli::budget::ByteLease>) -> Self {
+        self.lease = lease;
         self
     }
     fn cleanup(mut self, error: Option<Failure>) -> Self {
@@ -195,17 +238,23 @@ impl Output {
         self
     }
 }
+
 struct RemoteOutput {
     value: Value,
     connection: Option<McpConnection>,
+    inflight: Option<InflightBatch>,
+    lease: Option<mcpcli::budget::ByteLease>,
 }
 impl RemoteOutput {
     fn into_output(self, render: impl FnOnce(Value) -> Result<Output>) -> Output {
         render(self.value)
             .unwrap_or_else(Output::failure)
             .with_connection(self.connection)
+            .with_inflight(self.inflight)
+            .with_lease(self.lease)
     }
 }
+
 fn usage(kind: &str, error: impl std::fmt::Display) -> anyhow::Error {
     Failure::new(2, kind, error.to_string()).into()
 }
@@ -337,6 +386,17 @@ async fn arguments(
         .ok_or_else(|| usage("arguments", "tool arguments must be a JSON object"))
 }
 
+async fn close_after_error(connection: &mut McpConnection, error: &mut anyhow::Error) {
+    if let Err(cleanup) = connection.close().await
+        && let Some(failure) = error.downcast_mut::<Failure>()
+    {
+        failure.message = format!(
+            "{}; additionally: connection cleanup failed: {cleanup}",
+            failure.message
+        );
+    }
+}
+
 async fn remote(
     cli: &Cli,
     loaded: &LoadedConfig,
@@ -355,10 +415,10 @@ async fn remote(
         .servers
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
-    let budget = Duration::from_secs(cli.timeout);
+    let budget = Duration::from_secs(cli.timeout_secs());
     let started = Instant::now();
-    let future = async {
-        if cli.oneshot {
+    if cli.oneshot {
+        let oneshot_fut = async {
             if matches!(operation, Operation::Reset { .. }) {
                 return Err(usage("mode", "reset cannot be used with --oneshot"));
             }
@@ -367,84 +427,110 @@ async fn remote(
                     .await
                     .map_err(|error| daemon::mcp_error(error, false))?;
             let remaining = budget.saturating_sub(started.elapsed());
-            let result = match &operation {
-                Operation::Server { .. } => connection.server_info(),
-                Operation::Tools { .. } => connection
-                    .list_tool_pages(remaining)
-                    .await
-                    .map(|pages| json!({"pages": pages})),
-                Operation::Call {
-                    tool, arguments, ..
-                } => {
-                    connection
-                        .call_with_dispatch(tool, arguments.clone(), remaining, uncertain)
+            let process_budget = ByteBudget::global();
+            let result: std::result::Result<(Value, mcpcli::budget::ByteLease), anyhow::Error> =
+                match &operation {
+                    Operation::Server { .. } => connection
+                        .server_info()
+                        .map(|v| (v, process_budget.empty_lease())),
+                    Operation::Tools { .. } => connection
+                        .list_tool_pages(remaining)
                         .await
+                        .map(|pages| (json!({"pages": pages}), process_budget.empty_lease())),
+                    Operation::Call {
+                        tool, arguments, ..
+                    } => {
+                        connection
+                            .call_with_dispatch_leased(
+                                tool,
+                                arguments.clone(),
+                                remaining,
+                                uncertain,
+                            )
+                            .await
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
-            }
-            .map_err(|error| {
-                anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
-            });
+                .map_err(|error| {
+                    anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
+                });
             match result {
-                Ok(value) => {
+                Ok((mut value, mut lease)) => {
                     uncertain.store(false, Ordering::Release);
+                    let inflight = match &operation {
+                        Operation::Call {
+                            inline_media: false,
+                            ..
+                        } => match MediaStore::default()
+                            .extract_and_save(&mut value, &mut lease, process_budget)
+                            .await
+                        {
+                            Ok(batch) => batch,
+                            Err(failure) => {
+                                drop(value);
+                                drop(lease);
+                                let mut error = anyhow::Error::from(failure);
+                                close_after_error(&mut connection, &mut error).await;
+                                return Err(error);
+                            }
+                        },
+                        _ => None,
+                    };
                     Ok(RemoteOutput {
                         value,
                         connection: Some(connection),
+                        inflight,
+                        lease: Some(lease),
                     })
                 }
                 Err(mut error) => {
-                    if let Err(cleanup) = connection.close().await
-                        && let Some(failure) = error.downcast_mut::<Failure>()
-                    {
-                        failure.message = format!(
-                            "{}; additionally: connection cleanup failed: {cleanup}",
-                            failure.message
-                        );
-                    }
+                    close_after_error(&mut connection, &mut error).await;
                     Err(error)
                 }
             }
-        } else {
-            let paths = Paths::new(loaded.path.clone(), &cli.session)?;
-            timeout(
-                budget.saturating_sub(started.elapsed()),
-                runtime::ensure(&paths, loaded, false),
-            )
+        };
+        return timeout(budget + Duration::from_secs(10), oneshot_fut)
             .await
             .map_err(|_| {
                 Failure::new(
                     5,
                     "timeout",
-                    "deadline elapsed while starting the daemon; tool was not dispatched",
+                    "request deadline exceeded; the call is not replayed",
                 )
-            })??;
-            let remaining = budget.saturating_sub(started.elapsed());
-            if remaining.is_zero() {
-                return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
-            }
-            let response = runtime::exchange_tracked(
-                &paths,
-                &paths.request(&loaded.digest, operation, remaining)?,
-                uncertain,
-            )
-            .await?;
-            Ok(RemoteOutput {
-                value: response.result.context("daemon did not return a result")?,
-                connection: None,
-            })
-        }
-    };
-    timeout(budget + Duration::from_secs(10), future)
-        .await
-        .map_err(|_| {
-            Failure::new(
-                5,
-                "timeout",
-                "request deadline exceeded; the call is not replayed",
-            )
-            .uncertain(uncertain.load(Ordering::Acquire))
-        })?
+                .uncertain(uncertain.load(Ordering::Acquire))
+            })?;
+    }
+
+    let paths = Paths::new(loaded.path.clone(), &cli.session)?;
+    timeout(
+        budget.saturating_sub(started.elapsed()),
+        runtime::ensure(&paths, loaded, false),
+    )
+    .await
+    .map_err(|_| {
+        Failure::new(
+            5,
+            "timeout",
+            "deadline elapsed while starting the daemon; tool was not dispatched",
+        )
+    })??;
+    let remaining = budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
+    }
+    let request = paths.request_with_explicit(
+        &loaded.digest,
+        operation,
+        remaining,
+        cli.has_explicit_timeout(),
+    )?;
+    let response = runtime::exchange_tracked(&paths, &request, uncertain).await?;
+    Ok(RemoteOutput {
+        value: response.result.context("daemon did not return a result")?,
+        connection: None,
+        inflight: None,
+        lease: None,
+    })
 }
 
 fn server_text(value: &Value) -> Result<String> {
@@ -491,17 +577,33 @@ fn tools_text(value: &Value) -> Result<String> {
         .join("\n\n"))
 }
 
-fn tool_text(result: &Value) -> String {
+fn tool_text(result: &Value, inline_media: bool) -> String {
+    let mut saved_by_index = BTreeMap::new();
+    if !inline_media && let Some(entries) = result.get("savedMedia").and_then(Value::as_array) {
+        for entry in entries {
+            if let Some(index) = entry.get("contentIndex").and_then(Value::as_u64) {
+                saved_by_index.insert(index as usize, entry);
+            }
+        }
+    }
     let mut texts = Vec::new();
     let mut omitted = 0;
     if let Some(content) = result.get("content").and_then(Value::as_array) {
-        for block in content {
+        for (index, block) in content.iter().enumerate() {
             if block["type"] == "text" {
                 if let Some(text) = block["text"].as_str()
                     && !text.is_empty()
                 {
                     texts.push(text.to_owned());
                 }
+            } else if let Some(saved) = saved_by_index.get(&index) {
+                let kind = saved["kind"].as_str().unwrap_or("media");
+                let mime = saved["mimeType"]
+                    .as_str()
+                    .unwrap_or("application/octet-stream");
+                let bytes = saved["bytes"].as_u64().unwrap_or(0);
+                let path = saved["savedPath"].as_str().unwrap_or("");
+                texts.push(format!("Saved {kind} [{mime}] ({bytes} B): {path}"));
             } else {
                 omitted += 1;
             }
@@ -675,11 +777,18 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             args,
             args_file,
             stdin,
+            inline_media,
         } => {
             if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
                 return Err(usage("tool", "invalid tool name"));
             }
-            let args = arguments(args, args_file, *stdin, Duration::from_secs(cli.timeout)).await?;
+            let args = arguments(
+                args,
+                args_file,
+                *stdin,
+                Duration::from_secs(cli.timeout_secs()),
+            )
+            .await?;
             let remote = remote(
                 cli,
                 &loaded,
@@ -687,6 +796,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     server: server.clone(),
                     tool: tool.clone(),
                     arguments: args,
+                    inline_media: *inline_media,
                 },
                 uncertain,
             )
@@ -697,7 +807,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 0
             };
             let text = if cli.text {
-                Some(tool_text(&remote.value))
+                Some(tool_text(&remote.value, *inline_media))
             } else {
                 None
             };
@@ -707,8 +817,12 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 code,
                 diagnostic: None,
                 connection: None,
+                inflight: None,
+                lease: None,
             }
-            .with_connection(remote.connection))
+            .with_connection(remote.connection)
+            .with_inflight(remote.inflight)
+            .with_lease(remote.lease))
         }
         Command::Reset { server, force } => {
             let remote = remote(
@@ -724,7 +838,10 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             if let Some(warning) = remote.value.get("cleanup_warning").and_then(Value::as_str) {
                 eprintln!("mcpcli: {}", safe_text(warning));
             }
-            Ok(Output::json(remote.value).with_connection(remote.connection))
+            Ok(Output::json(remote.value)
+                .with_connection(remote.connection)
+                .with_inflight(remote.inflight)
+                .with_lease(remote.lease))
         }
         Command::Skills { command } => {
             let catalog = skills::discover(&loaded.config.skills)
@@ -847,19 +964,35 @@ async fn entry(cli: Cli) -> i32 {
         let _ = writeln!(stderr);
     }
     let Some(value) = output.value else {
+        drop(output.lease.take());
+        if let Some(inflight) = output.inflight.take() {
+            inflight.abort().await;
+        }
         return output.code;
     };
-    let mut stdout = std::io::stdout().lock();
-    let written = if cli.text {
-        let text = output
-            .text
-            .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap());
-        write_text(&mut stdout, &text)
-    } else {
-        serde_json::to_writer(&mut stdout, &value)
-            .map_err(std::io::Error::other)
-            .and_then(|_| writeln!(stdout))
+    let written = {
+        let mut stdout = std::io::stdout().lock();
+        let res = if cli.text {
+            let text = output
+                .text
+                .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap());
+            write_text(&mut stdout, &text)
+        } else {
+            serde_json::to_writer(&mut stdout, &value)
+                .map_err(std::io::Error::other)
+                .and_then(|_| writeln!(stdout))
+        };
+        res.and_then(|()| stdout.flush())
     };
+    drop(value);
+    drop(output.lease.take());
+    if let Some(inflight) = output.inflight.take() {
+        if written.is_ok() {
+            inflight.complete().await;
+        } else {
+            inflight.abort().await;
+        }
+    }
     if let Err(error) = written {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
             eprintln!("mcpcli: stdout failed: {}", safe_text(&error.to_string()));
@@ -938,17 +1071,43 @@ mod tests {
             let mut result = json!({
                 "content": vec![json!({"type": "text", "text": ""}); count]
             });
-            assert_eq!(tool_text(&result), "");
+            assert_eq!(tool_text(&result, false), "");
             result["structuredContent"] = json!({"answer": 42});
             assert_eq!(
-                tool_text(&result),
+                tool_text(&result, false),
                 serde_json::to_string_pretty(&result["structuredContent"]).unwrap()
             );
         }
         assert_eq!(
-            tool_text(&json!({"content": [{"type": "text", "text": " \n"}]})),
+            tool_text(
+                &json!({"content": [{"type": "text", "text": " \n"}]}),
+                false
+            ),
             " \n"
         );
+    }
+
+    #[test]
+    fn tool_text_renders_saved_media_summary_and_ignores_remote_field_when_inline() {
+        let saved = json!({
+            "content": [
+                {"type": "text", "text": "Read video"},
+                {"type": "resource", "resource": {"uri": "file:///x.mp4", "mimeType": "video/mp4"}}
+            ],
+            "savedMedia": [{
+                "contentIndex": 1,
+                "kind": "resource",
+                "savedPath": "/tmp/media/abc.mp4",
+                "mimeType": "video/mp4",
+                "bytes": 1234
+            }]
+        });
+        assert_eq!(
+            tool_text(&saved, false),
+            "Read video\nSaved resource [video/mp4] (1234 B): /tmp/media/abc.mp4"
+        );
+        // When --inline-media is set, any remote savedMedia field is ignored.
+        assert_eq!(tool_text(&saved, true), "Read video");
     }
 
     #[test]
@@ -988,7 +1147,7 @@ mod tests {
         for rendered in [
             server_text(&server).unwrap(),
             tools_text(&tools).unwrap(),
-            tool_text(&call),
+            tool_text(&call, false),
         ] {
             let mut bytes = Vec::new();
             write_text(&mut bytes, &rendered).unwrap();
@@ -1019,5 +1178,16 @@ mod tests {
     fn cli_and_help_probe_definitions_are_consistent() {
         Cli::command().debug_assert();
         TopLevelHelpProbe::command().debug_assert();
+        let parsed =
+            Cli::try_parse_from(["mcpcli", "call", "srv", "tool", "--inline-media"]).unwrap();
+        assert!(!parsed.has_explicit_timeout());
+        assert_eq!(parsed.timeout_secs(), 60);
+        assert!(matches!(
+            parsed.command,
+            Command::Call {
+                inline_media: true,
+                ..
+            }
+        ));
     }
 }

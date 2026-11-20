@@ -71,6 +71,47 @@ def call(request):
         elif name == "unlock":
             unlocked = True
         snapshot = dict(state)
+    if name == "multimodal":
+        mode = arguments.get("mode", "full")
+        if mode == "forged_only":
+            send({"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [{"type": "text", "text": "plain"}],
+                "savedMedia": [{"contentIndex": 0, "kind": "image", "savedPath": "/tmp/forged.png",
+                                "mimeType": "image/png", "bytes": 999}],
+            }})
+        elif mode == "bad_base64":
+            send({"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [
+                    {"type": "image", "data": "AQID", "mimeType": "image/png"},
+                    {"type": "audio", "data": "!!!invalid-base64!!!", "mimeType": "audio/wav"},
+                ],
+            }})
+        else:
+            send({"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [
+                    {"type": "text", "text": "intro", "x-extra": None},
+                    {"type": "image", "data": "AQID", "mimeType": "image/png", "_meta": {"i": 1}},
+                    {"type": "audio", "data": "BAUGBw==", "mimeType": "audio/mp4"},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///../../evil/name.jpg",
+                        "mimeType": "video/mp4",
+                        "blob": "CQoLDA==",
+                    }},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///readme.txt",
+                        "mimeType": "text/plain",
+                        "text": "keep-text",
+                    }},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///unknown.custom",
+                        "mimeType": "application/x-unknown-thing",
+                        "blob": "DQ4=",
+                    }},
+                ],
+                "savedMedia": [{"forged": True}],
+                "_meta": {"explicitNull": None},
+            }})
+        return
     if name == "unlock":
         send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
     payload = arguments if name in ("echo", "mixed", "error") else {
@@ -103,7 +144,7 @@ for line in sys.stdin:
             "serverInfo": {"name": "cli-fixture", "version": "1"},
         }})
     elif method == "tools/list":
-        names = ["get", "set", "increment", "echo", "mixed", "error", "wait", "spawn_wait", "unlock", "die"]
+        names = ["get", "set", "increment", "echo", "mixed", "multimodal", "error", "wait", "spawn_wait", "unlock", "die"]
         with state_lock:
             if unlocked:
                 names.append("admin")

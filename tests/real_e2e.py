@@ -420,14 +420,24 @@ class Acceptance:
 
         screenshot = self.call("browser", "browser_take_screenshot", {"type": "png"})
         images = [block for block in screenshot["content"] if block["type"] == "image"]
-        require(images and images[0]["mimeType"] == "image/png",
-                "screenshot image content missing")
-        data = base64.b64decode(images[0]["data"], validate=True)
+        require(images and images[0]["mimeType"] == "image/png" and "data" not in images[0],
+                "default screenshot call did not materialize image out of inline JSON")
+        saved_media = screenshot.get("savedMedia") or []
+        require(saved_media and saved_media[0]["mimeType"] == "image/png",
+                "savedMedia PNG entry missing")
+        data = Path(saved_media[0]["savedPath"]).read_bytes()
         require(data.startswith(b"\x89PNG\r\n\x1a\n") and data.endswith(b"IEND\xaeB\x60\x82"),
-                "image data was truncated or malformed")
+                "saved screenshot PNG was truncated or malformed")
+        inline_shot = self.command(
+            "call", "browser", "browser_take_screenshot", "--inline-media", "--args", '{"type":"png"}'
+        )
+        inline_images = [block for block in inline_shot["content"] if block["type"] == "image"]
+        inline_bytes = base64.b64decode(inline_images[0]["data"], validate=True)
+        require(inline_bytes.startswith(b"\x89PNG\r\n\x1a\n") and inline_bytes.endswith(b"IEND\xaeB\x60\x82"),
+                "inline screenshot PNG was truncated or malformed")
         (self.report_dir / "browser.png").write_bytes(data)
         self.report["screenshot_bytes"] = len(data)
-        self.passed("complete Playwright screenshot image preserved in JSON output")
+        self.passed("complete Playwright screenshot image saved to media cache and preserved with --inline-media")
 
         self.browser_counter("browser-http", "primary")
         self.passed("real Playwright Streamable HTTP /mcp stateful tool calls")

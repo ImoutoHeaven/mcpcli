@@ -21,6 +21,7 @@ parser.add_argument("--http", action="store_true")
 parser.add_argument("--tls", action="store_true")
 parser.add_argument("--modern", action="store_true")
 parser.add_argument("--mode", default="normal")
+parser.add_argument("--oversize-bytes", type=int, default=65537)
 parser.add_argument("--log", required=True)
 args = parser.parse_args()
 write_lock = threading.Lock()
@@ -131,7 +132,7 @@ def dispatch(request):
                                     "requestState": "opaque"})
         text = json.dumps(state) if name == "get" else "ok"
         if args.mode in ("oversize", "oversize_chunked", "oversize_sse"):
-            text = "x" * (16 * 1024 * 1024 + 1)
+            text = "x" * args.oversize_bytes
         return result(request, {"content": [{"type": "text", "text": text}],
                                "structuredContent": {"name": name},
                                "isError": name == "tool_error"})
@@ -191,7 +192,7 @@ if args.http:
                             return
                         body = b"data: " + json.dumps(response, separators=(",", ":")).encode() + b"\n\n"
                         if args.mode == "get_sse_oversize":
-                            body = b"data: " + b"x" * (16 * 1024 * 1024 + 1) + b"\n\n"
+                            body = b"data: " + b"x" * args.oversize_bytes + b"\n\n"
                         for offset in range(0, len(body), 16384):
                             chunk = body[offset:offset + 16384]
                             self.wfile.write(("%x\r\n" % len(chunk)).encode() + chunk + b"\r\n")

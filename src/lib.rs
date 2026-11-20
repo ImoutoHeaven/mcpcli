@@ -7,12 +7,14 @@
 compile_error!("mcpcli supports Linux, FreeBSD, macOS and Windows");
 
 pub mod agents;
+pub mod budget;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod ipc;
 pub mod json;
 pub mod mcp;
+pub mod media;
 pub mod runtime;
 pub mod skills;
 

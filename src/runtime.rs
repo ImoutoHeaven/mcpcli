@@ -1,4 +1,5 @@
 //! Private runtime files and short-lived clients of the persistent daemon.
+use crate::budget::{ByteBudget, format_bytes};
 use crate::config::{LoadedConfig, digest, valid_name};
 use crate::ipc::{self, Failure, Operation, Request, Response};
 use crate::platform;
@@ -7,12 +8,15 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, timeout_at};
 
 pub const START_WAIT: Duration = Duration::from_secs(10);
 pub const STOP_WAIT: Duration = Duration::from_secs(20);
@@ -45,7 +49,7 @@ impl Lock {
                 return Ok(lock);
             }
             if Instant::now() >= deadline {
-                bail!("timed out waiting for daemon startup lock");
+                bail!("timed out waiting for runtime lock");
             }
             sleep(Duration::from_millis(25)).await;
         }
@@ -85,7 +89,7 @@ impl Paths {
             };
         Self::with_root(config, session, &root)
     }
-    fn with_root(config: PathBuf, session: &str, root: &Path) -> Result<Self> {
+    pub fn with_root(config: PathBuf, session: &str, root: &Path) -> Result<Self> {
         if !valid_name(session) {
             bail!("session must be 1-64 ASCII letters, digits, '_' or '-'");
         }
@@ -138,14 +142,25 @@ impl Paths {
         operation: Operation,
         duration: Duration,
     ) -> Result<Request> {
+        self.request_with_explicit(digest, operation, duration, false)
+    }
+    pub fn request_with_explicit(
+        &self,
+        digest: &str,
+        operation: Operation,
+        duration: Duration,
+        explicit_deadline: bool,
+    ) -> Result<Request> {
         let timeout_ms = duration.as_millis().min(3_600_000) as u64;
+        let deadline_ms = platform::monotonic_millis()?.saturating_add(timeout_ms);
         Ok(Request {
             protocol: ipc::PROTOCOL,
             namespace: self.namespace.clone(),
             build: self.build.clone(),
             digest: digest.into(),
             timeout_ms,
-            deadline_ms: platform::monotonic_millis()?.saturating_add(timeout_ms),
+            deadline_ms,
+            explicit_deadline_ms: explicit_deadline.then_some(deadline_ms),
             operation,
         })
     }
@@ -222,19 +237,50 @@ pub async fn exchange_tracked(
     request: &Request,
     dispatched: &AtomicBool,
 ) -> Result<Response> {
+    exchange_tracked_with_options(
+        paths,
+        request,
+        dispatched,
+        ipc::TRANSFER_IDLE_TIMEOUT,
+        ByteBudget::global(),
+    )
+    .await
+}
+
+pub async fn exchange_tracked_with_options(
+    paths: &Paths,
+    request: &Request,
+    dispatched: &AtomicBool,
+    idle_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+) -> Result<Response> {
     let is_call = request.operation.is_call();
+    let now_ms = platform::monotonic_millis()?;
     let remaining = request
         .deadline_ms
-        .saturating_sub(platform::monotonic_millis()?)
+        .saturating_sub(now_ms)
         .min(request.timeout_ms);
     if remaining == 0 {
         return Err(
             Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
         );
     }
+    let started = Instant::now();
+    let exec_deadline = started + Duration::from_millis(remaining);
+    let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
+        started + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(request.timeout_ms))
+    });
+    if hard_deadline.is_some_and(|dl| Instant::now() >= dl) {
+        return Err(
+            Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
+        );
+    }
+
     let ignored = AtomicBool::new(false);
     let write_tracker = if is_call { dispatched } else { &ignored };
-    let future = async {
+
+    // Stage 1: connect, send request, and await validated 4-byte response header under operation budget.
+    let stage1 = async {
         let socket = if request.operation.management() {
             &paths.control_socket
         } else {
@@ -250,47 +296,154 @@ pub async fn exchange_tracked(
                 Failure::new(5, "timeout", "request expired before writing to daemon").into(),
             );
         }
-        ipc::write_frame_tracked(&mut stream, request, ipc::REQUEST_LIMIT, write_tracker).await?;
-        let response: Response = ipc::read_frame(&mut stream, ipc::RESPONSE_LIMIT)
+        let (req_frame, req_lease) = ipc::encode_frame_leased(request, ipc::REQUEST_LIMIT, budget)
+            .map_err(|error| -> anyhow::Error {
+                if error.kind() == io::ErrorKind::OutOfMemory {
+                    Failure::new(
+                        1,
+                        "memory_limit_exceeded",
+                        format!(
+                            "IPC request exceeded the {} active memory limit",
+                            format_bytes(budget.limit())
+                        ),
+                    )
+                    .into()
+                } else {
+                    error.into()
+                }
+            })?;
+        ipc::write_raw_idle(
+            &mut stream,
+            &req_frame,
+            idle_timeout,
+            Some(exec_deadline),
+            write_tracker,
+        )
+        .await?;
+        drop(req_frame);
+        drop(req_lease);
+        let len = ipc::read_frame_header(&mut stream, ipc::RESPONSE_LIMIT)
             .await?
             .context("daemon disconnected before returning a result")?;
-        if response.protocol != ipc::PROTOCOL || response.namespace != paths.namespace {
-            bail!("daemon IPC identity does not match");
-        }
-        if !request.operation.management() && response.build != paths.build {
+        Ok::<_, anyhow::Error>((stream, len))
+    };
+
+    let (mut stream, response_len) = match timeout_at(exec_deadline, stage1).await {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(error)) if error.downcast_ref::<Failure>().is_some() => return Err(error),
+        Ok(Err(error)) => {
+            if let Some(io_err) = error.downcast_ref::<io::Error>()
+                && io_err.kind() == io::ErrorKind::TimedOut
+            {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "daemon deadline exceeded; cancellation is not rollback",
+                )
+                .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+                .into());
+            }
             return Err(Failure::new(
-                6,
-                "daemon_mismatch",
-                "daemon binary changed; run daemon restart",
+                4,
+                "daemon_transport",
+                "daemon communication failed; tool calls are never replayed",
             )
+            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
             .into());
         }
-        if let Some(error) = response.error.as_ref() {
-            return Err(error.clone().into());
+        Err(_) => {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "daemon deadline exceeded; cancellation is not rollback",
+            )
+            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .into());
         }
-        if response.result.is_none() {
-            bail!("daemon response has no result");
-        }
-        Ok(response)
     };
-    match timeout(Duration::from_millis(remaining), future).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) if error.downcast_ref::<Failure>().is_some() => Err(error),
-        Ok(Err(_)) => Err(Failure::new(
+
+    // Stage 2: read validated response body using local 60s idle clock capped by explicit deadline.
+    let response: Response = match ipc::read_frame_body_idle(
+        &mut stream,
+        response_len,
+        idle_timeout,
+        hard_deadline,
+        budget,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "daemon deadline exceeded; cancellation is not rollback",
+            )
+            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .into());
+        }
+        Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
+            return Err(Failure::new(
+                1,
+                "memory_limit_exceeded",
+                format!(
+                    "daemon response exceeded the {} active memory limit; tool calls are never replayed",
+                    format_bytes(budget.limit())
+                ),
+            )
+            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .into());
+        }
+        Err(_) => {
+            return Err(Failure::new(
+                4,
+                "daemon_transport",
+                "daemon communication failed; tool calls are never replayed",
+            )
+            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .into());
+        }
+    };
+
+    if response.protocol != ipc::PROTOCOL {
+        return Err(Failure::new(
+            6,
+            "daemon_mismatch",
+            "daemon protocol does not match; run daemon restart",
+        )
+        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .into());
+    }
+    if response.namespace != paths.namespace {
+        return Err(Failure::new(
             4,
             "daemon_transport",
-            "daemon communication failed; tool calls are never replayed",
+            "daemon IPC identity does not match; tool calls are never replayed",
         )
         .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-        .into()),
-        Err(_) => Err(Failure::new(
-            5,
-            "timeout",
-            "daemon deadline exceeded; cancellation is not rollback",
-        )
-        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-        .into()),
+        .into());
     }
+    if !request.operation.management() && response.build != paths.build {
+        return Err(Failure::new(
+            6,
+            "daemon_mismatch",
+            "daemon binary changed; run daemon restart",
+        )
+        .into());
+    }
+    if let Some(error) = response.error.as_ref() {
+        return Err(error.clone().into());
+    }
+    if response.result.is_none() {
+        return Err(Failure::new(
+            4,
+            "daemon_transport",
+            "daemon response has no result; tool calls are never replayed",
+        )
+        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .into());
+    }
+    Ok(response)
 }
 
 pub async fn ensure(paths: &Paths, loaded: &LoadedConfig, explicit: bool) -> Result<()> {
@@ -472,6 +625,7 @@ mod tests {
                     server: "server".into(),
                     tool: "tool".into(),
                     arguments: serde_json::Map::new(),
+                    inline_media: false,
                 },
                 Duration::from_secs(1),
             )
@@ -503,6 +657,7 @@ mod tests {
                     server: "s".into(),
                     tool: "t".into(),
                     arguments: serde_json::Map::new(),
+                    inline_media: false,
                 },
                 Duration::from_secs(2),
             )

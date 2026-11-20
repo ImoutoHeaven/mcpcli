@@ -1,6 +1,8 @@
+use crate::budget::{ByteBudget, ByteLease, format_bytes};
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response};
-use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure};
+use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure, McpLimits};
+use crate::media::{InflightBatch, MediaStore};
 use crate::platform::{
     self,
     local::{Conn, Listener},
@@ -9,6 +11,7 @@ use crate::runtime::{Lock, Paths, State};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -25,6 +28,29 @@ const MAX_CONTROL_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
 const FRAME_WAIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
+pub struct DaemonOptions {
+    pub frame_wait: Duration,
+    pub idle_timeout: Duration,
+    pub response_limit: usize,
+    pub budget: Arc<ByteBudget>,
+    pub media: MediaStore,
+    pub mcp_limits: McpLimits,
+}
+
+impl Default for DaemonOptions {
+    fn default() -> Self {
+        Self {
+            frame_wait: FRAME_WAIT,
+            idle_timeout: ipc::TRANSFER_IDLE_TIMEOUT,
+            response_limit: ipc::RESPONSE_LIMIT,
+            budget: ByteBudget::global().clone(),
+            media: MediaStore::default(),
+            mcp_limits: McpLimits::default(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ServerState {
     connection: Option<McpConnection>,
@@ -35,6 +61,7 @@ struct App {
     paths: Paths,
     config: LoadedConfig,
     state: State,
+    options: DaemonOptions,
     servers: BTreeMap<String, Arc<Mutex<ServerState>>>,
     work: Semaphore,
     shutdown: CancellationToken,
@@ -56,6 +83,8 @@ pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
     }
 }
 
+type ExecutionOutcome = std::result::Result<(Value, ByteLease, Option<InflightBatch>), Failure>;
+
 impl App {
     fn response(&self, result: std::result::Result<Value, Failure>) -> Response {
         let (result, error) = match result {
@@ -72,18 +101,28 @@ impl App {
         }
     }
     fn status(&self) -> Value {
-        let servers: BTreeMap<_,_> = self.servers.iter().map(|(name,state)| {
-            let value = match state.try_lock() {
-                Ok(state) => json!({
-                    "state": if state.lost { "lost" } else {
-                        match &state.connection {Some(c) if c.is_closed()=>"lost",Some(_)=>"connected",None=>"lazy"}
-                    },
-                    "calls":state.calls
-                }),
-                Err(_) => json!({"state":"busy"}),
-            };
-            (name.clone(),value)
-        }).collect();
+        let servers: BTreeMap<_, _> = self
+            .servers
+            .iter()
+            .map(|(name, state)| {
+                let value = match state.try_lock() {
+                    Ok(state) => json!({
+                        "state": if state.lost {
+                            "lost"
+                        } else {
+                            match &state.connection {
+                                Some(c) if c.is_closed() => "lost",
+                                Some(_) => "connected",
+                                None => "lazy",
+                            }
+                        },
+                        "calls": state.calls
+                    }),
+                    Err(_) => json!({"state": "busy"}),
+                };
+                (name.clone(), value)
+            })
+            .collect();
         json!({"running":true,"pid":self.state.pid,"epoch":self.state.epoch,
             "session":self.paths.session,"namespace":self.paths.namespace,"version":env!("CARGO_PKG_VERSION"),
             "config_digest":self.config.digest,"build":self.paths.build,
@@ -139,10 +178,11 @@ impl App {
         operation: &Operation,
         deadline: Instant,
         dispatched: &AtomicBool,
-    ) -> std::result::Result<Value, Failure> {
+    ) -> ExecutionOutcome {
+        let empty = || self.options.budget.empty_lease();
         let server = match operation {
-            Operation::Status => return Ok(self.status()),
-            Operation::Stop => return Ok(json!({"stopping":true})),
+            Operation::Status => return Ok((self.status(), empty(), None)),
+            Operation::Stop => return Ok((json!({"stopping":true}), empty(), None)),
             Operation::Server { server }
             | Operation::Tools { server }
             | Operation::Call { server, .. }
@@ -198,7 +238,7 @@ impl App {
             if let Some(warning) = warning {
                 value["cleanup_warning"] = Value::String(warning);
             }
-            return Ok(value);
+            return Ok((value, empty(), None));
         }
         if state.lost
             || state
@@ -228,7 +268,7 @@ impl App {
             }
             let config = &self.config.config.servers[server];
             state.connection = Some(
-                McpConnection::connect(config, budget)
+                McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone())
                     .await
                     .map_err(|e| mcp_error(e, false))?,
             );
@@ -248,49 +288,143 @@ impl App {
             .connection
             .as_ref()
             .expect("connection was established");
-        let result = match operation {
-            Operation::Server { .. } => connection.server_info(),
-            Operation::Tools { .. } => connection
-                .list_tool_pages(budget)
-                .await
-                .map(|pages| json!({"pages": pages})),
-            Operation::Call {
-                tool, arguments, ..
-            } => {
-                connection
-                    .call_with_dispatch(tool, arguments.clone(), budget, dispatched)
+        match operation {
+            Operation::Server { .. } => {
+                let result = connection.server_info();
+                if connection.is_closed() {
+                    state.lost = true;
+                }
+                result
+                    .map(|value| (value, empty(), None))
+                    .map_err(|e| mcp_error(e, false))
+            }
+            Operation::Tools { .. } => {
+                let result = connection
+                    .list_tool_pages(budget)
                     .await
+                    .map(|pages| json!({"pages": pages}));
+                if connection.is_closed() {
+                    state.lost = true;
+                }
+                result
+                    .map(|value| (value, empty(), None))
+                    .map_err(|e| mcp_error(e, false))
+            }
+            Operation::Call {
+                tool,
+                arguments,
+                inline_media,
+                ..
+            } => {
+                let result = connection
+                    .call_with_dispatch_leased(tool, arguments.clone(), budget, dispatched)
+                    .await;
+                if connection.is_closed() {
+                    state.lost = true;
+                }
+                let (mut value, mut lease) =
+                    result.map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))?;
+                let inflight = if *inline_media {
+                    None
+                } else {
+                    self.options
+                        .media
+                        .extract_and_save(&mut value, &mut lease, &self.options.budget)
+                        .await?
+                };
+                Ok((value, lease, inflight))
             }
             _ => unreachable!(),
-        };
-        if connection.is_closed() {
-            state.lost = true;
         }
-        result.map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))
     }
 }
 
 async fn send(
     stream: &mut Conn,
     app: &App,
-    result: std::result::Result<Value, Failure>,
+    outcome: ExecutionOutcome,
     dispatched: bool,
+    hard_deadline: Option<Instant>,
 ) {
-    let response = app.response(result);
-    let write = async {
-        if let Err(error) = ipc::write_frame(stream, &response, ipc::RESPONSE_LIMIT).await
-            && error.kind() == std::io::ErrorKind::InvalidData
-        {
-            let fallback = app.response(Err(Failure::new(
-                4,
-                "result_too_large",
-                "result exceeds the 32 MiB IPC output limit; the operation is not replayed",
-            )
-            .uncertain(dispatched)));
-            let _ = ipc::write_frame(stream, &fallback, ipc::RESPONSE_LIMIT).await;
-        }
+    let (result, result_lease, mut inflight) = match outcome {
+        Ok((value, lease, inflight)) => (Ok(value), Some(lease), inflight),
+        Err(error) => (Err(error), None, None),
     };
-    let _ = timeout(FRAME_WAIT, write).await;
+    let response = app.response(result);
+    let encoded =
+        ipc::encode_frame_leased(&response, app.options.response_limit, &app.options.budget);
+    // Drop the unserialized Value and its lease before waiting on a slow IPC client.
+    drop(response);
+    drop(result_lease);
+
+    let started = AtomicBool::new(false);
+    match encoded {
+        Ok((frame, frame_lease)) => {
+            let written = ipc::write_raw_idle(
+                stream,
+                &frame,
+                app.options.idle_timeout,
+                hard_deadline,
+                &started,
+            )
+            .await;
+            drop(frame);
+            drop(frame_lease);
+            if let Some(batch) = inflight.take() {
+                if written.is_ok() {
+                    batch.complete().await;
+                } else {
+                    batch.abort().await;
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(batch) = inflight.take() {
+                batch.abort().await;
+            }
+            let fallback = match error.kind() {
+                io::ErrorKind::InvalidData => Some(
+                    Failure::new(
+                        4,
+                        "result_too_large",
+                        format!(
+                            "result exceeds the {} IPC output limit; the operation is not replayed",
+                            format_bytes(app.options.response_limit)
+                        ),
+                    )
+                    .uncertain(dispatched),
+                ),
+                io::ErrorKind::OutOfMemory => Some(
+                    Failure::new(
+                        1,
+                        "memory_limit_exceeded",
+                        format!(
+                            "result exceeded the {} active memory limit; the operation is not replayed",
+                            format_bytes(app.options.budget.limit())
+                        ),
+                    )
+                    .uncertain(dispatched),
+                ),
+                _ => None,
+            };
+            if let Some(failure) = fallback
+                && let Ok((fb_frame, _fb_lease)) = ipc::encode_frame_leased(
+                    &app.response(Err(failure)),
+                    app.options.response_limit,
+                    &app.options.budget,
+                )
+            {
+                let _ = ipc::write_raw_idle(
+                    stream,
+                    &fb_frame,
+                    app.options.idle_timeout,
+                    hard_deadline,
+                    &started,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
@@ -298,8 +432,12 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
         return;
     }
     let request = match timeout(
-        FRAME_WAIT,
-        ipc::read_frame::<_, Request>(&mut stream, ipc::REQUEST_LIMIT),
+        app.options.frame_wait,
+        ipc::read_frame_with_budget::<_, Request>(
+            &mut stream,
+            ipc::REQUEST_LIMIT,
+            &app.options.budget,
+        ),
     )
     .await
     {
@@ -316,21 +454,23 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 "control endpoint only accepts status and stop",
             )),
             false,
+            None,
         )
         .await;
         return;
     }
     if let Err(error) = app.validate(&request) {
-        send(&mut stream, &app, Err(error), false).await;
+        send(&mut stream, &app, Err(error), false, None).await;
         return;
     }
-    let remaining = match platform::monotonic_millis() {
-        Ok(now) => request
-            .deadline_ms
-            .saturating_sub(now)
-            .min(request.timeout_ms),
+    let now_ms = match platform::monotonic_millis() {
+        Ok(now) => now,
         Err(_) => return,
     };
+    let remaining = request
+        .deadline_ms
+        .saturating_sub(now_ms)
+        .min(request.timeout_ms);
     if remaining == 0 {
         send(
             &mut stream,
@@ -341,16 +481,32 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 "request expired before admission",
             )),
             false,
+            None,
         )
         .await;
         return;
     }
+    let admitted = Instant::now();
+    let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
+        admitted + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(request.timeout_ms))
+    });
     if matches!(request.operation, Operation::Stop) {
-        send(&mut stream, &app, Ok(json!({"stopping":true})), false).await;
+        send(
+            &mut stream,
+            &app,
+            Ok((
+                json!({"stopping":true}),
+                app.options.budget.empty_lease(),
+                None,
+            )),
+            false,
+            hard_deadline,
+        )
+        .await;
         app.shutdown.cancel();
         return;
     }
-    let deadline = Instant::now() + Duration::from_millis(remaining);
+    let deadline = admitted + Duration::from_millis(remaining);
     let dispatched = AtomicBool::new(false);
     let execute = timeout(
         Duration::from_millis(remaining),
@@ -369,16 +525,26 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
                 .uncertain(dispatched.load(Ordering::Acquire))),
         },
     };
+    let send_deadline = hard_deadline.filter(|_| result.is_ok());
     send(
         &mut stream,
         &app,
         result,
         dispatched.load(Ordering::Acquire),
+        send_deadline,
     )
     .await;
 }
 
 pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
+    run_with_options(paths, config, DaemonOptions::default()).await
+}
+
+pub async fn run_with_options(
+    paths: Paths,
+    config: LoadedConfig,
+    options: DaemonOptions,
+) -> Result<()> {
     let _lifetime =
         Lock::try_acquire(&paths.daemon_lock())?.context("daemon is already running")?;
     paths.remove_socket()?;
@@ -399,6 +565,7 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
         paths: paths.clone(),
         config,
         state: state.clone(),
+        options,
         servers,
         work: Semaphore::new(MAX_IN_FLIGHT),
         shutdown: CancellationToken::new(),
