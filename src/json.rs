@@ -72,10 +72,86 @@ impl<'de> Deserialize<'de> for Unique {
     }
 }
 
+// serde_json uses one scratch Vec for escaped strings and, with float_roundtrip,
+// mantissas that overflow u64. Keep its largest capacity through the entire parse.
+pub fn scratch_bytes(bytes: &[u8]) -> usize {
+    let mut index = 0;
+    let mut longest = 0;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'-' | b'0'..=b'9') {
+            let start = index;
+            while index < bytes.len()
+                && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+            {
+                index += 1;
+            }
+            let mut significand = Some(0u64);
+            for &byte in bytes[start..index]
+                .iter()
+                .take_while(|&&byte| !matches!(byte, b'e' | b'E'))
+            {
+                if byte.is_ascii_digit() {
+                    significand = significand.and_then(|value| {
+                        value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))
+                    });
+                }
+            }
+            if significand.is_none() {
+                longest = longest.max(index - start);
+            }
+            continue;
+        }
+        if bytes[index] != b'"' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let start = index;
+        let mut escaped = false;
+        while index < bytes.len() && bytes[index] != b'"' {
+            if bytes[index] == b'\\' {
+                escaped = true;
+                index = index.saturating_add(2).min(bytes.len());
+            } else {
+                index += 1;
+            }
+        }
+        if escaped {
+            longest = longest.max(index - start);
+        }
+        index += 1;
+    }
+    if longest == 0 {
+        0
+    } else {
+        longest.saturating_mul(2).max(8)
+    }
+}
+
+pub fn serialized_len(value: &impl serde::Serialize) -> serde_json::Result<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| std::io::Error::other("JSON length overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
 pub fn parse(bytes: &[u8]) -> Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let Unique(value) = Unique::deserialize(&mut deserializer).context("invalid JSON")?;
     deserializer.end().context("trailing data after JSON")?;
+    drop(deserializer);
     validate_tokens(bytes)?;
     Ok(value)
 }
@@ -137,15 +213,28 @@ fn validate_tokens(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, PartialEq)]
-struct Decimal {
+#[derive(Debug)]
+struct Decimal<'a> {
     negative: bool,
-    digits: String,
+    digits: &'a str,
     exponent: i64,
 }
 
-// Canonical exact decimal value: significant digits times a power of ten.
-fn decimal(text: &str) -> Result<Decimal> {
+impl PartialEq for Decimal<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.negative == other.negative
+            && self.exponent == other.exponent
+            && self
+                .digits
+                .bytes()
+                .filter(|byte| *byte != b'.')
+                .eq(other.digits.bytes().filter(|byte| *byte != b'.'))
+    }
+}
+
+// Canonical decimal view borrows the significant digits, skipping the decimal
+// point during comparison. Long finite decimal spellings need no String copies.
+fn decimal(text: &str) -> Result<Decimal<'_>> {
     let negative = text.starts_with('-');
     let unsigned = text.strip_prefix('-').unwrap_or(text);
     let (mantissa, exponent) = if let Some(index) = unsigned.find(['e', 'E']) {
@@ -161,27 +250,29 @@ fn decimal(text: &str) -> Result<Decimal> {
     let fraction = mantissa
         .find('.')
         .map_or(0, |index| mantissa.len() - index - 1);
-    let digits: String = mantissa
-        .chars()
-        .filter(|character| *character != '.')
-        .collect();
-    let significant = digits.trim_start_matches('0');
-    if significant.is_empty() {
+    let Some(start) = mantissa
+        .bytes()
+        .position(|byte| matches!(byte, b'1'..=b'9'))
+    else {
         return Ok(Decimal {
             negative,
-            digits: "0".into(),
+            digits: "0",
             exponent: 0,
         });
-    }
-    let trimmed = significant.trim_end_matches('0');
-    let trailing = i64::try_from(significant.len() - trimmed.len())?;
+    };
+    let end = mantissa
+        .bytes()
+        .rposition(|byte| matches!(byte, b'1'..=b'9'))
+        .expect("nonzero digit")
+        + 1;
+    let trailing = mantissa[end..].bytes().filter(u8::is_ascii_digit).count();
     let exponent = exponent
         .checked_sub(i64::try_from(fraction)?)
-        .and_then(|exponent| exponent.checked_add(trailing))
+        .and_then(|exponent| exponent.checked_add(i64::try_from(trailing).ok()?))
         .context("number exponent exceeds the supported range")?;
     Ok(Decimal {
         negative,
-        digits: trimmed.into(),
+        digits: &mantissa[start..end],
         exponent,
     })
 }
@@ -207,6 +298,33 @@ pub fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratch_reservation_covers_escaped_tokens_and_survives_later_plain_tokens() {
+        assert_eq!(scratch_bytes(br#"{"plain":"normal text"}"#), 0);
+        assert_eq!(
+            scratch_bytes(br#"{"x":"a\nb","later":"longer plain text"}"#),
+            8
+        );
+        assert_eq!(scratch_bytes(br#"{"a\nb":"x","later":"text"}"#), 8);
+        let escaped = "x".repeat(100) + "\n";
+        let raw = serde_json::to_vec(&serde_json::json!([escaped, "z".repeat(300)])).unwrap();
+        assert_eq!(scratch_bytes(&raw), 204);
+    }
+
+    #[test]
+    fn numeric_workspace_covers_float_roundtrip_and_borrowed_canonicalization() {
+        let number = "0.1000000000000000000000000000000000000000";
+        assert!(scratch_bytes(number.as_bytes()) >= number.len());
+        assert_eq!(parse(number.as_bytes()).unwrap(), serde_json::json!(0.1));
+        assert_eq!(decimal(number).unwrap(), decimal("1e-1").unwrap());
+        assert_eq!(scratch_bytes(b"123"), 0);
+        assert_eq!(scratch_bytes(b"18446744073709551615"), 0);
+        let view = decimal("123.456").unwrap();
+        assert_eq!(view.digits.as_ptr(), "123.456".as_ptr());
+        let decoded = serde_json::to_vec(&serde_json::json!({"text":"escaped\ntext"})).unwrap();
+        assert!(scratch_bytes(&decoded) > 0);
+    }
 
     #[test]
     fn rejects_duplicate_keys_at_any_depth() {

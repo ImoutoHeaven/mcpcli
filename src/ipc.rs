@@ -21,7 +21,6 @@ pub const ARGUMENT_LIMIT: usize = 1 << 20;
 pub const TRANSFER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const WRITE_CHUNK: usize = 64 * 1024;
-const LEASE_SLAB: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,7 +76,9 @@ pub struct Failure {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub outcome_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rpc_error: Option<Value>,
+    pub rpc_error: Option<Arc<Value>>,
+    #[serde(skip)]
+    pub(crate) lease: Option<Arc<ByteLease>>,
 }
 impl Failure {
     pub fn new(code: i32, kind: &str, message: impl Into<String>) -> Self {
@@ -87,6 +88,7 @@ impl Failure {
             message: message.into(),
             outcome_unknown: false,
             rpc_error: None,
+            lease: None,
         }
     }
     pub fn uncertain(mut self, uncertain: bool) -> Self {
@@ -117,22 +119,24 @@ pub struct Response {
 struct LimitedVecWriter {
     buf: Vec<u8>,
     max: usize,
+    prefix: usize,
     lease: ByteLease,
     abort: Option<io::Error>,
 }
 
 impl LimitedVecWriter {
-    fn new(max: usize, budget: &Arc<ByteBudget>) -> io::Result<Self> {
+    fn new(max: usize, budget: &Arc<ByteBudget>, prefix: usize) -> io::Result<Self> {
         let mut lease = budget.empty_lease();
-        if !lease.try_grow(4) {
+        if !lease.try_grow(prefix) {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
                 "IPC frame exceeded active memory limit",
             ));
         }
         Ok(Self {
-            buf: vec![0u8; 4],
+            buf: vec![0u8; prefix],
             max,
+            prefix,
             lease,
             abort: None,
         })
@@ -142,7 +146,7 @@ impl LimitedVecWriter {
         if let Some(error) = self.abort {
             return Err(error);
         }
-        let payload_len = self.buf.len().saturating_sub(4);
+        let payload_len = self.buf.len().saturating_sub(self.prefix);
         if payload_len == 0 || payload_len > self.max || payload_len > u32::MAX as usize {
             self.buf = Vec::new();
             self.lease.release();
@@ -151,15 +155,17 @@ impl LimitedVecWriter {
                 "IPC response exceeds frame limit",
             ));
         }
-        self.lease.shrink_to(self.buf.len());
-        self.buf[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        self.lease.shrink_to(self.buf.capacity());
+        if self.prefix == 4 {
+            self.buf[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        }
         Ok((self.buf, self.lease))
     }
 }
 
 impl io::Write for LimitedVecWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let Some(payload_len) = (self.buf.len() - 4).checked_add(bytes.len()) else {
+        let Some(payload_len) = (self.buf.len() - self.prefix).checked_add(bytes.len()) else {
             self.buf = Vec::new();
             self.lease.release();
             self.abort = Some(io::Error::new(
@@ -183,23 +189,21 @@ impl io::Write for LimitedVecWriter {
                 "IPC response exceeds frame limit",
             ));
         }
-        let needed = 4 + payload_len;
-        if needed > self.lease.bytes() {
-            let delta = needed - self.lease.bytes();
-            let max_frame = 4usize.saturating_add(self.max);
-            let slab = delta.max(LEASE_SLAB.min(max_frame.saturating_sub(self.lease.bytes())));
-            if !self.lease.try_grow(slab) && !self.lease.try_grow(delta) {
-                self.buf = Vec::new();
-                self.lease.release();
-                self.abort = Some(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "IPC frame exceeded active memory limit",
-                ));
-                return Err(io::Error::new(
-                    io::ErrorKind::OutOfMemory,
-                    "IPC frame exceeded active memory limit",
-                ));
-            }
+        let needed = self.prefix + payload_len;
+        if !self
+            .lease
+            .reserve_vec(&mut self.buf, needed, self.max.saturating_add(self.prefix))
+        {
+            self.buf = Vec::new();
+            self.lease.release();
+            self.abort = Some(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "IPC frame exceeded active memory limit",
+            ));
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "IPC frame exceeded active memory limit",
+            ));
         }
         self.buf.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -215,7 +219,24 @@ pub fn encode_frame_leased<T: Serialize>(
     max: usize,
     budget: &Arc<ByteBudget>,
 ) -> io::Result<(Vec<u8>, ByteLease)> {
-    let mut writer = LimitedVecWriter::new(max, budget)?;
+    encode_leased(value, max, budget, 4)
+}
+
+pub(crate) fn encode_json_leased<T: Serialize>(
+    value: &T,
+    max: usize,
+    budget: &Arc<ByteBudget>,
+) -> io::Result<(Vec<u8>, ByteLease)> {
+    encode_leased(value, max, budget, 0)
+}
+
+fn encode_leased<T: Serialize>(
+    value: &T,
+    max: usize,
+    budget: &Arc<ByteBudget>,
+    prefix: usize,
+) -> io::Result<(Vec<u8>, ByteLease)> {
+    let mut writer = LimitedVecWriter::new(max, budget, prefix)?;
     if let Err(error) = serde_json::to_writer(&mut writer, value) {
         if let Some(abort) = writer.abort.take() {
             return Err(abort);
@@ -293,7 +314,7 @@ pub async fn read_frame_body_idle<R: AsyncRead + Unpin, T: DeserializeOwned>(
     idle_timeout: Duration,
     hard_deadline: Option<Instant>,
     budget: &Arc<ByteBudget>,
-) -> io::Result<T> {
+) -> io::Result<(T, ByteLease)> {
     let _lease = budget.try_acquire(len).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::OutOfMemory,
@@ -315,14 +336,14 @@ pub async fn read_frame_body_idle<R: AsyncRead + Unpin, T: DeserializeOwned>(
         }
         filled += n;
     }
-    serde_json::from_slice(&body).map_err(io::Error::other)
+    parse_frame_body(crate::budget::Leased::new(body, _lease), budget)
 }
 
 pub async fn read_frame_with_budget<R: AsyncRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
     max: usize,
     budget: &Arc<ByteBudget>,
-) -> io::Result<Option<T>> {
+) -> io::Result<Option<(T, ByteLease)>> {
     let Some(len) = read_frame_header(reader, max).await? else {
         return Ok(None);
     };
@@ -334,9 +355,31 @@ pub async fn read_frame_with_budget<R: AsyncRead + Unpin, T: DeserializeOwned>(
     })?;
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(io::Error::other)
+    parse_frame_body(crate::budget::Leased::new(body, _lease), budget).map(Some)
+}
+
+fn parse_frame_body<T: DeserializeOwned>(
+    body: crate::budget::Leased<Vec<u8>>,
+    budget: &Arc<ByteBudget>,
+) -> io::Result<(T, ByteLease)> {
+    let len = body.len();
+    let exhausted = || {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "IPC decoded value exceeded active memory limit",
+        )
+    };
+    let value_lease = budget.try_acquire(len).ok_or_else(exhausted)?;
+    let scratch = budget
+        .try_acquire(crate::json::scratch_bytes(&body))
+        .ok_or_else(exhausted)?;
+    let value: serde_json::Value = serde_json::from_slice(&body).map_err(io::Error::other)?;
+    drop(scratch);
+    drop(body);
+    let value = crate::budget::Leased::new(value, value_lease);
+    let typed_lease = budget.try_acquire(len).ok_or_else(exhausted)?;
+    let typed = T::deserialize(&*value).map_err(io::Error::other)?;
+    Ok((typed, typed_lease))
 }
 
 #[cfg(test)]
@@ -348,7 +391,9 @@ mod tests {
         reader: &mut R,
         max: usize,
     ) -> io::Result<Option<T>> {
-        read_frame_with_budget(reader, max, ByteBudget::global()).await
+        Ok(read_frame_with_budget(reader, max, ByteBudget::global())
+            .await?
+            .map(|(value, _lease)| value))
     }
 
     async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(
@@ -400,6 +445,75 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn decoded_values_keep_leases_after_body_release_and_charge_parse_overlap() {
+        let body = serde_json::to_vec(&serde_json::json!({"text": "x".repeat(128)})).unwrap();
+        let tight = ByteBudget::new(body.len() * 2 - 1);
+        let error = read_frame_body_idle::<_, Value>(
+            &mut body.as_slice(),
+            body.len(),
+            Duration::from_secs(1),
+            None,
+            &tight,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(tight.used(), 0);
+        let budget = ByteBudget::new(body.len() * 2);
+        let (value, lease) = read_frame_body_idle::<_, Value>(
+            &mut body.as_slice(),
+            body.len(),
+            Duration::from_secs(1),
+            None,
+            &budget,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value["text"].as_str().unwrap().len(), 128);
+        assert_eq!(budget.used(), body.len());
+        assert!(budget.try_acquire(body.len() + 1).is_none());
+        drop(value);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        let (frame, lease) = encode_frame_leased(
+            &serde_json::json!({"text": "x".repeat(129)}),
+            1024,
+            &ByteBudget::new(4096),
+        )
+        .unwrap();
+        assert_eq!(frame.capacity(), lease.bytes());
+        assert!(frame.capacity() >= frame.len());
+    }
+
+    #[tokio::test]
+    async fn escaped_ipc_text_requires_workspace_before_deserialization() {
+        let text = "x".repeat(4096) + "\n";
+        let raw = serde_json::to_vec(&serde_json::json!({"text":text})).unwrap();
+        let peak = 2 * raw.len() + crate::json::scratch_bytes(&raw);
+        for fits in [false, true] {
+            let budget = ByteBudget::new(peak - usize::from(!fits));
+            let result = read_frame_body_idle::<_, Value>(
+                &mut raw.as_slice(),
+                raw.len(),
+                Duration::from_secs(1),
+                None,
+                &budget,
+            )
+            .await;
+            if fits {
+                let (value, lease) = result.unwrap();
+                assert_eq!(value["text"], text);
+                assert_eq!(budget.used(), raw.len());
+                drop(value);
+                drop(lease);
+            } else {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::OutOfMemory);
+            }
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[test]

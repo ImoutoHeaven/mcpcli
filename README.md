@@ -73,8 +73,8 @@ mcpcli daemon stop
 `call` accepts `--args JSON`, `--args-file PATH`, or `--stdin`, defaulting to `{}`.
 Output is JSON on stdout, or readable text with `--text`. By default, `call` decodes
 binary `image`, `audio`, and blob `resource` blocks into a private local cache and
-lists their paths in top-level `savedMedia`; pass `--inline-media` to keep Base64
-payloads inline.
+returns `{result, savedMedia}` with local paths in `savedMedia`; pass
+`--inline-media` to print the original result with Base64 payloads inline.
 
 The daemon starts on demand. `--session NAME` isolates client sessions, `--oneshot`
 opens a single-command connection, and `daemon run` runs in the foreground. Restart

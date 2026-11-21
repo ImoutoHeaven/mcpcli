@@ -14,6 +14,12 @@ exposed and advertised. Resources, prompts, sampling, roots, interactive
 elicitation (MRTR), asynchronous Tasks, OAuth login, legacy two-endpoint
 HTTP+SSE, and outbound MCP server hosting are out of scope.
 
+The dependency is the unmodified crates.io `rmcp =3.9.0` package, pinned by
+Cargo.lock. The repository has no rmcp vendor copy or Cargo patch. Local byte
+owners cover objects held by this application; they are released at the actual
+handoff to the SDK. Guarantees that require changes to SDK model fields, queues,
+or caches are outside this implementation (see WONT FIX below).
+
 Supported targets are Alpine and Debian Linux (x86-64 and ARM64, static musl),
 FreeBSD (x86-64), macOS (Intel and Apple silicon), and Windows (x86-64 and
 ARM64). Local IPC uses Unix domain sockets or Windows named pipes. `mcpcli`
@@ -184,25 +190,90 @@ dispatch flag is set and subsequent transport or timeout failures report
 `outcome_unknown: true`. Cancellation asks the server to stop work; side
 effects that already ran remain in effect.
 
-Upstream stdio and HTTP connections enforce a 512 MiB message or event limit
-under the 1 GiB non-blocking process byte budget, while `list_tool_pages` uses
-a separate 16 MiB catalog limit:
+The application's stdio and HTTP adapters enforce a 512 MiB message or event
+limit and use a shared 1 GiB non-blocking byte budget for their buffers and
+decoded values. `list_tool_pages` also enforces a 16 MiB catalog limit.
+SDK-owned allocations after handoff have the limits described under WONT FIX:
 
 - `ChildTransport` reads stdio lines directly via `BufReader::fill_buf` and
-  `consume`, resets `line_buf` capacity above 64 KiB after every line, and
-  refuses writes once terminated.
+  `consume`, releases the completed line buffer, and refuses writes once
+  terminated.
 - `BoundedHttp` enforces 512 MiB on `application/json` bodies, and custom
   `BoundedSseStream` parses POST SSE and background GET SSE events up to
   512 MiB per event (handling split UTF-8 BOMs, comments, `\r`/`\n`/`\r\n`, and
-  ignored NUL `id` fields while shrinking internal buffers above 64 KiB).
-- When `Ingress` matches a pending request, it acquires a separate byte lease
-  for the lossless `Value` while the raw buffer is still live, deserializes
-  `ServerJsonRpcMessage` once, strips `CallToolResult` payloads down to an
-  empty stub for the SDK (including shrinking matched SSE `data` strings), and
-  drops the raw buffer and its lease immediately.
+  ignored NUL `id` fields). Per [WHATWG event stream interpretation](https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation),
+  fields without a colon have empty values, repeated `event`/`id`/valid `retry`
+  fields overwrite earlier values, unknown fields are ignored, and invalid or
+  overflowing `retry` values are ignored. Completed line buffers are released
+  or moved into their event; their capacity remains charged while retained.
+- SSE `id` values have a separate 8 KiB UTF-8 byte limit before SDK handoff.
+  An oversized ID terminates the connection and pending call immediately;
+  GET streams do not reconnect and POST calls are not replayed. Event/data
+  limits remain 512 MiB. The SDK keeps its own reconnect-ID strings: these
+  copies are bounded metadata, not exact leases on SDK-owned allocations.
+- Invalid UTF-8 detected by the local SSE parser is a terminal parse error.
+  Its cause reaches the waiting operation even after a prior event ID;
+  ordinary network errors and EOF keep the SDK's existing reconnect policy.
+- `Ingress` owns each raw buffer and reserves the lossless `Value` plus JSON
+  scratch before parsing. Scratch is one reusable Vec: its allowance is twice
+  the longest escaped string or numeric token whose mantissa exceeds u64 (at
+  least 8 bytes), retained until the JSON deserializer is gone. Numeric
+  losslessness checks then compare borrowed canonical decimal views without
+  digit copies. Raw bytes are released before conversion from a borrowed
+  `&Value` into the official SDK model. That synchronous conversion reserves
+  one payload-sized final model and two payload-sized temporary copies for
+  upstream string-ID and subscription-metadata conversions. Temporary credit
+  is returned after conversion; the local model remains in `Leased` until
+  the transport returns it to the SDK. Its later SDK lifetime is not covered.
+- Matched tool calls and RPC errors give the SDK small stubs while the lossless
+  result or error keeps its own lease. SSE uses the official raw `Sse` API:
+  the local parser queues owned events, encodes validated stubs before handoff,
+  and keeps each event charged while it remains in that queue. The SDK parses
+  the returned event again. Lossless initialize/discover output, tool pages,
+  names, and locally retained pagination cursors have application owners;
+  these owners make no promise about SDK peer-info or schema-cache copies.
+- Application-created call parameters reserve their construction and local
+  wait, ending when the application's future ends. MCP stdio and HTTP bodies
+  use the bounded capacity-counting JSON writer. Stdio keeps the body until
+  writing finishes; HTTP uses `Bytes::from_owner`, so request-body clones
+  retained by the transport keep that encoded buffer charged. CLI arguments
+  use leased readers before parsing, reserve the decoded value and scratch,
+  and move their owned object into the operation. The source owner follows
+  CLI/daemon IPC writeback and oneshot dispatch without another argument-map
+  clone. The original `--args` String separately reserves its actual capacity
+  at CLI entry and retains that charge through output.
+- The application's client service keeps the official SDK dispatch,
+  cancellation, and progress behavior. Its noninteractive defaults drop each
+  request or notification before its context. Unsupported server methods
+  receive a fixed local error without echoing arbitrary method strings.
+- Buffer leases count allocated capacity. Growth reserves the replacement
+  before copying and returns the old charge after freeing its allocation.
+  IPC decoding holds separate leases for the frame and decoded value; the
+  value lease follows the result through CLI output. RPC errors share their
+  exact `error` value and lease across diagnostic conversions and clones.
+  The SDK receives a small error stub (long diagnostics use a 1 KiB UTF-8
+  prefix and an ellipsis); `rpc_error` preserves the original fields and full message. Text and
+  diagnostic output write borrowed spans and stream JSON, avoiding full-size
+  rendering copies. Server, tool-list and inspect text also stream borrowed
+  fields; inspect moves its selected raw tool from the owned pages. Its short
+  display name is normalized and truncated without copying the full name.
 - Oversize frames and byte-budget exhaustion store a connection-scoped
   termination error, suppress HTTP SSE GET reconnects, and wake pending
   `tools/call` futures immediately.
+
+### WONT FIX: SDK-owned allocation lifetimes
+
+Exact accounting after an object crosses the official rmcp API would require
+upstream ownership hooks. This includes SSE reparsing and queued messages,
+unpolled handler tasks, request IDs retained for cancellation and response
+sending, peer-info metadata, tool schemas and cache keys, pagination copies,
+and call-parameter clones retained after cancellation. The SDK's subscription-ID
+getter and disabled-resource-cache URI preparation also keep upstream behavior.
+The former local model fields, preparsed-SSE wrapper, and SDK queue/clone tests
+were removed with the fork. Application guards do not imply coverage of those
+allocations, and a green application test does not establish that coverage.
+These items are WONT FIX in this repository under the no-fork requirement;
+they require an upstream change before an exact ownership guarantee can be made.
 
 Disconnecting a CLI client cancels its in-flight operation while keeping a
 healthy server connection open for future commands. When a server connection
@@ -263,25 +334,47 @@ decodes them into a private media directory using random hex stems and a fixed
 21-MIME extension allowlist (`.mp4`, `.webm`, `.mov`, `.3gp`, `.avi`, `.m4a`,
 `.wav`, `.mp3`, `.ogg`, `.flac`, `.aac`, `.aiff`, `.pdf`, `.png`, `.jpg`,
 `.gif`, `.webp`, `.bmp`, `.tiff`, `.heic`, `.heif`, or `.bin` for other MIME
-types, ignoring upstream URIs), removes any upstream `savedMedia` key, and
-attaches top-level `savedMedia` entries (`contentIndex`, `kind`, `savedPath`,
-`mimeType`, `bytes`). `--inline-media` skips extraction and prints the verified
-JSON result with Base64 strings untouched.
+types, ignoring upstream URIs), and returns `{result, savedMedia}`. All other
+upstream fields, including a remote `result.savedMedia`, remain untouched. The
+local top-level `savedMedia` array (empty when nothing was saved) contains entries
+(`contentIndex`, `kind`, `savedPath`, `mimeType`, `bytes`). `--inline-media` skips
+extraction and wrapping and prints the verified MCP result with Base64 strings
+and all remote fields untouched. Local records reserve their path, MIME, kind
+and field-name payload before construction and retain that charge with the
+result. Path construction and the rollback list reserve their overlapping
+allocations separately. MIME matching borrows its source string.
 
 Media directory resolution uses `<MCPCLI_RUNTIME_DIR>/media` when
 `MCPCLI_RUNTIME_DIR` is set; otherwise Unix tries `$XDG_CACHE_HOME/mcpcli/media`,
 `$HOME/.cache/mcpcli/media`, and `<runtime>/media`, and Windows uses
 `%LOCALAPPDATA%\mcpcli\media` (`0700` or owner-only DACL, independent of Unix
-socket path length limits). Both the daemon and `--oneshot` acquire
+socket path length limits). A canonical cache directory that cannot be represented
+as UTF-8 fails with a local cache error before any media file is published;
+paths in JSON are never lossy. Both the daemon and `--oneshot` acquire
 `<media_dir>/.lock` to serialize garbage collection, the 2 GiB cache cap,
 `.tmp-<pid>-<seq>-<rand>` writes (`flush` without `sync_all`), atomic renames,
 and `.inflight-<id>.lock` batch leases. Garbage collection skips active
 in-flight batches and files within 60 seconds of publication. Completing local
-IPC or `--oneshot` stdout writeback refreshes that batch's 60-second retention
-timestamp under `.lock`; write interruptions release the in-flight lease
-without refreshing, ordinary decode or capacity errors roll back all files
-created in that call, and crash leftovers (`.tmp-*` and dead-process in-flight
-records) are reclaimed on the next GC pass.
+IPC or `--oneshot` stdout writeback records its completion timestamp in the
+batch's existing lock file, without acquiring the directory lock. The file
+records `writing` before output starts, then a completed timestamp or an aborted
+write. GC imports completed timestamps before applying the 60-second retention
+window. Ordinary decode or capacity errors roll back that call's files;
+explicitly aborted writes do not refresh retention, and crashes before writeback starts
+remain recoverable on the next GC pass.
+
+After GC acquires an inactive batch's OS lock, a remaining `writing` or unreadable
+record gets one conservative 60-second protection window. GC persists that new
+timestamp before retiring the batch, so later collections can recover its space
+without blocking other calls. An aborted write keeps its original publication
+time. Because cache files survive reboots but the monotonic clock restarts, GC
+normalizes future publication and completion timestamps to the current time once;
+that also preserves a full protection window without retaining files indefinitely.
+Oneshot reports completion errors to stderr and exits nonzero. If daemon completion
+fails after the IPC response has been flushed, the daemon reports that local commit failure on its stderr;
+there is no second response frame. Only a missing index starts an empty cache
+index. Other index read errors stop GC, and both index reads and atomic writes
+use the same 4 MiB limit.
 
 `--text` prints text blocks and `Saved <kind> [<mimeType>] (<bytes> B): <path>`
 lines for saved media, notes omitted inline binary blocks on stderr when
@@ -348,6 +441,7 @@ trees, and non-UTF-8 or binary files are rejected.
 | MCP stdio message | 512 MiB per line |
 | HTTP JSON response | 512 MiB |
 | HTTP POST / GET SSE | 512 MiB per event |
+| SSE event ID | 8 KiB of UTF-8 bytes |
 | Media cache | 2 GiB total, 60 s retention after writeback |
 | Tool catalog | 256 pages, 10,000 tools, 16 MiB |
 | Global `AGENTS.md` | 1 MiB |

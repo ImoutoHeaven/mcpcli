@@ -7,13 +7,13 @@ use crate::{
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashSet, hash_map::RandomState},
     ffi::OsStr,
     hash::{BuildHasher, Hasher},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,6 +25,7 @@ use std::{
 pub const MAX_MEDIA_CACHE_BYTES: u64 = 2 << 30;
 pub const DEFAULT_PROTECTION_MS: u64 = 60_000;
 pub const DEFAULT_LOCK_WAIT: Duration = Duration::from_secs(10);
+const MAX_INDEX_BYTES: usize = 4 << 20;
 
 pub type ClockFn = Arc<dyn Fn() -> io::Result<u64> + Send + Sync>;
 
@@ -66,30 +67,32 @@ pub fn extension_for_mime(mime: &str) -> &'static str {
         .split_once(';')
         .map_or(mime, |(essence, _)| essence)
         .trim();
-    match essence.to_ascii_lowercase().as_str() {
-        "video/mp4" => ".mp4",
-        "video/webm" => ".webm",
-        "video/quicktime" => ".mov",
-        "video/3gpp" => ".3gp",
-        "video/avi" => ".avi",
-        "audio/mp4" => ".m4a",
-        "audio/wav" => ".wav",
-        "audio/mpeg" => ".mp3",
-        "audio/ogg" => ".ogg",
-        "audio/flac" => ".flac",
-        "audio/aac" => ".aac",
-        "audio/aiff" => ".aiff",
-        "application/pdf" => ".pdf",
-        "image/png" => ".png",
-        "image/jpeg" => ".jpg",
-        "image/gif" => ".gif",
-        "image/webp" => ".webp",
-        "image/bmp" => ".bmp",
-        "image/tiff" => ".tiff",
-        "image/heic" => ".heic",
-        "image/heif" => ".heif",
-        _ => ".bin",
-    }
+    [
+        ("video/mp4", ".mp4"),
+        ("video/webm", ".webm"),
+        ("video/quicktime", ".mov"),
+        ("video/3gpp", ".3gp"),
+        ("video/avi", ".avi"),
+        ("audio/mp4", ".m4a"),
+        ("audio/wav", ".wav"),
+        ("audio/mpeg", ".mp3"),
+        ("audio/ogg", ".ogg"),
+        ("audio/flac", ".flac"),
+        ("audio/aac", ".aac"),
+        ("audio/aiff", ".aiff"),
+        ("application/pdf", ".pdf"),
+        ("image/png", ".png"),
+        ("image/jpeg", ".jpg"),
+        ("image/gif", ".gif"),
+        ("image/webp", ".webp"),
+        ("image/bmp", ".bmp"),
+        ("image/tiff", ".tiff"),
+        ("image/heic", ".heic"),
+        ("image/heif", ".heif"),
+    ]
+    .into_iter()
+    .find(|(known, _)| essence.eq_ignore_ascii_case(known))
+    .map_or(".bin", |(_, extension)| extension)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,22 +311,26 @@ fn remove_ignoring_benign(path: &Path) -> bool {
     }
 }
 
-fn load_index(media_dir: &Path) -> MediaIndex {
+fn load_index(media_dir: &Path) -> Result<MediaIndex> {
     let path = media_dir.join(".index.json");
-    let Ok(file) = platform::open_input(&path) else {
-        return MediaIndex::default();
+    let file = match platform::open_input(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(MediaIndex::default()),
+        Err(error) => return Err(error).context("cannot open media cache index"),
     };
-    let Ok(bytes) = crate::json::read_limited(file, 4 << 20) else {
-        return MediaIndex::default();
-    };
-    serde_json::from_slice(&bytes).unwrap_or_default()
+    let bytes = crate::json::read_limited(file, MAX_INDEX_BYTES)
+        .context("cannot read media cache index")?;
+    serde_json::from_slice(&bytes).context("invalid media cache index")
 }
 
 fn save_index(media_dir: &Path, index: &MediaIndex) -> Result<()> {
+    let encoded = serde_json::to_vec(index)?;
+    if encoded.len() > MAX_INDEX_BYTES {
+        bail!("media cache index exceeds its {MAX_INDEX_BYTES} byte limit");
+    }
     let tmp = media_dir.join(".index.tmp");
     let _ = remove_ignoring_benign(&tmp);
     let mut file = platform::new_private_file(&tmp)?;
-    let encoded = serde_json::to_vec(index)?;
     let outcome = (|| -> Result<()> {
         file.write_all(&encoded)?;
         file.flush()?;
@@ -337,34 +344,83 @@ fn save_index(media_dir: &Path, index: &MediaIndex) -> Result<()> {
     outcome
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Writeback {
+    Writing,
+    Complete { completed_ms: u64 },
+    Aborted,
+}
+
+fn read_writeback(lock: &Lock) -> Result<Option<Writeback>> {
+    let mut file = lock.file();
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(257).read_to_end(&mut bytes)?;
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if bytes.len() > 256 {
+        bail!("media batch writeback record is too large; files remain protected");
+    }
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .context("invalid media batch writeback record; files remain protected")
+}
+
+fn write_writeback(lock: &Lock, state: Writeback) -> Result<()> {
+    let encoded = serde_json::to_vec(&state)?;
+    let mut file = lock.file();
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&encoded)?;
+    file.set_len(encoded.len() as u64)?;
+    file.flush()?;
+    file.sync_data()?;
+    Ok(())
+}
+
 fn gc_locked(
     media_dir: &Path,
     index: &mut MediaIndex,
     now_ms: u64,
     protection_ms: u64,
 ) -> Result<u64> {
+    // The cache survives a reboot, while the monotonic clock starts over. Give
+    // future records one fresh protection window and persist that normalization.
+    for meta in index.files.values_mut() {
+        meta.published_ms = meta.published_ms.min(now_ms);
+    }
     let mut active_inflight_files = HashSet::new();
-    index.inflight.retain(|batch_id, files| {
+    let mut retired = Vec::new();
+    for (batch_id, files) in &index.inflight {
         let lock_path = media_dir.join(format!(".inflight-{batch_id}.lock"));
-        match Lock::try_acquire(&lock_path) {
-            Ok(None) => {
-                for file in files {
-                    active_inflight_files.insert(file.clone());
+        match Lock::try_acquire(&lock_path)? {
+            None => {
+                active_inflight_files.extend(files.iter().cloned());
+            }
+            Some(guard) => {
+                // Exclusive ownership means no writer can still complete this
+                // batch. A crash may leave Writing or a partial record; protect
+                // that uncertain completion once, without blocking later calls.
+                let protection_start = match read_writeback(&guard) {
+                    Ok(Some(Writeback::Complete { completed_ms })) => {
+                        Some(completed_ms.min(now_ms))
+                    }
+                    Ok(Some(Writeback::Writing)) | Err(_) => Some(now_ms),
+                    Ok(Some(Writeback::Aborted)) | Ok(None) => None,
+                };
+                if let Some(start) = protection_start {
+                    for file in files {
+                        if let Some(meta) = index.files.get_mut(file) {
+                            meta.published_ms = start;
+                        }
+                    }
                 }
-                true
-            }
-            Ok(Some(guard)) => {
                 drop(guard);
-                let _ = remove_ignoring_benign(&lock_path);
-                false
-            }
-            Err(_) => {
-                let _ = remove_ignoring_benign(&lock_path);
-                false
+                retired.push((batch_id.clone(), lock_path));
             }
         }
-    });
-
+    }
     let mut used_bytes = 0u64;
     let mut seen_files = HashSet::new();
     for entry in std::fs::read_dir(media_dir)? {
@@ -425,8 +481,57 @@ fn gc_locked(
         }
     }
     index.files.retain(|name, _| seen_files.contains(name));
-    let _ = save_index(media_dir, index);
+    for (batch_id, _) in &retired {
+        index.inflight.remove(batch_id);
+    }
+    save_index(media_dir, index)?;
+    for (_, path) in retired {
+        let _ = remove_ignoring_benign(&path);
+    }
     Ok(used_bytes)
+}
+
+const WRAPPER_KEY_BYTES: usize = "result".len() + "savedMedia".len();
+
+fn media_memory_failure(budget: &ByteBudget) -> Failure {
+    Failure::new(
+        1,
+        "memory_limit_exceeded",
+        format!("saving MCP media exceeded the {} active memory limit; side effects may have occurred, the call was not retried",
+            format_bytes(budget.limit())),
+    ).uncertain(true)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SavedMediaRecord<'a> {
+    content_index: usize,
+    kind: &'a str,
+    saved_path: &'a str,
+    mime_type: &'a str,
+    bytes: u64,
+}
+
+impl SavedMediaRecord<'_> {
+    fn into_value(self) -> Value {
+        let mut record = Map::new();
+        record.insert("contentIndex".into(), self.content_index.into());
+        record.insert("kind".into(), Value::String(self.kind.to_owned()));
+        record.insert(
+            "savedPath".into(),
+            Value::String(self.saved_path.to_owned()),
+        );
+        record.insert("mimeType".into(), Value::String(self.mime_type.to_owned()));
+        record.insert("bytes".into(), self.bytes.into());
+        Value::Object(record)
+    }
+}
+
+fn wrap_saved_media(result: &mut Value, saved_media: Vec<Value>) {
+    let mut output = serde_json::Map::new();
+    output.insert("result".into(), result.take());
+    output.insert("savedMedia".into(), Value::Array(saved_media));
+    *result = Value::Object(output);
 }
 
 #[derive(Clone)]
@@ -489,7 +594,7 @@ impl MediaStore {
         let media_dir = self.directory()?;
         let _dir_lock = Lock::acquire(&media_dir.join(".lock"), self.lock_wait).await?;
         let now_ms = (self.clock)()?;
-        let mut index = load_index(&media_dir);
+        let mut index = load_index(&media_dir)?;
         gc_locked(&media_dir, &mut index, now_ms, self.protection_ms)
     }
 
@@ -499,11 +604,14 @@ impl MediaStore {
         result_lease: &mut ByteLease,
         budget: &Arc<ByteBudget>,
     ) -> std::result::Result<Option<InflightBatch>, Failure> {
+        let mut records_lease = budget
+            .try_acquire(WRAPPER_KEY_BYTES)
+            .ok_or_else(|| media_memory_failure(budget))?;
         let Some(root) = result.as_object_mut() else {
+            wrap_saved_media(result, Vec::new());
+            result_lease.merge(records_lease);
             return Ok(None);
         };
-        // Never allow an upstream result field to impersonate local savedMedia records.
-        root.remove("savedMedia");
 
         let is_media_resource = |res: &serde_json::Map<String, Value>| match res.get("blob") {
             None => false,
@@ -524,6 +632,8 @@ impl MediaStore {
                 })
             });
         if !has_media {
+            wrap_saved_media(result, Vec::new());
+            result_lease.merge(records_lease);
             return Ok(None);
         }
 
@@ -535,6 +645,14 @@ impl MediaStore {
             )
             .uncertain(true)
         })?;
+        let media_dir_text = media_dir.to_str().ok_or_else(|| Failure::new(1, "media_cache",
+            "local media cache path cannot be represented as UTF-8; side effects may have occurred, the call was not retried").uncertain(true))?;
+        // ASCII generated filenames fit within 96 bytes. PathBuf joining may
+        // double its capacity; reserve before constructing or copying paths.
+        let path_bytes = media_dir_text
+            .len()
+            .saturating_add(1 + 96)
+            .saturating_mul(2);
         let _dir_lock = Lock::acquire(&media_dir.join(".lock"), self.lock_wait)
             .await
             .map_err(|error| {
@@ -554,7 +672,9 @@ impl MediaStore {
             )
             .uncertain(true)
         })?;
-        let mut index = load_index(&media_dir);
+        let mut index = load_index(&media_dir).map_err(|error| {
+            Failure::new(1, "media_cache", format!("cannot read media cache index: {error:#}; side effects may have occurred, the call was not retried")).uncertain(true)
+        })?;
         let used_bytes = gc_locked(&media_dir, &mut index, now_ms, self.protection_ms).map_err(
             |error| {
                 Failure::new(
@@ -566,6 +686,7 @@ impl MediaStore {
             },
         )?;
 
+        let mut created_paths_lease = budget.empty_lease();
         let mut created_paths: Vec<PathBuf> = Vec::new();
         let mut inflight_lock_path: Option<PathBuf> = None;
         let pid = std::process::id();
@@ -594,8 +715,7 @@ impl MediaStore {
                             let mime = block_obj
                                 .get("mimeType")
                                 .and_then(Value::as_str)
-                                .unwrap_or("application/octet-stream")
-                                .to_owned();
+                                .unwrap_or("application/octet-stream");
                             ("image", mime, raw)
                         }
                         Some("audio") => {
@@ -605,8 +725,7 @@ impl MediaStore {
                             let mime = block_obj
                                 .get("mimeType")
                                 .and_then(Value::as_str)
-                                .unwrap_or("application/octet-stream")
-                                .to_owned();
+                                .unwrap_or("application/octet-stream");
                             ("audio", mime, raw)
                         }
                         Some("resource") => {
@@ -624,8 +743,7 @@ impl MediaStore {
                             let mime = res_obj
                                 .get("mimeType")
                                 .and_then(Value::as_str)
-                                .unwrap_or("application/octet-stream")
-                                .to_owned();
+                                .unwrap_or("application/octet-stream");
                             ("resource", mime, raw)
                         }
                         _ => continue,
@@ -644,8 +762,8 @@ impl MediaStore {
                 drop(encoded);
                 result_lease.shrink_by(encoded_len);
 
-                let (decoded, decode_lease) = match decode_res {
-                    Ok(pair) => pair,
+                let (decode_lease, decoded) = match decode_res {
+                    Ok((decoded, lease)) => (lease, decoded),
                     Err(DecodeError::InvalidBase64) => {
                         return Err(Failure::new(
                             4,
@@ -681,6 +799,14 @@ impl MediaStore {
                     .uncertain(true));
                 }
 
+                if !created_paths_lease.try_grow(path_bytes) {
+                    return Err(media_memory_failure(budget));
+                }
+                // tmp path, final path and replacement rollback-path copy may
+                // coexist; the retained rollback list has its own allowance.
+                let _path_workspace = budget
+                    .try_acquire(path_bytes.saturating_mul(3))
+                    .ok_or_else(|| media_memory_failure(budget))?;
                 let seq = next_sequence();
                 let tmp_name = format!(".tmp-{pid}-{seq}-{}", random_hex(16));
                 let tmp_path = media_dir.join(tmp_name);
@@ -706,7 +832,7 @@ impl MediaStore {
                 drop(decoded);
                 drop(decode_lease);
 
-                let ext = extension_for_mime(&mime_type);
+                let ext = extension_for_mime(mime_type);
                 let (final_name, final_path) = loop {
                     let candidate_name = format!("{}{ext}", random_hex(32));
                     let candidate_path = media_dir.join(&candidate_name);
@@ -723,6 +849,26 @@ impl MediaStore {
                         }
                     }
                 };
+                let record = SavedMediaRecord {
+                    content_index: content_idx,
+                    kind,
+                    saved_path: final_path
+                        .to_str()
+                        .expect("UTF-8 directory and ASCII filename"),
+                    mime_type,
+                    bytes: decoded_len,
+                };
+                let record_bytes = crate::json::serialized_len(&record).map_err(|error| {
+                    Failure::new(
+                        1,
+                        "media_cache",
+                        format!("cannot encode local media record: {error}"),
+                    )
+                    .uncertain(true)
+                })?;
+                if !records_lease.try_grow(record_bytes) {
+                    return Err(media_memory_failure(budget));
+                }
                 platform::replace_file(&tmp_path, &final_path).map_err(|error| {
                     Failure::new(
                         1,
@@ -737,13 +883,7 @@ impl MediaStore {
 
                 batch_bytes = next_batch;
                 batch_filenames.push(final_name);
-                saved_entries.push(json!({
-                    "contentIndex": content_idx,
-                    "kind": kind,
-                    "savedPath": final_path,
-                    "mimeType": mime_type,
-                    "bytes": decoded_len,
-                }));
+                saved_entries.push(record.into_value());
             }
 
             let batch_id = format!("{pid}-{}-{}", next_sequence(), random_hex(16));
@@ -788,22 +928,16 @@ impl MediaStore {
             Ok((
                 saved_entries,
                 InflightBatch {
-                    store: self.clone(),
-                    media_dir: media_dir.clone(),
-                    batch_id,
+                    clock: self.clock.clone(),
                     lock: Some(batch_lock),
-                    lock_path: batch_lock_path,
                 },
             ))
         })();
 
         match outcome {
             Ok((saved_entries, inflight)) => {
-                if !saved_entries.is_empty()
-                    && let Some(root) = result.as_object_mut()
-                {
-                    root.insert("savedMedia".into(), Value::Array(saved_entries));
-                }
+                wrap_saved_media(result, saved_entries);
+                result_lease.merge(records_lease);
                 Ok(Some(inflight))
             }
             Err(failure) => {
@@ -820,54 +954,44 @@ impl MediaStore {
 }
 
 pub struct InflightBatch {
-    store: MediaStore,
-    media_dir: PathBuf,
-    batch_id: String,
+    clock: ClockFn,
     lock: Option<Lock>,
-    lock_path: PathBuf,
 }
 
 impl InflightBatch {
-    pub async fn complete(mut self) {
-        if let Ok(_dir_lock) =
-            Lock::acquire(&self.media_dir.join(".lock"), self.store.lock_wait).await
-        {
-            let mut index = load_index(&self.media_dir);
-            if let Some(files) = index.inflight.remove(&self.batch_id)
-                && let Ok(now_ms) = (self.store.clock)()
-            {
-                for name in files {
-                    if let Some(meta) = index.files.get_mut(&name) {
-                        meta.published_ms = now_ms;
-                    }
-                }
-            }
-            let _ = save_index(&self.media_dir, &index);
-            drop(self.lock.take());
-            let _ = remove_ignoring_benign(&self.lock_path);
-        } else {
-            drop(self.lock.take());
-        }
+    pub fn begin_writeback(&self) -> Result<()> {
+        write_writeback(
+            self.lock.as_ref().expect("active batch"),
+            Writeback::Writing,
+        )
+        .context("cannot record media writeback start")
     }
 
-    pub async fn abort(mut self) {
-        if let Ok(_dir_lock) =
-            Lock::acquire(&self.media_dir.join(".lock"), Duration::from_secs(2)).await
-        {
-            let mut index = load_index(&self.media_dir);
-            index.inflight.remove(&self.batch_id);
-            let _ = save_index(&self.media_dir, &index);
-            drop(self.lock.take());
-            let _ = remove_ignoring_benign(&self.lock_path);
-        } else {
-            drop(self.lock.take());
-        }
+    pub async fn complete(mut self) -> Result<()> {
+        let completed_ms = (self.clock)().context("cannot read media completion clock")?;
+        write_writeback(
+            self.lock.as_ref().expect("active batch"),
+            Writeback::Complete { completed_ms },
+        )
+        .context("cannot record media writeback completion; files remain protected")?;
+        drop(self.lock.take());
+        Ok(())
+    }
+
+    pub async fn abort(mut self) -> Result<()> {
+        write_writeback(
+            self.lock.as_ref().expect("active batch"),
+            Writeback::Aborted,
+        )
+        .context("cannot record interrupted media writeback; files remain protected")?;
+        drop(self.lock.take());
+        Ok(())
     }
 }
 
 impl Drop for InflightBatch {
     fn drop(&mut self) {
-        // Releasing the OS lock lets the next holder of .lock reclaim the stale batch.
+        // GC reads the durable writeback state after this OS lock is released.
         drop(self.lock.take());
     }
 }
@@ -875,6 +999,30 @@ impl Drop for InflightBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn saved_media_wrapper_moves_existing_string_buffers() {
+        let mut result = json!({"content": [{"type": "text", "text": "x".repeat(128 << 10)}]});
+        let text_ptr = result["content"][0]["text"].as_str().unwrap().as_ptr();
+        let saved = vec![json!({"savedPath": "a".repeat(4096)})];
+        let path_ptr = saved[0]["savedPath"].as_str().unwrap().as_ptr();
+        wrap_saved_media(&mut result, saved);
+        assert_eq!(
+            result["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            text_ptr
+        );
+        assert_eq!(
+            result["savedMedia"][0]["savedPath"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            path_ptr
+        );
+    }
 
     #[test]
     fn mime_whitelist_covers_all_required_types_and_falls_back_to_bin() {
@@ -987,7 +1135,371 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rollback_on_error_and_forged_remote_saved_media_rejection() {
+    async fn completion_record_survives_directory_contention_and_clock_failure() {
+        let (_base, media_dir) = test_media_dir();
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock_now = now.clone();
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            4096,
+            60_000,
+            Duration::from_millis(25),
+            Arc::new(move || {
+                let now = clock_now.load(Ordering::Acquire);
+                if now == u64::MAX {
+                    Err(io::Error::other("clock unavailable"))
+                } else {
+                    Ok(now)
+                }
+            }),
+        );
+        let budget = ByteBudget::new(4096);
+        let mut result =
+            json!({"content": [{"type":"image","mimeType":"image/png","data":"AQID"}]});
+        let mut lease = budget.empty_lease();
+        let batch = store
+            .extract_and_save(&mut result, &mut lease, &budget)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = PathBuf::from(result["savedMedia"][0]["savedPath"].as_str().unwrap());
+        batch.begin_writeback().unwrap();
+        now.store(80_000, Ordering::Release);
+        let dir_lock = Lock::try_acquire(&media_dir.join(".lock"))
+            .unwrap()
+            .unwrap();
+        // Completing a slow write never waits for the directory lock.
+        batch.complete().await.unwrap();
+        drop(dir_lock);
+        now.store(139_999, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 3);
+        assert!(path.exists());
+        now.store(140_000, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 0);
+        assert!(!path.exists());
+
+        let mut result =
+            json!({"content": [{"type":"image","mimeType":"image/png","data":"AQID"}]});
+        let batch = store
+            .extract_and_save(&mut result, &mut lease, &budget)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = PathBuf::from(result["savedMedia"][0]["savedPath"].as_str().unwrap());
+        batch.begin_writeback().unwrap();
+        now.store(u64::MAX, Ordering::Release);
+        assert!(
+            batch
+                .complete()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("completion clock")
+        );
+        // With no writer left, recover Writing with one conservative window.
+        now.store(300_000, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 3);
+        assert!(load_index(&media_dir).unwrap().inflight.is_empty());
+        assert!(path.exists());
+        now.store(359_999, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 3);
+        now.store(360_000, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 0);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn inactive_writeback_recovers_without_blocking_other_batches() {
+        for state in ["writing", "incomplete", "aborted"] {
+            let (_base, media_dir) = test_media_dir();
+            let now = Arc::new(AtomicU64::new(1_000));
+            let clock_now = now.clone();
+            let store = MediaStore::with_options(
+                media_dir.clone(),
+                6,
+                60_000,
+                Duration::from_secs(1),
+                Arc::new(move || Ok(clock_now.load(Ordering::Acquire))),
+            );
+            let budget = ByteBudget::new(16 * 1024);
+            let mut result =
+                json!({"content":[{"type":"image","mimeType":"image/png","data":"AQID"}]});
+            let mut lease = budget.empty_lease();
+            let batch = store
+                .extract_and_save(&mut result, &mut lease, &budget)
+                .await
+                .unwrap()
+                .unwrap();
+            let path = PathBuf::from(result["savedMedia"][0]["savedPath"].as_str().unwrap());
+            batch.begin_writeback().unwrap();
+            if state == "incomplete" {
+                // An interrupted journal update may leave only its first byte.
+                let mut file = batch.lock.as_ref().unwrap().file();
+                file.seek(SeekFrom::Start(0)).unwrap();
+                file.write_all(b"{").unwrap();
+                file.set_len(1).unwrap();
+                file.flush().unwrap();
+            }
+            if state == "aborted" {
+                batch.abort().await.unwrap();
+                now.store(300_000, Ordering::Release);
+                assert_eq!(store.run_gc().await.unwrap(), 0);
+                assert!(!path.exists());
+                continue;
+            }
+            drop(batch);
+            now.store(300_000, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 3);
+            assert!(load_index(&media_dir).unwrap().inflight.is_empty());
+            assert!(path.exists());
+            let mut later =
+                json!({"content":[{"type":"image","mimeType":"image/png","data":"BAUG"}]});
+            let mut later_lease = budget.empty_lease();
+            store
+                .extract_and_save(&mut later, &mut later_lease, &budget)
+                .await
+                .unwrap()
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            now.store(359_999, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 6);
+            assert!(path.exists());
+            now.store(360_000, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 0);
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn future_monotonic_timestamps_get_one_protection_window() {
+        for pending_completion in [false, true] {
+            let (_base, media_dir) = test_media_dir();
+            let now = Arc::new(AtomicU64::new(500_000));
+            let clock_now = now.clone();
+            let store = MediaStore::with_options(
+                media_dir.clone(),
+                3,
+                60_000,
+                Duration::from_secs(1),
+                Arc::new(move || Ok(clock_now.load(Ordering::Acquire))),
+            );
+            let budget = ByteBudget::new(16 * 1024);
+            let mut result =
+                json!({"content":[{"type":"image","mimeType":"image/png","data":"AQID"}]});
+            let mut lease = budget.empty_lease();
+            store
+                .extract_and_save(&mut result, &mut lease, &budget)
+                .await
+                .unwrap()
+                .unwrap()
+                .complete()
+                .await
+                .unwrap();
+            let path = PathBuf::from(result["savedMedia"][0]["savedPath"].as_str().unwrap());
+            if !pending_completion {
+                assert_eq!(store.run_gc().await.unwrap(), 3);
+            }
+            now.store(1_000, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 3);
+            assert!(
+                load_index(&media_dir)
+                    .unwrap()
+                    .files
+                    .values()
+                    .all(|meta| meta.published_ms == 1_000)
+            );
+            now.store(60_999, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 3);
+            assert!(path.exists());
+            now.store(61_000, Ordering::Release);
+            assert_eq!(store.run_gc().await.unwrap(), 0);
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_or_unreadable_index_never_runs_destructive_gc() {
+        let (_base, media_dir) = test_media_dir();
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            4096,
+            60_000,
+            Duration::from_secs(1),
+            Arc::new(|| Ok(500_000)),
+        );
+        store.directory().unwrap();
+        let saved = media_dir.join("existing.png");
+        std::fs::write(&saved, b"keep").unwrap();
+        let index_path = media_dir.join(".index.json");
+        for contents in [b"{bad json".to_vec(), vec![b' '; MAX_INDEX_BYTES + 1]] {
+            std::fs::write(&index_path, &contents).unwrap();
+            assert!(store.run_gc().await.is_err());
+            assert_eq!(std::fs::read(&saved).unwrap(), b"keep");
+            assert_eq!(std::fs::read(&index_path).unwrap(), contents);
+        }
+        std::fs::remove_file(&index_path).unwrap();
+        std::fs::create_dir(&index_path).unwrap();
+        assert!(store.run_gc().await.is_err());
+        assert!(saved.exists());
+    }
+
+    #[test]
+    fn index_read_and_write_share_the_same_limit() {
+        let (_base, media_dir) = test_media_dir();
+        std::fs::create_dir(&media_dir).unwrap();
+        let mut index = MediaIndex::default();
+        index
+            .files
+            .insert(String::new(), FileMeta { published_ms: 1 });
+        let overhead = serde_json::to_vec(&index).unwrap().len();
+        index.files.clear();
+        index.files.insert(
+            "x".repeat(MAX_INDEX_BYTES - overhead),
+            FileMeta { published_ms: 1 },
+        );
+        save_index(&media_dir, &index).unwrap();
+        let valid = std::fs::read(media_dir.join(".index.json")).unwrap();
+        assert_eq!(valid.len(), MAX_INDEX_BYTES);
+        assert_eq!(load_index(&media_dir).unwrap().files.len(), 1);
+        index
+            .files
+            .insert("extra".into(), FileMeta { published_ms: 2 });
+        assert!(save_index(&media_dir, &index).is_err());
+        assert_eq!(std::fs::read(media_dir.join(".index.json")).unwrap(), valid);
+        assert!(!media_dir.join(".index.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn saved_records_hold_their_budget_and_admission_rolls_back_only_this_batch() {
+        let (base, _) = test_media_dir();
+        let media_dir = base.path().canonicalize().unwrap().join("media-é");
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            4096,
+            60_000,
+            Duration::from_secs(2),
+            Arc::new(|| Ok(1_000)),
+        );
+        let source = json!({"content":[{"type":"image", "mimeType":"image/png", "data":"AQID"}]});
+        let source_bytes = crate::json::serialized_len(&source).unwrap();
+        let initial_budget = ByteBudget::new(16 << 10);
+        let mut initial_lease = initial_budget.try_acquire(source_bytes).unwrap();
+        let mut initial = source.clone();
+        store
+            .extract_and_save(&mut initial, &mut initial_lease, &initial_budget)
+            .await
+            .unwrap()
+            .unwrap()
+            .complete()
+            .await
+            .unwrap();
+        let existing = PathBuf::from(initial["savedMedia"][0]["savedPath"].as_str().unwrap());
+        drop(initial);
+        drop(initial_lease);
+        assert_eq!(initial_budget.used(), 0);
+
+        let sample_path = media_dir.join(format!("{}.png", "0".repeat(32)));
+        let sample_record = SavedMediaRecord {
+            content_index: 0,
+            kind: "image",
+            saved_path: sample_path.to_str().unwrap(),
+            mime_type: "image/png",
+            bytes: 3,
+        };
+        let record_bytes = crate::json::serialized_len(&sample_record).unwrap();
+        let path_bytes = 2 * (media_dir.to_str().unwrap().len() + 1 + 96);
+        let retained = source_bytes - 4 + WRAPPER_KEY_BYTES + record_bytes;
+        let peak = retained + 4 * path_bytes;
+        for limit in [peak - 1, peak] {
+            let budget = ByteBudget::new(limit);
+            let mut lease = budget.try_acquire(source_bytes).unwrap();
+            let mut result = source.clone();
+            let outcome = store
+                .extract_and_save(&mut result, &mut lease, &budget)
+                .await;
+            if limit < peak {
+                let error = outcome
+                    .err()
+                    .expect("record admission must fail before publication");
+                assert_eq!(error.kind, "memory_limit_exceeded");
+                assert!(error.outcome_unknown);
+                assert_eq!(budget.used(), source_bytes - 4);
+            } else {
+                outcome.unwrap().unwrap().complete().await.unwrap();
+                assert_eq!(budget.used(), retained);
+                assert_eq!(lease.bytes(), retained);
+                assert_eq!(result["savedMedia"][0]["mimeType"], "image/png");
+                let path = Path::new(result["savedMedia"][0]["savedPath"].as_str().unwrap());
+                assert_eq!(path.parent(), Some(media_dir.as_path()));
+                assert_eq!(std::fs::read(path).unwrap(), [1, 2, 3]);
+            }
+            assert!(
+                existing.exists(),
+                "a previous protected batch must survive admission failure"
+            );
+            let entries: Vec<_> = std::fs::read_dir(&media_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(
+                !entries
+                    .iter()
+                    .any(|name| name.to_str().unwrap().starts_with(".tmp-"))
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|name| !name.to_str().unwrap().starts_with('.'))
+                    .count(),
+                if limit < peak { 1 } else { 2 }
+            );
+            drop(result);
+            drop(lease);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_media_directory_returns_a_cache_error_before_publication() {
+        use std::os::unix::ffi::OsStringExt;
+        let (base, _) = test_media_dir();
+        let media_dir = base.path().join(std::ffi::OsString::from_vec(vec![
+            b'm', b'e', b'd', b'i', b'a', b'-', 0xff,
+        ]));
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            4096,
+            60_000,
+            Duration::from_secs(2),
+            Arc::new(|| Ok(1_000)),
+        );
+        let budget = ByteBudget::new(4096);
+        let mut result =
+            json!({"content":[{"type":"image", "mimeType":"image/png", "data":"AQID"}]});
+        let source_bytes = crate::json::serialized_len(&result).unwrap();
+        let mut lease = budget.try_acquire(source_bytes).unwrap();
+        let error = store
+            .extract_and_save(&mut result, &mut lease, &budget)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.kind, "media_cache");
+        assert!(error.outcome_unknown);
+        assert_eq!(result["content"][0]["data"], "AQID");
+        assert_eq!(budget.used(), source_bytes);
+        if let Ok(entries) = std::fs::read_dir(&media_dir) {
+            assert_eq!(entries.count(), 0);
+        }
+        drop(result);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_on_error_and_remote_saved_media_preservation() {
         let (_base, media_dir) = test_media_dir();
         let now = Arc::new(AtomicU64::new(1_000));
         let clock_now = now.clone();
@@ -1000,7 +1512,7 @@ mod tests {
         );
         let budget = ByteBudget::new(4096);
 
-        // Forged savedMedia on text-only result is stripped.
+        // Remote fields stay inside result even when no local media is saved.
         let mut forged_text = json!({
             "content": [{"type": "text", "text": "ok"}],
             "savedMedia": [{"contentIndex": 0, "savedPath": "/etc/passwd"}],
@@ -1014,10 +1526,14 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(forged_text.get("savedMedia").is_none());
-        assert_eq!(forged_text.get("x-extra"), Some(&Value::Null));
+        assert_eq!(forged_text["savedMedia"], json!([]));
+        assert_eq!(
+            forged_text["result"]["savedMedia"][0]["savedPath"],
+            "/etc/passwd"
+        );
+        assert_eq!(forged_text["result"].get("x-extra"), Some(&Value::Null));
 
-        // First call saves 4 bytes ("AQIDBA=="), ignoring hostile remote URI and forged savedMedia.
+        // Local filenames and saved records remain separate from remote metadata.
         let mut valid = json!({
             "content": [{
                 "type": "resource",
@@ -1036,7 +1552,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        inflight.complete().await;
+        inflight.complete().await.unwrap();
+        assert_eq!(
+            valid["result"]["savedMedia"],
+            json!([{"savedPath": "/forged"}])
+        );
         let saved = valid["savedMedia"].as_array().unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0]["kind"], "resource");
@@ -1054,9 +1574,13 @@ mod tests {
         );
         assert!(!saved_path.to_string_lossy().contains("passwd"));
         assert_eq!(std::fs::read(&saved_path).unwrap(), vec![1, 2, 3, 4]);
-        assert!(valid["content"][0]["resource"].get("blob").is_none());
+        assert!(
+            valid["result"]["content"][0]["resource"]
+                .get("blob")
+                .is_none()
+        );
         assert_eq!(
-            valid["content"][0]["resource"]["_meta"]["keep"],
+            valid["result"]["content"][0]["resource"]["_meta"]["keep"],
             Value::Null
         );
 
@@ -1137,10 +1661,13 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            text_only["content"][0]["resource"].get("blob"),
+            text_only["result"]["content"][0]["resource"].get("blob"),
             Some(&Value::Null)
         );
-        assert_eq!(text_only["content"][0]["resource"]["text"], "hello");
+        assert_eq!(
+            text_only["result"]["content"][0]["resource"]["text"],
+            "hello"
+        );
 
         let mut mixed = json!({
             "content": [
@@ -1154,9 +1681,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        batch.complete().await;
+        batch.complete().await.unwrap();
         assert_eq!(
-            mixed["content"][0]["resource"].get("blob"),
+            mixed["result"]["content"][0]["resource"].get("blob"),
             Some(&Value::Null)
         );
         assert_eq!(mixed["savedMedia"][0]["contentIndex"], 1);

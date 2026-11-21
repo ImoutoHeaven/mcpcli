@@ -88,6 +88,76 @@ impl ByteLease {
         }
     }
 
+    fn replacement_lease(&self, capacity: usize, needed: usize, limit: usize) -> Option<Self> {
+        if needed > limit {
+            return None;
+        }
+        let target = needed.max(capacity.saturating_mul(2)).min(limit);
+        self.budget.try_acquire(target).or_else(|| {
+            (target != needed)
+                .then(|| self.budget.try_acquire(needed))
+                .flatten()
+        })
+    }
+
+    /// Reserve a replacement before copying, accounting for both allocations
+    /// until the old buffer is freed. `needed` is the total required length.
+    pub fn reserve_vec(&mut self, buffer: &mut Vec<u8>, needed: usize, limit: usize) -> bool {
+        if needed <= buffer.capacity() {
+            return needed <= limit;
+        }
+        let Some(mut replacement_lease) = self.replacement_lease(buffer.capacity(), needed, limit)
+        else {
+            return false;
+        };
+        let mut replacement = Vec::new();
+        if replacement
+            .try_reserve_exact(replacement_lease.bytes())
+            .is_err()
+            || !replacement_lease.try_grow(
+                replacement
+                    .capacity()
+                    .saturating_sub(replacement_lease.bytes()),
+            )
+        {
+            return false;
+        }
+        replacement.extend_from_slice(buffer);
+        let old_capacity = buffer.capacity();
+        *buffer = replacement;
+        self.shrink_by(old_capacity);
+        self.merge(replacement_lease);
+        true
+    }
+
+    pub fn reserve_string(&mut self, buffer: &mut String, needed: usize, limit: usize) -> bool {
+        if needed <= buffer.capacity() {
+            return needed <= limit;
+        }
+        let Some(mut replacement_lease) = self.replacement_lease(buffer.capacity(), needed, limit)
+        else {
+            return false;
+        };
+        let mut replacement = String::new();
+        if replacement
+            .try_reserve_exact(replacement_lease.bytes())
+            .is_err()
+            || !replacement_lease.try_grow(
+                replacement
+                    .capacity()
+                    .saturating_sub(replacement_lease.bytes()),
+            )
+        {
+            return false;
+        }
+        replacement.push_str(buffer);
+        let old_capacity = buffer.capacity();
+        *buffer = replacement;
+        self.shrink_by(old_capacity);
+        self.merge(replacement_lease);
+        true
+    }
+
     pub fn shrink_to(&mut self, retained: usize) {
         if retained < self.bytes {
             let delta = self.bytes - retained;
@@ -102,6 +172,17 @@ impl ByteLease {
 
     pub fn release(&mut self) {
         self.shrink_to(0);
+    }
+
+    pub fn split(&mut self, bytes: usize) -> Option<Self> {
+        if bytes > self.bytes {
+            return None;
+        }
+        self.bytes -= bytes;
+        Some(Self {
+            budget: self.budget.clone(),
+            bytes,
+        })
     }
 
     pub fn take(&mut self) -> Self {
@@ -128,6 +209,41 @@ impl Drop for ByteLease {
     }
 }
 
+/// A value whose allocation remains charged while its caller retains it.
+#[derive(Debug)]
+pub struct Leased<T> {
+    value: T,
+    lease: ByteLease,
+}
+
+impl<T> Leased<T> {
+    pub fn new(value: T, lease: ByteLease) -> Self {
+        Self { value, lease }
+    }
+
+    pub(crate) fn value_mut(&mut self) -> &mut T {
+        &mut self.value
+    }
+
+    pub fn into_parts(self) -> (T, ByteLease) {
+        (self.value, self.lease)
+    }
+}
+
+impl<T> std::ops::Deref for Leased<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: AsRef<[u8]>> AsRef<[u8]> for Leased<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.value.as_ref()
+    }
+}
+
 pub fn format_bytes(bytes: usize) -> String {
     const MIB: usize = 1 << 20;
     const GIB: usize = 1 << 30;
@@ -143,6 +259,62 @@ pub fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffer_growth_accounts_capacity_and_overlapping_replacements() {
+        let budget = ByteBudget::new(40);
+        let mut lease = budget.empty_lease();
+        let mut buffer = Vec::new();
+        assert!(lease.reserve_vec(&mut buffer, 16, 64));
+        buffer.extend_from_slice(&[1; 16]);
+        assert_eq!(lease.bytes(), buffer.capacity());
+        // Doubling would need 16 + 32 live bytes; an exact replacement fits.
+        assert!(lease.reserve_vec(&mut buffer, 17, 64));
+        assert_eq!(buffer.capacity(), 17);
+        assert_eq!(lease.bytes(), 17);
+        assert_eq!(buffer, [1; 16]);
+        assert!(!lease.reserve_vec(&mut buffer, 24, 64));
+        assert_eq!(buffer.capacity(), 17);
+        assert_eq!(budget.used(), 17);
+        drop(buffer);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        let mut lease = budget.empty_lease();
+        let mut text = String::new();
+        assert!(lease.reserve_string(&mut text, 16, 64));
+        text.push_str("abcdefghijklmnop");
+        assert!(lease.reserve_string(&mut text, 17, 64));
+        assert_eq!(text, "abcdefghijklmnop");
+        assert_eq!(lease.bytes(), text.capacity());
+        assert!(!lease.reserve_string(&mut text, 24, 64));
+        drop(text);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelled_future_drops_payload_before_its_lease() {
+        struct Payload(Arc<ByteBudget>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.0.used(), 64);
+            }
+        }
+        for polled in [false, true] {
+            let budget = ByteBudget::new(64);
+            let payload = Leased::new(Payload(budget.clone()), budget.try_acquire(64).unwrap());
+            let future = async move {
+                let _payload = payload;
+                std::future::pending::<()>().await;
+            };
+            if polled {
+                assert!(futures_util::FutureExt::now_or_never(future).is_none());
+            } else {
+                drop(future);
+            }
+            assert_eq!(budget.used(), 0);
+        }
+    }
 
     #[test]
     fn non_blocking_admission_handoff_and_release_leave_zero_debt() {

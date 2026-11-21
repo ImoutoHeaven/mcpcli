@@ -265,17 +265,17 @@ def state_and_discovery(f):
     assert tools and all({"name", "description", "inputSchema"} <= set(tool) for tool in tools)
     assert "admin" not in [tool["name"] for tool in tools]
     assert f.value("inspect", "state", "set")["inputSchema"]["type"] == "object"
-    first = f.call("set", {"stage": "canary"})["structuredContent"]
-    second = f.call("get")["structuredContent"]
+    first = f.call("set", {"stage": "canary"})["result"]["structuredContent"]
+    second = f.call("get")["result"]["structuredContent"]
     assert first["pid"] == second["pid"] and second["state"]["stage"] == "canary"
     f.call("unlock")
     assert "admin" in [tool["name"] for page in f.value("tools", "state")["pages"] for tool in page["tools"]]
-    assert f.call("admin")["structuredContent"]["state"]["stage"] == "canary"
-    one = f.value("--oneshot", "call", "state", "get")["structuredContent"]
+    assert f.call("admin")["result"]["structuredContent"]["state"]["stage"] == "canary"
+    one = f.value("--oneshot", "call", "state", "get")["result"]["structuredContent"]
     assert one["state"] == {} and one["pid"] != second["pid"]
-    assert f.call("get")["structuredContent"]["state"]["stage"] == "canary"
+    assert f.call("get")["result"]["structuredContent"]["state"]["stage"] == "canary"
     f.value("reset", "state")
-    reset = f.call("get")["structuredContent"]
+    reset = f.call("get")["result"]["structuredContent"]
     assert reset["state"] == {} and reset["pid"] != second["pid"]
     assert len(f.events("start")) == 3
 
@@ -287,12 +287,12 @@ def json_inputs_and_outputs(f):
                "private": {"$serde_json::private::Number": "123",
                            "$serde_json::private::RawValue": "[1,2]"}}
     encoded = json.dumps(payload)
-    assert f.call("echo", payload)["structuredContent"] == payload
+    assert f.call("echo", payload)["result"]["structuredContent"] == payload
     path = f.root / "arguments.json"
     path.write_text(encoded)
-    assert f.value("call", "state", "echo", "--args-file", str(path))["structuredContent"] == payload
-    assert f.value("call", "state", "echo", "--stdin", input_text=encoded)["structuredContent"] == payload
-    assert f.call("echo")["structuredContent"] == {}
+    assert f.value("call", "state", "echo", "--args-file", str(path))["result"]["structuredContent"] == payload
+    assert f.value("call", "state", "echo", "--stdin", input_text=encoded)["result"]["structuredContent"] == payload
+    assert f.call("echo")["result"]["structuredContent"] == {}
     before = len(f.events("call"))
     for invalid in ('[]', '{"a":1,"a":2}', '{"n":18446744073709551616}',
                     '{"n":0.12345678901234567890123456789}'):
@@ -301,12 +301,12 @@ def json_inputs_and_outputs(f):
     source = '{"number":1.917236612140147400e-154}'
     precise = f.invoke("call", "state", "echo", "--args", source)
     received = json.loads(precise.stdout, parse_float=Decimal)
-    assert received["structuredContent"]["number"] == Decimal("1.917236612140147400e-154")
+    assert received["result"]["structuredContent"]["number"] == Decimal("1.917236612140147400e-154")
     failure = f.value("call", "state", "error", "--args", '{"failure":"expected"}', code=3)
-    assert failure["isError"] is True and failure["structuredContent"]["failure"] == "expected"
+    assert failure["result"]["isError"] is True and failure["result"]["structuredContent"]["failure"] == "expected"
     mixed = f.call("mixed", {"ok": True})
-    assert "data" not in mixed["content"][1]
-    assert mixed["_meta"]["fixture"] == "cli-acceptance"
+    assert "data" not in mixed["result"]["content"][1]
+    assert mixed["result"]["_meta"]["fixture"] == "cli-acceptance"
     assert len(mixed["savedMedia"]) == 1
     saved = mixed["savedMedia"][0]
     assert saved["contentIndex"] == 1 and saved["kind"] == "image"
@@ -326,15 +326,15 @@ def json_inputs_and_outputs(f):
 
 
 def session_and_restart(f):
-    a = f.call("set", {"value": "a"})["structuredContent"]
-    b = f.call("set", {"value": "b"}, session="other")["structuredContent"]
+    a = f.call("set", {"value": "a"})["result"]["structuredContent"]
+    b = f.call("set", {"value": "b"}, session="other")["result"]["structuredContent"]
     assert a["pid"] != b["pid"]
-    assert f.call("get")["structuredContent"]["state"] == {"value": "a"}
-    assert f.call("get", session="other")["structuredContent"]["state"] == {"value": "b"}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {"value": "a"}
+    assert f.call("get", session="other")["result"]["structuredContent"]["state"] == {"value": "b"}
     assert f.value("daemon", "status")["namespace"] != f.value("daemon", "status", session="other")["namespace"]
     f.value("daemon", "restart")
-    assert f.call("get")["structuredContent"]["state"] == {}
-    assert f.call("get", session="other")["structuredContent"]["state"] == {"value": "b"}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
+    assert f.call("get", session="other")["result"]["structuredContent"]["state"] == {"value": "b"}
 
 
 def global_agents(f):
@@ -465,7 +465,7 @@ def changed_and_deleted_config(f):
     assert f.fail("daemon", "start", code=6)["kind"] == "daemon_mismatch"
     assert f.value("daemon", "status")["pid"] == previous["pid"]
     f.value("daemon", "restart")
-    assert f.call("get")["structuredContent"]["state"] == {}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
     f.config.unlink()
     assert f.value("daemon", "status")["running"] is True
     assert f.value("daemon", "stop")["stopped"] is True
@@ -477,7 +477,7 @@ def simultaneous_startup(f):
 
     def increment(_):
         barrier.wait()
-        return f.call("increment", timeout=20)["structuredContent"]["state"]["counter"]
+        return f.call("increment", timeout=20)["result"]["structuredContent"]["state"]["counter"]
 
     with ThreadPoolExecutor(max_workers=16) as pool:
         counters = list(pool.map(increment, range(16)))
@@ -490,7 +490,7 @@ def simultaneous_startup(f):
     f.save_config()
     f.value("daemon", "restart")
     f.value("call", "slow", "get")
-    fast = f.value("call", "fast", "get")["structuredContent"]
+    fast = f.value("call", "fast", "get")["result"]["structuredContent"]
     status = f.value("daemon", "status")
     socket_path = f.runtime / status["namespace"] / "sock"
     queued = [f.start("call", "slow", "wait", "--args", '{"seconds":30}', timeout=40)
@@ -503,7 +503,7 @@ def simultaneous_startup(f):
         time.sleep(1)
         assert all(process.poll() is None for process in queued), "queued client exited early"
     started = time.monotonic()
-    result = f.value("call", "fast", "get", timeout=2, wall_timeout=4)["structuredContent"]
+    result = f.value("call", "fast", "get", timeout=2, wall_timeout=4)["result"]["structuredContent"]
     assert result["pid"] == fast["pid"]
     assert time.monotonic() - started < 2, "one busy server starved an independent server"
     for process in queued:
@@ -526,7 +526,7 @@ def timeout_and_disconnect(f):
     wait_for(lambda: f.events("cancel", request_id=request_id, matched=True),
              "client disconnect did not cancel the MCP request")
     assert len(f.events("call", tool="wait")) == 2
-    assert f.call("get")["structuredContent"]["state"] == {}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
     assert len(f.events("start")) == 1
 
 
@@ -634,7 +634,7 @@ def unclean_stop_requires_explicit_recovery(f):
     assert not f.events("start"), "implicit recovery spawned an MCP process"
     restarted = f.value("daemon", "start")
     assert restarted["pid"] != status["pid"]
-    assert f.call("get")["structuredContent"]["state"] == {}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
 
 
 def lost_server_requires_reset(f):
@@ -646,7 +646,7 @@ def lost_server_requires_reset(f):
     assert f.fail("call", "state", "get", code=6)["kind"] == "session_lost"
     assert len(f.events("start")) == 1
     f.value("reset", "state")
-    assert f.call("get")["structuredContent"]["state"] == {}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
     assert len(f.events("start")) == 2
 
 
@@ -659,12 +659,12 @@ def http_cleanup_failure(f, mode):
     }
     f.save_config()
     result = f.invoke("--oneshot", "call", "state", "get", code=1)
-    assert json.loads(result.stdout)["structuredContent"] == {"name": "get"}
+    assert json.loads(result.stdout)["result"]["structuredContent"] == {"name": "get"}
     assert error_value(result)["kind"] == "cleanup"
     assert "do not replay" in error_value(result)["message"]
     assert log.read_text().splitlines().count("DELETE") == 1
     assert log.read_text().splitlines().count("tools/call") == 1
-    peer = f.value("call", "local_peer", "set", "--args", '{"keep":"alive"}')["structuredContent"]
+    peer = f.value("call", "local_peer", "set", "--args", '{"keep":"alive"}')["result"]["structuredContent"]
     f.call("get")
     assert f.fail("reset", "state", code=1)["kind"] == "cleanup"
     assert f.value("daemon", "status")["servers"]["state"]["state"] == "lost"
@@ -676,16 +676,16 @@ def http_cleanup_failure(f, mode):
     forced_json = json.loads(forced.stdout)
     assert forced_json["reset"] is True and "cleanup_warning" in forced_json
     assert "unconfirmed remote cleanup" in forced.stderr
-    assert f.value("call", "local_peer", "get")["structuredContent"]["pid"] == peer["pid"]
-    assert f.value("call", "local_peer", "get")["structuredContent"]["state"] == {"keep": "alive"}
-    assert f.call("get")["structuredContent"] == {"name": "get"}
+    assert f.value("call", "local_peer", "get")["result"]["structuredContent"]["pid"] == peer["pid"]
+    assert f.value("call", "local_peer", "get")["result"]["structuredContent"]["state"] == {"keep": "alive"}
+    assert f.call("get")["result"]["structuredContent"] == {"name": "get"}
     # Active HTTP cleanup failure during daemon restart still brings up the replacement daemon.
     old_pid = f.value("daemon", "status")["pid"]
     restarted = f.invoke("daemon", "restart")
     restarted_status = json.loads(restarted.stdout)
     assert restarted_status["running"] is True and restarted_status["pid"] != old_pid
     assert "cleanup" in restarted.stderr
-    assert f.call("get")["structuredContent"] == {"name": "get"}
+    assert f.call("get")["result"]["structuredContent"] == {"name": "get"}
     assert f.fail("daemon", "stop", code=1)["kind"] == "runtime"
     assert f.value("daemon", "status")["running"] is False
     states = list(f.runtime.glob("*/state.json"))
@@ -698,7 +698,7 @@ def http_cleanup_failure(f, mode):
 def http_delete_error_is_reported(f):
     redirect_log = f.use_http("delete_redirect")
     redirect_result = f.invoke("--oneshot", "call", "state", "get", code=1)
-    assert json.loads(redirect_result.stdout)["structuredContent"] == {"name": "get"}
+    assert json.loads(redirect_result.stdout)["result"]["structuredContent"] == {"name": "get"}
     assert error_value(redirect_result)["kind"] == "cleanup"
     assert "do not replay" in error_value(redirect_result)["message"]
     assert redirect_log.read_text().splitlines().count("DELETE") == 1
@@ -769,7 +769,7 @@ def interrupt_after_result_preserves_known_outcome(f):
     interrupt(process, signal.CTRL_BREAK_EVENT if WINDOWS else signal.SIGINT)
     stdout, stderr = process.communicate(timeout=6)
     assert process.returncode == (143 if WINDOWS else 130), (process.returncode, stderr)
-    assert json.loads(stdout)["structuredContent"] == {"name": "get"}, stdout
+    assert json.loads(stdout)["result"]["structuredContent"] == {"name": "get"}, stdout
     failure = json.loads(stderr)["error"]
     assert failure["kind"] == "cancelled", failure
     assert not failure.get("outcome_unknown", False), "known result became an uncertain call"
@@ -780,7 +780,7 @@ def http_optional_session_delete(f):
     for mode in ("delete_expired", "delete_unsupported"):
         log = f.use_http(mode)
         result = f.invoke("--oneshot", "call", "state", "get")
-        assert json.loads(result.stdout)["structuredContent"] == {"name": "get"}
+        assert json.loads(result.stdout)["result"]["structuredContent"] == {"name": "get"}
         assert not result.stderr
         assert log.read_text().splitlines().count("DELETE") == 1
     assert not f.runtime.exists()
@@ -792,7 +792,7 @@ def burst_admission(f):
 
     def increment(_):
         barrier.wait()
-        return f.call("increment", timeout=20)["structuredContent"]["state"]["counter"]
+        return f.call("increment", timeout=20)["result"]["structuredContent"]["state"]["counter"]
 
     with ThreadPoolExecutor(max_workers=40) as pool:
         counters = list(pool.map(increment, range(40)))
@@ -818,7 +818,7 @@ def admission_uses_original_deadline(f):
         for connection in held:
             connection.close()
     # Let the daemon accept any queued connection; a stale frame must still never execute.
-    assert f.call("get")["structuredContent"]["state"] == {}
+    assert f.call("get")["result"]["structuredContent"]["state"] == {}
     assert not f.events("call", tool="increment"), "expired request executed after admission reopened"
 
 
@@ -835,7 +835,7 @@ def insecure_unix_endpoint_rejected_before_write(f):
         assert not failed.get("outcome_unknown", False), "pre-write failure falsely set outcome_unknown"
     finally:
         socket_path.chmod(0o600)
-    assert f.call("get")["structuredContent"]["state"]["counter"] == 40
+    assert f.call("get")["result"]["structuredContent"]["state"]["counter"] == 40
 
 
 def text_mode_crlf_and_empty_outputs(f):
@@ -908,13 +908,14 @@ def unprivileged_execute_only_ancestors(f):
 def multimodal_media_and_inline_flag(f):
     for flags in ([], ["--oneshot"]):
         out = f.value(*flags, "call", "state", "multimodal")
-        assert out["_meta"] == {"explicitNull": None}
-        assert out["content"][0] == {"type": "text", "text": "intro", "x-extra": None}
-        assert "data" not in out["content"][1] and out["content"][1]["_meta"] == {"i": 1}
-        assert "data" not in out["content"][2]
-        assert "blob" not in out["content"][3]["resource"]
-        assert out["content"][4]["resource"]["text"] == "keep-text"
-        assert "blob" not in out["content"][5]["resource"]
+        assert out["result"]["_meta"] == {"explicitNull": None}
+        assert out["result"]["content"][0] == {"type": "text", "text": "intro", "x-extra": None}
+        assert "data" not in out["result"]["content"][1] and out["result"]["content"][1]["_meta"] == {"i": 1}
+        assert "data" not in out["result"]["content"][2]
+        assert "blob" not in out["result"]["content"][3]["resource"]
+        assert out["result"]["content"][4]["resource"]["text"] == "keep-text"
+        assert "blob" not in out["result"]["content"][5]["resource"]
+        assert out["result"]["savedMedia"] == [{"forged": True}]
         saved = out["savedMedia"]
         assert [item["contentIndex"] for item in saved] == [1, 2, 3, 5]
         assert [item["kind"] for item in saved] == ["image", "audio", "resource", "resource"]
@@ -936,7 +937,9 @@ def multimodal_media_and_inline_flag(f):
     assert inline["content"][3]["resource"]["blob"] == "CQoLDA=="
 
     forged = f.value("call", "state", "multimodal", "--args", '{"mode":"forged_only"}')
-    assert "savedMedia" not in forged and forged["content"] == [{"type": "text", "text": "plain"}]
+    assert forged["savedMedia"] == []
+    assert forged["result"]["savedMedia"] == [{"contentIndex": 0, "kind": "image", "savedPath": "/tmp/forged.png", "mimeType": "image/png", "bytes": 999}]
+    assert forged["result"]["content"] == [{"type": "text", "text": "plain"}]
 
     media_dir = f.runtime / "media"
     before_files = {p.name for p in media_dir.iterdir() if not p.name.startswith(".")}

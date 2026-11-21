@@ -43,7 +43,7 @@ def raw_semantic_disclosure(f):
                     for name in ["raw_object", "raw_null", "raw_tool_error"]:
                         answer = case.value(*flags, "call", "state", name,
                                             code=3 if name == "raw_tool_error" else 0)
-                        assert answer == raw.call_result(name), (label, name, answer)
+                        assert answer == {"result": raw.call_result(name), "savedMedia": []}, (label, name, answer)
                     for name in ["raw_error_object", "raw_error_null"]:
                         result = case.invoke(*flags, "call", "state", name, code=4)
                         assert not result.stdout, (label, name, result.stdout)

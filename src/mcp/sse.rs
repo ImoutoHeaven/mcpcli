@@ -11,14 +11,17 @@ use rmcp::transport::streamable_http_client::SseError;
 use sse_stream::Sse;
 
 use super::{FailureKind, TransportTermination, ingress::Ingress};
-use crate::budget::{ByteBudget, ByteLease, format_bytes};
+use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 
+const MAX_SSE_ID_BYTES: usize = 8 * 1024;
+
+#[cfg(test)]
 const LINE_SHRINK_CAP: usize = 64 * 1024;
 
-pub(super) fn sse_retained_len(sse: &Sse) -> usize {
-    sse.event.as_ref().map_or(0, String::len)
-        + sse.data.as_ref().map_or(0, String::len)
-        + sse.id.as_ref().map_or(0, String::len)
+pub(super) fn sse_retained_capacity(sse: &Sse) -> usize {
+    sse.event.as_ref().map_or(0, String::capacity)
+        + sse.data.as_ref().map_or(0, String::capacity)
+        + sse.id.as_ref().map_or(0, String::capacity)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,8 +88,7 @@ struct BoundedSseStream<S> {
     current: Option<Sse>,
     current_raw_bytes: usize,
     current_lease: ByteLease,
-    parsed: VecDeque<(Sse, ByteLease)>,
-    yielded_lease: ByteLease,
+    parsed: VecDeque<Leased<Sse>>,
     done: bool,
 }
 
@@ -100,7 +102,6 @@ impl<S> BoundedSseStream<S> {
     ) -> Self {
         let line_lease = budget.empty_lease();
         let current_lease = budget.empty_lease();
-        let yielded_lease = budget.empty_lease();
         Self {
             source,
             limit,
@@ -115,16 +116,12 @@ impl<S> BoundedSseStream<S> {
             current_raw_bytes: 0,
             current_lease,
             parsed: VecDeque::new(),
-            yielded_lease,
             done: false,
         }
     }
 
     fn clear_line_buf(&mut self) {
-        self.line_buf.clear();
-        if self.line_buf.capacity() > LINE_SHRINK_CAP {
-            self.line_buf = Vec::new();
-        }
+        self.line_buf = Vec::new();
         self.line_lease.release();
     }
 
@@ -134,7 +131,6 @@ impl<S> BoundedSseStream<S> {
         self.current_raw_bytes = 0;
         self.current_lease.release();
         self.parsed.clear();
-        self.yielded_lease.release();
     }
 
     fn fail_too_large(&mut self) -> SseError {
@@ -143,6 +139,18 @@ impl<S> BoundedSseStream<S> {
         let msg = format!(
             "SSE event exceeds the {} response limit",
             format_bytes(self.limit)
+        );
+        self.termination
+            .terminate(FailureKind::Transport, msg.clone());
+        SseError::Body(Box::new(std::io::Error::other(msg)))
+    }
+
+    fn fail_id_too_large(&mut self) -> SseError {
+        self.done = true;
+        self.clear_all();
+        let msg = format!(
+            "SSE id exceeds the {} metadata limit",
+            format_bytes(MAX_SSE_ID_BYTES)
         );
         self.termination
             .terminate(FailureKind::Transport, msg.clone());
@@ -161,36 +169,45 @@ impl<S> BoundedSseStream<S> {
         SseError::Body(Box::new(std::io::Error::other(msg)))
     }
 
+    fn finish_parse_error(&mut self, error: SseError) -> SseError {
+        if matches!(error, SseError::Utf8Parse(_)) {
+            self.termination.terminate(
+                FailureKind::Transport,
+                format!("SSE UTF-8 decoding failed: {error}"),
+            );
+        }
+        self.done = true;
+        self.clear_all();
+        error
+    }
+
     fn dispatch_event(&mut self) -> Result<(), SseError> {
         self.current_raw_bytes = 0;
         if let Some(mut sse) = self.current.take() {
-            if let Some(data) = sse.data.as_mut()
-                && data.capacity() > data.len().saturating_add(LINE_SHRINK_CAP)
-            {
-                data.shrink_to_fit();
-            }
-            if let Some(ev) = sse.event.as_mut()
-                && ev.capacity() > ev.len().saturating_add(LINE_SHRINK_CAP)
-            {
-                ev.shrink_to_fit();
-            }
-            if let Some(id) = sse.id.as_mut()
-                && id.capacity() > id.len().saturating_add(LINE_SHRINK_CAP)
-            {
-                id.shrink_to_fit();
-            }
             let mut lease = self.current_lease.take();
-            lease.shrink_to(sse_retained_len(&sse));
-            if self
+            lease.shrink_to(sse_retained_capacity(&sse));
+            match self
                 .ingress
                 .observe_sse(&mut sse, &mut lease, self.limit, &self.budget)
-                .is_err()
             {
-                drop(sse);
-                drop(lease);
-                return Err(self.fail_memory_limit());
+                Ok(()) => {}
+                Err(super::IngressError::MemoryExhausted) => {
+                    drop(sse);
+                    drop(lease);
+                    return Err(self.fail_memory_limit());
+                }
+                Err(super::IngressError::InvalidMetadata) => {
+                    drop(sse);
+                    drop(lease);
+                    self.done = true;
+                    self.clear_all();
+                    let message = "MCP response JSON cannot be represented losslessly";
+                    self.termination
+                        .terminate(FailureKind::Protocol, message.into());
+                    return Err(SseError::Body(Box::new(std::io::Error::other(message))));
+                }
             }
-            self.parsed.push_back((sse, lease));
+            self.parsed.push_back(Leased::new(sse, lease));
         } else {
             self.current_lease.release();
         }
@@ -198,79 +215,83 @@ impl<S> BoundedSseStream<S> {
     }
 
     fn parse_borrowed_field(&mut self, line: &[u8]) -> Result<(), SseError> {
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            return Err(SseError::InvalidLine);
+        let (field, value) = match line.iter().position(|&b| b == b':') {
+            Some(colon) => (&line[..colon], &line[colon + 1..]),
+            None => (line, &[][..]),
         };
-        let field = &line[..colon];
-        let value = &line[colon + 1..];
         let value = value.strip_prefix(b" ").unwrap_or(value);
 
         match field {
             b"data" => {
                 let text = std::str::from_utf8(value).map_err(SseError::Utf8Parse)?;
-                let has_prev = self.current.as_ref().is_some_and(|ev| ev.data.is_some());
-                let grow = text.len() + usize::from(has_prev);
-                if !self.current_lease.try_grow(grow) {
+                let event = self.current.get_or_insert_default();
+                let has_prev = event.data.is_some();
+                let existing = event.data.get_or_insert_default();
+                let needed = existing
+                    .len()
+                    .saturating_add(text.len())
+                    .saturating_add(usize::from(has_prev));
+                if !self
+                    .current_lease
+                    .reserve_string(existing, needed, self.limit)
+                {
                     return Err(self.fail_memory_limit());
                 }
-                let event = self.current.get_or_insert_default();
-                if let Some(existing) = event.data.as_mut() {
+                if has_prev {
                     existing.push('\n');
-                    existing.push_str(text);
-                } else {
-                    event.data = Some(text.to_owned());
                 }
+                existing.push_str(text);
             }
-            b"event" => {
-                let text = std::str::from_utf8(value).map_err(SseError::Utf8Parse)?;
-                if self.current.as_ref().is_some_and(|ev| ev.event.is_some()) {
-                    return Err(SseError::DuplicatedEventLine);
-                }
-                if !self.current_lease.try_grow(text.len()) {
-                    return Err(self.fail_memory_limit());
-                }
-                let event = self.current.get_or_insert_default();
-                event.event = Some(text.to_owned());
-            }
-            b"id" => {
-                if value.contains(&0u8) {
+            b"event" | b"id" => {
+                if field == b"id" && value.contains(&0u8) {
                     return Ok(());
                 }
-                let text = std::str::from_utf8(value).map_err(SseError::Utf8Parse)?;
-                if self.current.as_ref().is_some_and(|ev| ev.id.is_some()) {
-                    return Err(SseError::DuplicatedIdLine);
+                if field == b"id" && value.len() > MAX_SSE_ID_BYTES {
+                    return Err(self.fail_id_too_large());
                 }
-                if !self.current_lease.try_grow(text.len()) {
+                let text = std::str::from_utf8(value).map_err(SseError::Utf8Parse)?;
+                let event = self.current.get_or_insert_default();
+                let slot = if field == b"event" {
+                    &mut event.event
+                } else {
+                    &mut event.id
+                };
+                let released = slot.take().map_or(0, |old| old.capacity());
+                self.current_lease.shrink_by(released);
+                let mut value = String::new();
+                if !self
+                    .current_lease
+                    .reserve_string(&mut value, text.len(), self.limit)
+                {
                     return Err(self.fail_memory_limit());
                 }
-                let event = self.current.get_or_insert_default();
-                event.id = Some(text.to_owned());
+                value.push_str(text);
+                *slot = Some(value);
             }
             b"retry" => {
-                let retry = std::str::from_utf8(value)
-                    .map_err(SseError::Utf8Parse)?
-                    .trim_ascii()
-                    .parse::<u64>()
-                    .map_err(SseError::IntParse)?;
-                let event = self.current.get_or_insert_default();
-                if event.retry.is_some() {
-                    return Err(SseError::DuplicatedRetry);
+                if !value.is_empty()
+                    && value.iter().all(u8::is_ascii_digit)
+                    && let Ok(retry) = std::str::from_utf8(value)
+                        .expect("ASCII digits")
+                        .parse::<u64>()
+                {
+                    self.current.get_or_insert_default().retry = Some(retry);
                 }
-                event.retry = Some(retry);
             }
-            b"" => {}
-            _ => return Err(SseError::InvalidLine),
+            _ => {}
         }
         Ok(())
     }
 
+    // Parameters drop in reverse order: every early return must release the
+    // owned bytes before their lease, including bare fields and UTF-8 failures.
     fn parse_owned_field(
         &mut self,
-        mut line: Vec<u8>,
         mut line_lease: ByteLease,
+        mut line: Vec<u8>,
     ) -> Result<(), SseError> {
         let Some(colon) = line.iter().position(|&b| b == b':') else {
-            return Err(SseError::InvalidLine);
+            return self.parse_borrowed_field(&line);
         };
         if &line[..colon] == b"data" && self.current.as_ref().is_none_or(|ev| ev.data.is_none()) {
             let val_start = if line.get(colon + 1) == Some(&b' ') {
@@ -280,11 +301,8 @@ impl<S> BoundedSseStream<S> {
             };
             std::str::from_utf8(&line[val_start..]).map_err(SseError::Utf8Parse)?;
             line.drain(..val_start);
-            if line.capacity() > line.len().saturating_add(LINE_SHRINK_CAP) {
-                line.shrink_to_fit();
-            }
             let data = String::from_utf8(line).expect("validated UTF-8");
-            line_lease.shrink_to(data.len());
+            line_lease.shrink_to(data.capacity());
             self.current_lease.merge(line_lease);
             let event = self.current.get_or_insert_default();
             event.data = Some(data);
@@ -313,7 +331,10 @@ impl<S> BoundedSseStream<S> {
                 if self.current_raw_bytes.saturating_add(next_line_len) > self.limit {
                     return Err(self.fail_too_large());
                 }
-                if !self.line_lease.try_grow(bytes.len()) {
+                if !self
+                    .line_lease
+                    .reserve_vec(&mut self.line_buf, next_line_len, self.limit)
+                {
                     return Err(self.fail_memory_limit());
                 }
                 self.line_buf.extend_from_slice(bytes);
@@ -359,9 +380,6 @@ impl<S> BoundedSseStream<S> {
                     if self.current_raw_bytes.saturating_add(total_len) > self.limit {
                         return Err(self.fail_too_large());
                     }
-                    if !self.line_lease.try_grow(fragment.len()) {
-                        return Err(self.fail_memory_limit());
-                    }
                     self.clear_line_buf();
                 } else {
                     let next_raw = self
@@ -371,14 +389,17 @@ impl<S> BoundedSseStream<S> {
                     if next_raw > self.limit {
                         return Err(self.fail_too_large());
                     }
-                    if !self.line_lease.try_grow(fragment.len()) {
+                    if !self
+                        .line_lease
+                        .reserve_vec(&mut self.line_buf, total_len, self.limit)
+                    {
                         return Err(self.fail_memory_limit());
                     }
                     self.line_buf.extend_from_slice(fragment);
                     self.current_raw_bytes = next_raw;
                     let owned_line = std::mem::take(&mut self.line_buf);
                     let owned_lease = self.line_lease.take();
-                    self.parse_owned_field(owned_line, owned_lease)?;
+                    self.parse_owned_field(owned_lease, owned_line)?;
                 }
             }
         }
@@ -401,11 +422,8 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut().get_mut();
-        // Release the lease of the previously yielded event now that downstream moved on.
-        this.yielded_lease.release();
-        if let Some((sse, lease)) = this.parsed.pop_front() {
-            this.yielded_lease = lease;
-            return Poll::Ready(Some(Ok(sse)));
+        if let Some(sse) = this.parsed.pop_front() {
+            return Poll::Ready(Some(Ok(sse.into_parts().0)));
         }
         if this.done {
             return Poll::Ready(None);
@@ -432,8 +450,7 @@ where
                     if prefix_len > 0
                         && let Err(err) = this.feed_bytes(&fallback[..prefix_len])
                     {
-                        this.clear_all();
-                        return Poll::Ready(Some(Err(err)));
+                        return Poll::Ready(Some(Err(this.finish_parse_error(err))));
                     }
                     this.clear_all();
                     return Poll::Ready(None);
@@ -452,20 +469,15 @@ where
                     if prefix_len > 0
                         && let Err(err) = this.feed_bytes(&fallback[..prefix_len])
                     {
-                        this.done = true;
-                        this.clear_all();
-                        return Poll::Ready(Some(Err(err)));
+                        return Poll::Ready(Some(Err(this.finish_parse_error(err))));
                     }
                     if !rest.is_empty()
                         && let Err(err) = this.feed_bytes(rest)
                     {
-                        this.done = true;
-                        this.clear_all();
-                        return Poll::Ready(Some(Err(err)));
+                        return Poll::Ready(Some(Err(this.finish_parse_error(err))));
                     }
-                    if let Some((sse, lease)) = this.parsed.pop_front() {
-                        this.yielded_lease = lease;
-                        return Poll::Ready(Some(Ok(sse)));
+                    if let Some(sse) = this.parsed.pop_front() {
+                        return Poll::Ready(Some(Ok(sse.into_parts().0)));
                     }
                 }
             }
@@ -502,6 +514,166 @@ mod tests {
             ingress,
             termination,
         )
+    }
+
+    #[tokio::test]
+    async fn id_metadata_limit_counts_utf8_bytes_before_sdk_handoff() {
+        for bytes in [MAX_SSE_ID_BYTES - 1, MAX_SSE_ID_BYTES, MAX_SSE_ID_BYTES + 1] {
+            let id = format!(
+                "{}{}",
+                "é".repeat(bytes / 2),
+                if bytes % 2 == 0 { "" } else { "x" }
+            );
+            assert_eq!(id.len(), bytes);
+            for fragmented in [false, true] {
+                let wire = format!("id: {id}\ndata: ok\n\n").into_bytes();
+                let chunks = if fragmented {
+                    vec![wire[..100].to_vec(), wire[100..].to_vec()]
+                } else {
+                    vec![wire]
+                };
+                let budget = ByteBudget::new(128 * 1024);
+                let term = Arc::new(TransportTermination::default());
+                let source =
+                    futures_util::stream::iter(chunks.into_iter().map(Ok::<_, std::io::Error>));
+                let mut stream = BoundedSseStream::new(
+                    source,
+                    32 * 1024,
+                    budget.clone(),
+                    Ingress::default(),
+                    term.clone(),
+                );
+                let event = stream.next().await.unwrap();
+                if bytes <= MAX_SSE_ID_BYTES {
+                    let event = event.unwrap();
+                    assert_eq!(event.id.as_deref(), Some(id.as_str()));
+                    assert!(!term.is_terminated());
+                    drop(event);
+                } else {
+                    assert!(event.is_err());
+                    assert!(term.is_terminated());
+                    assert!(term.failure(false).to_string().contains("SSE id exceeds"));
+                }
+                drop(stream);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_utf8_error_keeps_its_reason_after_a_valid_event_id() {
+        for fragmented in [false, true] {
+            let budget = ByteBudget::new(1024);
+            let termination = Arc::new(TransportTermination::default());
+            let mut stream = test_stream(
+                if fragmented {
+                    vec![b"id: first\n\n", b"data: ", b"\xff\n\n"]
+                } else {
+                    vec![b"id: first\n\n", b"data: \xff\n\n"]
+                },
+                1024,
+                budget.clone(),
+                Ingress::default(),
+                termination.clone(),
+            );
+            let first = stream.next().await.unwrap().unwrap();
+            assert_eq!(first.id.as_deref(), Some("first"));
+            drop(first);
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(matches!(error, SseError::Utf8Parse(_)));
+            assert!(termination.is_terminated());
+            assert!(
+                termination
+                    .failure(false)
+                    .to_string()
+                    .contains("SSE UTF-8 decoding failed")
+            );
+            assert!(stream.next().await.is_none());
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_fields_allow_empty_overwritten_and_ignored_values() {
+        let budget = ByteBudget::new(512);
+        let term = Arc::new(TransportTermination::default());
+        let mut stream = test_stream(vec![
+            b"event: old\nid: old\nretry: 1\nunknown: ignored\n",
+            b"event: new\nid: new\nretry: 2\nretry: +3\nretry: 1x\nretry: 18446744073709551616\nretry:  4\n",
+            b"data\ndata: line\n\n", b"i", b"d\nretry\nevent\nunknown\n\n",
+        ], 512, budget.clone(), Ingress::default(), term.clone());
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.event.as_deref(), Some("new"));
+        assert_eq!(first.id.as_deref(), Some("new"));
+        assert_eq!(first.retry, Some(2));
+        assert_eq!(first.data.as_deref(), Some("\nline"));
+        drop(first);
+        let second = stream.next().await.unwrap().unwrap();
+        assert_eq!(second.id.as_deref(), Some(""));
+        assert_eq!(second.event.as_deref(), Some(""));
+        assert_eq!(second.retry, None);
+        assert_eq!(second.data, None);
+        drop(second);
+        assert!(stream.next().await.is_none());
+        assert!(!term.is_terminated());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn replaced_metadata_releases_capacity_and_ignored_fields_keep_existing_value() {
+        let budget = ByteBudget::new(100);
+        let mut stream = test_stream(
+            vec![],
+            512,
+            budget.clone(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+        );
+        stream
+            .parse_borrowed_field(format!("id: {}", "a".repeat(80)).as_bytes())
+            .unwrap();
+        assert_eq!(budget.used(), 80);
+        stream
+            .parse_borrowed_field(format!("id: {}", "b".repeat(90)).as_bytes())
+            .unwrap();
+        assert_eq!(budget.used(), 90);
+        stream.parse_borrowed_field(b"id: a\0b").unwrap();
+        stream.parse_borrowed_field(b"extension: unused").unwrap();
+        assert_eq!(budget.used(), 90);
+        stream.parse_borrowed_field(b"id").unwrap();
+        assert_eq!(budget.used(), 0);
+        assert_eq!(stream.current.as_ref().unwrap().id.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn fragmented_sse_handoffs_keep_capacity_charged() {
+        let budget = ByteBudget::new(256);
+        let mut stream = test_stream(
+            vec![],
+            128,
+            budget.clone(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+        );
+        stream.feed_bytes(b"data: ab").unwrap();
+        stream.feed_bytes(b"cdefghijk").unwrap();
+        assert_eq!(stream.line_lease.bytes(), stream.line_buf.capacity());
+        assert_eq!(budget.used(), stream.line_buf.capacity());
+        stream.feed_bytes(b"\n").unwrap();
+        assert!(stream.line_buf.is_empty());
+        assert_eq!(
+            budget.used(),
+            sse_retained_capacity(stream.current.as_ref().unwrap())
+        );
+        stream.feed_bytes(b"data: more\n").unwrap();
+        assert_eq!(
+            budget.used(),
+            sse_retained_capacity(stream.current.as_ref().unwrap())
+        );
+        stream.feed_bytes(b"\n").unwrap();
+        assert_eq!(budget.used(), sse_retained_capacity(&stream.parsed[0]));
+        drop(stream);
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]
@@ -561,14 +733,21 @@ mod tests {
         assert_eq!(ev1.id.as_deref(), Some("good-1"));
         assert_eq!(ev1.data.as_ref().unwrap().len(), 6 + 80 * 1024);
         assert!(s.line_buf.capacity() <= LINE_SHRINK_CAP);
-        // Unmatched SSE event keeps its lease active while downstream holds ev1!
-        assert_eq!(budget.used(), sse_retained_len(&ev1));
+        // Accounting ends when the official SDK receives the event. The
+        // application's own queued events remain charged.
+        assert_eq!(
+            budget.used(),
+            s.parsed
+                .iter()
+                .map(|event| sse_retained_capacity(event))
+                .sum::<usize>()
+        );
         drop(ev1);
 
         let ev2 = s.next().await.unwrap().unwrap();
         assert_eq!(ev2.data.as_deref(), Some("after"));
-        // Previous event lease was released on next poll; only ev2 is charged now.
-        assert_eq!(budget.used(), 5);
+        // Both events have crossed the official SDK handoff.
+        assert_eq!(budget.used(), 0);
         drop(ev2);
 
         assert!(s.next().await.is_none());
@@ -578,7 +757,7 @@ mod tests {
 
     #[tokio::test]
     async fn stubs_captured_tool_call_sse_data_and_enforces_memory_limit() {
-        let budget = ByteBudget::new(200 * 1024);
+        let budget = ByteBudget::new(400 * 1024);
         let ingress = Ingress::default();
         let _capture = ingress.capture().unwrap();
         let req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
@@ -605,8 +784,17 @@ mod tests {
         );
 
         let yielded = s.next().await.unwrap().unwrap();
-        // Yielded SSE data was shrunk to a tiny stub (~48 B), freeing the 70 KiB string immediately!
-        assert!(yielded.data.as_ref().unwrap().len() < 128);
+        // The official SDK receives a small encoded stub. The application
+        // retains the lossless result separately.
+        let stub: rmcp::model::ServerJsonRpcMessage =
+            serde_json::from_str(yielded.data.as_deref().unwrap()).unwrap();
+        let rmcp::model::ServerJsonRpcMessage::Response(response) = &stub else {
+            panic!("expected response")
+        };
+        let rmcp::model::ServerResult::CallToolResult(result) = &response.result else {
+            panic!("expected call result")
+        };
+        assert!(result.content.is_empty());
         let (_, val, val_lease) = ingress.take().unwrap();
         assert_eq!(
             val.unwrap()["result"]["content"][0]["text"]

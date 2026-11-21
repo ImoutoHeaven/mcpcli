@@ -1,5 +1,5 @@
 //! Private runtime files and short-lived clients of the persistent daemon.
-use crate::budget::{ByteBudget, format_bytes};
+use crate::budget::{ByteBudget, ByteLease, format_bytes};
 use crate::config::{LoadedConfig, digest, valid_name};
 use crate::ipc::{self, Failure, Operation, Request, Response};
 use crate::platform;
@@ -34,6 +34,10 @@ pub struct Paths {
 
 pub struct Lock(File);
 impl Lock {
+    pub(crate) fn file(&self) -> &File {
+        &self.0
+    }
+
     pub fn try_acquire(path: &Path) -> Result<Option<Self>> {
         let file = secure_file(path)?;
         match file.try_lock() {
@@ -227,7 +231,7 @@ impl State {
     }
 }
 
-pub async fn exchange(paths: &Paths, request: &Request) -> Result<Response> {
+pub async fn exchange(paths: &Paths, request: &Request) -> Result<(Response, ByteLease)> {
     let dispatched = AtomicBool::new(false);
     exchange_tracked(paths, request, &dispatched).await
 }
@@ -236,7 +240,7 @@ pub async fn exchange_tracked(
     paths: &Paths,
     request: &Request,
     dispatched: &AtomicBool,
-) -> Result<Response> {
+) -> Result<(Response, ByteLease)> {
     exchange_tracked_with_options(
         paths,
         request,
@@ -253,7 +257,7 @@ pub async fn exchange_tracked_with_options(
     dispatched: &AtomicBool,
     idle_timeout: Duration,
     budget: &Arc<ByteBudget>,
-) -> Result<Response> {
+) -> Result<(Response, ByteLease)> {
     let is_call = request.operation.is_call();
     let now_ms = platform::monotonic_millis()?;
     let remaining = request
@@ -296,7 +300,8 @@ pub async fn exchange_tracked_with_options(
                 Failure::new(5, "timeout", "request expired before writing to daemon").into(),
             );
         }
-        let (req_frame, req_lease) = ipc::encode_frame_leased(request, ipc::REQUEST_LIMIT, budget)
+        let (req_lease, req_frame) = ipc::encode_frame_leased(request, ipc::REQUEST_LIMIT, budget)
+            .map(|(frame, lease)| (lease, frame))
             .map_err(|error| -> anyhow::Error {
                 if error.kind() == io::ErrorKind::OutOfMemory {
                     Failure::new(
@@ -363,7 +368,7 @@ pub async fn exchange_tracked_with_options(
     };
 
     // Stage 2: read validated response body using local 60s idle clock capped by explicit deadline.
-    let response: Response = match ipc::read_frame_body_idle(
+    let (response_lease, mut response): (ByteLease, Response) = match ipc::read_frame_body_idle(
         &mut stream,
         response_len,
         idle_timeout,
@@ -372,7 +377,7 @@ pub async fn exchange_tracked_with_options(
     )
     .await
     {
-        Ok(response) => response,
+        Ok((response, lease)) => (lease, response),
         Err(error) if error.kind() == io::ErrorKind::TimedOut => {
             return Err(Failure::new(
                 5,
@@ -431,8 +436,9 @@ pub async fn exchange_tracked_with_options(
         )
         .into());
     }
-    if let Some(error) = response.error.as_ref() {
-        return Err(error.clone().into());
+    if let Some(mut error) = response.error.take() {
+        error.lease = Some(Arc::new(response_lease));
+        return Err(error.into());
     }
     if response.result.is_none() {
         return Err(Failure::new(
@@ -443,17 +449,18 @@ pub async fn exchange_tracked_with_options(
         .uncertain(is_call && write_tracker.load(Ordering::Acquire))
         .into());
     }
-    Ok(response)
+    Ok((response, response_lease))
 }
 
 pub async fn ensure(paths: &Paths, loaded: &LoadedConfig, explicit: bool) -> Result<()> {
     let _startup = Lock::acquire(&paths.startup_lock(), START_WAIT).await?;
     if paths.running()? {
-        let response = exchange(
+        let (_response_lease, response) = exchange(
             paths,
             &paths.request("", Operation::Status, Duration::from_secs(2))?,
         )
-        .await?;
+        .await
+        .map(|(response, lease)| (lease, response))?;
         if response.build != paths.build {
             return Err(Failure::new(
                 6,

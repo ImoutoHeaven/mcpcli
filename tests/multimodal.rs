@@ -94,6 +94,60 @@ fn build_padded_call_response(id: &Value, target_json_len: usize) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn version_negotiation_keeps_supported_control_field() {
+    let dir = temp_dir();
+    let script = dir.path().join("negotiate.py");
+    let log = dir.path().join("requests.log");
+    std::fs::write(
+        &script,
+        r#"import json, sys
+attempts = 0
+for raw in sys.stdin.buffer:
+    req = json.loads(raw)
+    with open(sys.argv[1], "a") as f:
+        f.write(req.get("method", "") + "\n")
+    if "id" not in req:
+        continue
+    attempts += 1
+    if attempts == 1:
+        out = {"error": {"code": -32022, "message": "renegotiate", "data": {
+            "supported": ["2099-01-01", "2026-07-28"], "extra": "x" * 65536}}}
+    else:
+        out = {"result": {"resultType": "complete", "supportedVersions": ["2026-07-28"],
+            "capabilities": {}, "ttlMs": 0, "cacheScope": "private"}}
+    out.update(jsonrpc="2.0", id=req["id"])
+    print(json.dumps(out), flush=True)
+"#,
+    )
+    .unwrap();
+    let config = ServerConfig::Stdio {
+        command: python(),
+        args: vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+        ],
+        env: BTreeMap::new(),
+        cwd: None,
+        description: None,
+    };
+    let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
+    assert_eq!(
+        connection.server_info().unwrap()["protocolVersion"],
+        "2026-07-28"
+    );
+    connection.close().await.unwrap();
+    let requests = std::fs::read_to_string(log).unwrap();
+    assert_eq!(
+        requests
+            .lines()
+            .filter(|method| *method == "server/discover")
+            .count(),
+        2
+    );
+    assert!(!requests.lines().any(|method| method == "initialize"));
+}
+
+#[tokio::test]
 async fn stdio_exact_bounds_unknown_fields_and_memory_overload() {
     let dir = temp_dir();
     let base = dir.path().canonicalize().unwrap();
@@ -162,6 +216,9 @@ for raw in sys.stdin.buffer:
             let res = conn.call("sized", args, BUDGET).await.unwrap();
             assert_eq!(res["x-unknown"], json!({"explicit": null}));
             conn.close().await.unwrap();
+            drop(conn);
+            assert!(budget.used() > 0, "the returned value lost its lease");
+            drop(res);
             assert_eq!(budget.used(), 0);
         }
 
@@ -201,6 +258,7 @@ for raw in sys.stdin.buffer:
             .count();
         assert_eq!(calls, 1);
         conn.close().await.unwrap();
+        drop(conn);
         assert_eq!(budget.used(), 0);
     }
 
@@ -217,7 +275,7 @@ for raw in sys.stdin.buffer:
         cwd: None,
         description: None,
     };
-    let tight_budget = ByteBudget::new(1024);
+    let tight_budget = ByteBudget::new(2048);
     let limits = McpLimits {
         max_response_bytes: 16 * 1024,
         max_tool_catalog_bytes: 16 * 1024,
@@ -231,6 +289,7 @@ for raw in sys.stdin.buffer:
     assert_eq!(fail_kind(&err), FailureKind::Transport);
     assert!(err.to_string().contains("active memory limit"));
     conn.close().await.unwrap();
+    drop(conn);
     assert_eq!(tight_budget.used(), 0);
 }
 
@@ -273,16 +332,25 @@ async fn read_http_request(
 
 #[tokio::test]
 async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
+    // A parsed event needs lossless Value R + SDK model R + conversion scratch 2R.
+    // One more event's worth covers the small connection, ID, and request buffers.
+    const SSE_BUDGET_EVENTS: usize = 5;
+    const PROGRESS_EVENTS: usize = 8;
+
     #[derive(Clone, Copy)]
     enum Mode {
         JsonLen,
         JsonChunked,
         PostSseSingle,
         PostSseWithIdReject,
+        PostSseLargeId,
+        PostSseInvalidUtf8,
         PostSseCumulativePass,
         GetSseSingle,
         GetSseWithIdReject,
         GetSseOverload,
+        GetSseLargeId,
+        GetSseInvalidUtf8,
     }
 
     async fn spawn_http_mock(
@@ -326,6 +394,8 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                 Mode::GetSseSingle
                                     | Mode::GetSseWithIdReject
                                     | Mode::GetSseOverload
+                                    | Mode::GetSseLargeId
+                                    | Mode::GetSseInvalidUtf8
                             ) {
                                 let _ = socket
                                     .write_all(
@@ -353,10 +423,34 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                     continue;
                                 };
                                 let mut payload = Vec::new();
-                                if matches!(mode, Mode::GetSseWithIdReject | Mode::GetSseOverload) {
+                                if matches!(
+                                    mode,
+                                    Mode::GetSseWithIdReject
+                                        | Mode::GetSseOverload
+                                        | Mode::GetSseLargeId
+                                        | Mode::GetSseInvalidUtf8
+                                ) {
                                     payload.extend_from_slice(
                                         b"id: g-1\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}\n\n",
                                     );
+                                }
+                                if matches!(mode, Mode::GetSseLargeId | Mode::GetSseInvalidUtf8) {
+                                    let header = format!("{:x}\r\n", payload.len());
+                                    socket.write_all(header.as_bytes()).await.unwrap();
+                                    socket.write_all(&payload).await.unwrap();
+                                    socket.write_all(b"\r\n").await.unwrap();
+                                    socket.flush().await.unwrap();
+                                    // Let the SDK retain the legal event ID before the bad one arrives.
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                    payload.clear();
+                                    if matches!(mode, Mode::GetSseInvalidUtf8) {
+                                        payload.extend_from_slice(b"data: \xff\n\n");
+                                    } else {
+                                        payload.extend_from_slice(
+                                            format!("id: {}\n", "x".repeat(8 * 1024 + 1))
+                                                .as_bytes(),
+                                        );
+                                    }
                                 }
                                 // In EventBudget: single-line `data: <json>\n\n` retains `6 + json.len() + 1` = `7 + json.len()`.
                                 let json_bytes = build_padded_call_response(&id, target - 7);
@@ -471,7 +565,9 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                     let _ = socket.write_all(head.as_bytes()).await;
                                     let _ = socket.write_all(&sse).await;
                                 }
-                                Mode::PostSseWithIdReject => {
+                                Mode::PostSseWithIdReject
+                                | Mode::PostSseLargeId
+                                | Mode::PostSseInvalidUtf8 => {
                                     let _ = socket
                                         .write_all(
                                             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -479,15 +575,39 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                         .await;
                                     let ev1 = b"id: p-1\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progressToken\":1,\"progress\":1}}\n\n";
                                     let json_bytes = build_padded_call_response(&id, target - 7);
-                                    let mut ev2 = b"data: ".to_vec();
+                                    let mut ev2 = Vec::new();
+                                    if matches!(
+                                        mode,
+                                        Mode::PostSseLargeId | Mode::PostSseInvalidUtf8
+                                    ) {
+                                        if matches!(mode, Mode::PostSseInvalidUtf8) {
+                                            ev2.extend_from_slice(b"data: \xff\n\n");
+                                        } else {
+                                            ev2.extend_from_slice(
+                                                format!("id: {}\n", "x".repeat(8 * 1024 + 1))
+                                                    .as_bytes(),
+                                            );
+                                        }
+                                    }
+                                    ev2.extend_from_slice(b"data: ");
                                     ev2.extend_from_slice(&json_bytes);
                                     ev2.extend_from_slice(b"\n\n");
-                                    for part in [ev1.as_slice(), ev2.as_slice()] {
+                                    for (index, part) in
+                                        [ev1.as_slice(), ev2.as_slice()].into_iter().enumerate()
+                                    {
                                         let hdr = format!("{:x}\r\n", part.len());
                                         let _ = socket.write_all(hdr.as_bytes()).await;
                                         let _ = socket.write_all(part).await;
                                         let _ = socket.write_all(b"\r\n").await;
                                         let _ = socket.flush().await;
+                                        if index == 0
+                                            && matches!(
+                                                mode,
+                                                Mode::PostSseLargeId | Mode::PostSseInvalidUtf8
+                                            )
+                                        {
+                                            tokio::time::sleep(Duration::from_millis(20)).await;
+                                        }
                                     }
                                     // Hold stream open so timeout would fire if hard error didn't wake caller.
                                     tokio::time::sleep(Duration::from_secs(10)).await;
@@ -496,7 +616,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                 Mode::PostSseCumulativePass => {
                                     let mut sse = Vec::new();
                                     let pad = "p".repeat(sse_limit - 140);
-                                    for idx in 0..4 {
+                                    for idx in 0..PROGRESS_EVENTS {
                                         let note = format!(
                                             "id: n-{idx}\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progressToken\":1,\"progress\":{idx},\"message\":\"{pad}\"}}}}\n\n"
                                         );
@@ -508,7 +628,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                     sse.extend_from_slice(b"data: ");
                                     sse.extend_from_slice(&json_bytes);
                                     sse.extend_from_slice(b"\n\n");
-                                    assert!(sse.len() > sse_limit * 3);
+                                    assert!(sse.len() > sse_limit * SSE_BUDGET_EVENTS);
                                     let _ = socket
                                         .write_all(
                                             b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
@@ -525,7 +645,9 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
                                 }
                                 Mode::GetSseSingle
                                 | Mode::GetSseWithIdReject
-                                | Mode::GetSseOverload => {
+                                | Mode::GetSseOverload
+                                | Mode::GetSseLargeId
+                                | Mode::GetSseInvalidUtf8 => {
                                     pending_get.lock().await.push((id, target));
                                     notify.notify_waiters();
                                     let _ = socket
@@ -572,8 +694,10 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
             let args = json!({"target": target}).as_object().unwrap().clone();
             let res = conn.call("sized", args, BUDGET).await.unwrap();
             assert_eq!(res["x-unknown"], json!({"explicit": null}));
+            drop(res);
             assert_eq!(calls.load(Ordering::Acquire), 1);
             conn.close().await.unwrap();
+            drop(conn);
             server_task.abort();
             assert_eq!(budget.used(), 0);
         }
@@ -599,6 +723,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
             assert_eq!(gets.load(Ordering::Acquire), 1);
         }
         conn.close().await.unwrap();
+        drop(conn);
         server_task.abort();
         assert_eq!(budget.used(), 0);
     }
@@ -626,15 +751,57 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         assert_eq!(gets.load(Ordering::Acquire), 1);
         assert_eq!(calls.load(Ordering::Acquire), 1);
         conn.close().await.unwrap();
+        drop(conn);
         server_task.abort();
         assert_eq!(budget.used(), 0);
     }
 
-    // 3. POST SSE per-event < N, cumulative > 3*N succeeds even with tight process budget (< cumulative bytes).
+    // Metadata limits terminate POST and background GET after a legal event ID,
+    // without reconnecting GET, replaying the call, or degrading to its timeout.
+    for (mode, reason) in [
+        (Mode::PostSseLargeId, "SSE id exceeds"),
+        (Mode::GetSseLargeId, "SSE id exceeds"),
+        (Mode::PostSseInvalidUtf8, "SSE UTF-8 decoding failed"),
+        (Mode::GetSseInvalidUtf8, "SSE UTF-8 decoding failed"),
+    ] {
+        let (cfg, gets, calls, server_task) = spawn_http_mock(mode, 32 * 1024).await;
+        let budget = ByteBudget::new(128 * 1024);
+        let limits = McpLimits {
+            max_response_bytes: 32 * 1024,
+            max_tool_catalog_bytes: 16 * 1024,
+            budget: budget.clone(),
+        };
+        let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let err = conn
+            .call(
+                "sized",
+                json!({"target":512}).as_object().unwrap().clone(),
+                BUDGET,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "degraded to timeout: {err}"
+        );
+        assert_eq!(fail_kind(&err), FailureKind::Transport);
+        assert!(err.to_string().contains(reason), "unexpected error: {err}");
+        assert_eq!(gets.load(Ordering::Acquire), 1, "triggered GET reconnect");
+        assert_eq!(calls.load(Ordering::Acquire), 1, "replayed tools/call");
+        conn.close().await.unwrap();
+        drop(conn);
+        server_task.abort();
+        assert_eq!(budget.used(), 0);
+    }
+
+    // 3. Each POST SSE event fits N and its conversion workspace; the full stream exceeds the process budget.
     {
         let (cfg, _gets, calls, server_task) =
             spawn_http_mock(Mode::PostSseCumulativePass, limit).await;
-        let budget = ByteBudget::new(limit * 5 / 2);
+        let budget = ByteBudget::new(limit * SSE_BUDGET_EVENTS);
         let limits = McpLimits {
             max_response_bytes: limit,
             max_tool_catalog_bytes: 16 * 1024,
@@ -646,8 +813,10 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let args = json!({"target": limit}).as_object().unwrap().clone();
         let res = conn.call("sized", args, BUDGET).await.unwrap();
         assert_eq!(res["x-unknown"], json!({"explicit": null}));
+        drop(res);
         assert_eq!(calls.load(Ordering::Acquire), 1);
         conn.close().await.unwrap();
+        drop(conn);
         server_task.abort();
         assert_eq!(budget.used(), 0);
     }
@@ -695,6 +864,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         assert_eq!(gets.load(Ordering::Acquire), 1, "triggered GET reconnect");
         assert_eq!(calls.load(Ordering::Acquire), 1, "replayed tools/call");
         conn.close().await.unwrap();
+        drop(conn);
         server_task.abort();
         assert_eq!(budget.used(), 0);
     }
@@ -702,17 +872,24 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
 
 #[tokio::test]
 async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
+    const SMALL_RESPONSE: usize = 6000;
+    const LARGE_RESPONSE: usize = 7200;
+    const CONNECTION_AND_REQUEST_BYTES: usize = 2048;
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let big_catalog = Arc::new(AtomicBool::new(true));
     let catalog_flag = big_catalog.clone();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
     let server_barrier = barrier.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let server_calls = calls.clone();
 
     let server = tokio::spawn(async move {
         while let Ok((mut socket, _)) = listener.accept().await {
             let catalog_flag = catalog_flag.clone();
             let server_barrier = server_barrier.clone();
+            let calls = server_calls.clone();
             tokio::spawn(async move {
                 while let Some((req_line, _, body)) = read_http_request(&mut socket).await {
                     if req_line.starts_with("DELETE ") {
@@ -762,6 +939,7 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
                         let _ = socket.write_all(head.as_bytes()).await;
                         let _ = socket.write_all(&out).await;
                     } else if method == "tools/call" {
+                        calls.fetch_add(1, Ordering::AcqRel);
                         let sync_chunks = req["params"]["arguments"]
                             .get("sync")
                             .and_then(Value::as_bool)
@@ -807,7 +985,12 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
         headers: BTreeMap::new(),
         description: None,
     };
-    let shared_budget = ByteBudget::new(12_500);
+    // A single response needs 4R during official SDK conversion, after its raw
+    // frame is released. Reserve both connections and their small call arguments.
+    let shared_budget = ByteBudget::new(4 * LARGE_RESPONSE + CONNECTION_AND_REQUEST_BYTES);
+    // Even the smaller conversion cannot coexist with the other completed result.
+    // tokio::join! keeps that result's lease until both calls finish.
+    assert!(shared_budget.limit() < 4 * SMALL_RESPONSE + LARGE_RESPONSE);
     let limits = McpLimits {
         max_response_bytes: 32_768,
         max_tool_catalog_bytes: 400,
@@ -824,16 +1007,29 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
     big_catalog.store(false, Ordering::Release);
     let res = conn1.call("echo", Map::new(), BUDGET).await.unwrap();
     assert_eq!(res["isError"], false);
+    drop(res);
 
-    // Two concurrent 6000 B calls sharing a 12500 B budget must never deadlock.
     let mut conn2 = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
         .await
         .unwrap();
-    let sync1 = json!({"sync": true, "bytes": 6000})
+    assert!(shared_budget.used() < CONNECTION_AND_REQUEST_BYTES);
+    // Both sizes must fit alone with both connections alive. Otherwise a failure
+    // below would only test an undersized single-call fixture.
+    for (conn, bytes) in [(&conn1, SMALL_RESPONSE), (&conn2, LARGE_RESPONSE)] {
+        let arguments = json!({"sync": false, "bytes": bytes})
+            .as_object()
+            .unwrap()
+            .clone();
+        let result = conn.call("echo", arguments, BUDGET).await.unwrap();
+        assert_eq!(result["isError"], false);
+        drop(result);
+    }
+    let prior_calls = calls.load(Ordering::Acquire);
+    let sync1 = json!({"sync": true, "bytes": SMALL_RESPONSE})
         .as_object()
         .unwrap()
         .clone();
-    let sync2 = json!({"sync": true, "bytes": 7200})
+    let sync2 = json!({"sync": true, "bytes": LARGE_RESPONSE})
         .as_object()
         .unwrap()
         .clone();
@@ -843,17 +1039,22 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
         conn2.call("echo", sync2, BUDGET),
     );
     assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(calls.load(Ordering::Acquire) - prior_calls, 2);
     assert!(
         r1.is_err() || r2.is_err(),
-        "12500 B budget admitted two overlapping 6000 B calls simultaneously"
+        "shared budget admitted both overlapping conversions and retained results"
     );
     for r in [&r1, &r2] {
         if let Err(err) = r {
             assert!(err.to_string().contains("active memory limit"), "{err}");
         }
     }
+    drop(r1);
+    drop(r2);
     conn1.close().await.unwrap();
     conn2.close().await.unwrap();
+    drop(conn1);
+    drop(conn2);
     server.abort();
     assert_eq!(shared_budget.used(), 0);
 }
@@ -862,7 +1063,11 @@ async fn read_ipc_frame<R: tokio::io::AsyncRead + Unpin, T: serde::de::Deseriali
     reader: &mut R,
     max: usize,
 ) -> std::io::Result<Option<T>> {
-    ipc::read_frame_with_budget(reader, max, ByteBudget::global()).await
+    Ok(
+        ipc::read_frame_with_budget(reader, max, ByteBudget::global())
+            .await?
+            .map(|(value, _lease)| value),
+    )
 }
 
 async fn write_ipc_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
@@ -873,6 +1078,76 @@ async fn write_ipc_frame<W: tokio::io::AsyncWrite + Unpin, T: serde::Serialize>(
     let (frame, _lease) = ipc::encode_frame_leased(value, max, ByteBudget::global())?;
     writer.write_all(&frame).await?;
     writer.flush().await
+}
+
+#[tokio::test]
+async fn ipc_error_retains_value_lease_until_the_last_failure_owner() {
+    let dir = temp_dir();
+    let base = dir.path().canonicalize().unwrap();
+    let paths = Paths::with_root(base.join("mcpcli.json"), "default", &base.join("rt")).unwrap();
+    let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+    platform::secure_endpoint(&paths.socket).unwrap();
+    let server_paths = paths.clone();
+    let server = tokio::spawn(async move {
+        let mut conn = listener.accept().await.unwrap();
+        let _request: Request = read_ipc_frame(&mut conn, ipc::REQUEST_LIMIT)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut error = Failure::new(4, "mcp_protocol", "failed");
+        error.rpc_error = Some(Arc::new(
+            json!({"code":-32603,"message":"failed","data":{"text":"x".repeat(1024)}}),
+        ));
+        let response = Response {
+            protocol: ipc::PROTOCOL,
+            namespace: server_paths.namespace,
+            build: server_paths.build,
+            epoch: "e".into(),
+            result: None,
+            error: Some(error),
+        };
+        write_ipc_frame(&mut conn, &response, ipc::RESPONSE_LIMIT)
+            .await
+            .unwrap();
+    });
+    let request = paths
+        .request(
+            "d",
+            Operation::Call {
+                server: "s".into(),
+                tool: "t".into(),
+                arguments: Map::new(),
+                inline_media: false,
+            },
+            Duration::from_secs(2),
+        )
+        .unwrap();
+    let budget = ByteBudget::new(8192);
+    let error = runtime::exchange_tracked_with_options(
+        &paths,
+        &request,
+        &AtomicBool::new(false),
+        Duration::from_secs(1),
+        &budget,
+    )
+    .await
+    .unwrap_err();
+    let failure = error.downcast_ref::<Failure>().unwrap();
+    assert_eq!(
+        failure.rpc_error.as_ref().unwrap()["data"]["text"]
+            .as_str()
+            .unwrap()
+            .len(),
+        1024
+    );
+    let charged = budget.used();
+    assert!(charged > 1024);
+    let copy = failure.clone();
+    drop(error);
+    assert_eq!(budget.used(), charged);
+    drop(copy);
+    assert_eq!(budget.used(), 0);
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -970,7 +1245,7 @@ async fn ipc_two_stage_clocks_and_protocol_v3_rejection() {
         )
         .unwrap();
     let dispatched = AtomicBool::new(false);
-    let ok_resp = runtime::exchange_tracked_with_options(
+    let (ok_resp, _response_lease) = runtime::exchange_tracked_with_options(
         &paths,
         &req,
         &dispatched,
@@ -1194,7 +1469,7 @@ async fn cross_process_media_helper_entry() {
             let mut lease = budget.try_acquire(b64.len()).unwrap();
             match store.extract_and_save(&mut val, &mut lease, &budget).await {
                 Ok(Some(batch)) => {
-                    batch.complete().await;
+                    batch.complete().await.unwrap();
                     let p = val["savedMedia"][0]["savedPath"].as_str().unwrap();
                     println!("SAVED:{p}");
                 }
@@ -1304,7 +1579,7 @@ async fn media_cache_cross_process_inflight_protection_crash_recovery_and_conten
 
     // Complete local writeback at t=80_000 -> refreshes file_a's 60s window to 80_000..140_000.
     write_shared_clock(&clock_file, 80_000);
-    inflight_a.complete().await;
+    inflight_a.complete().await.unwrap();
 
     write_shared_clock(&clock_file, 130_000);
     let gc_mid = run_media_helper("gc", &media_dir, &clock_file, 10_000, 0);
@@ -1344,7 +1619,7 @@ async fn media_cache_cross_process_inflight_protection_crash_recovery_and_conten
         .unwrap();
     let path_abort = PathBuf::from(val_abort["savedMedia"][0]["savedPath"].as_str().unwrap());
     write_shared_clock(&clock_file, 270_000);
-    inflight_abort.abort().await;
+    inflight_abort.abort().await.unwrap();
     let gc_abort = run_media_helper("gc", &media_dir, &clock_file, 10_000, 0);
     assert!(gc_abort.status.success());
     assert!(!path_abort.exists());
@@ -1750,7 +2025,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
             .as_str()
             .unwrap(),
     );
-    // Wait briefly for daemon::send post-flush batch.complete() to update .index.json.
+    // Wait briefly for daemon::send post-flush batch.complete() to persist its completion record.
     tokio::time::sleep(Duration::from_millis(40)).await;
     now_ms.store(130_000, Ordering::Release);
     assert_eq!(store.run_gc().await.unwrap(), 64);

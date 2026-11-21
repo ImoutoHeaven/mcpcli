@@ -16,15 +16,16 @@ use anyhow::Result;
 use futures_util::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use rmcp::{
-    ClientHandler, RoleClient,
+    RoleClient,
     model::{
         CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig,
-        ClientJsonRpcMessage, ClientRequest, ErrorData, Implementation, PaginatedRequestParams,
-        ProtocolVersion, ServerJsonRpcMessage,
+        ClientJsonRpcMessage, ClientRequest, ClientResult, ElicitResult, ElicitationAction,
+        ErrorCode, ErrorData, Implementation, PaginatedRequestParams, ProtocolVersion,
+        ServerJsonRpcMessage, ServerNotification, ServerRequest,
     },
     service::{
         ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer,
-        QuitReason, RunningService, ServiceError,
+        QuitReason, RequestContext, RunningService, Service, ServiceError,
     },
     transport::{
         Transport,
@@ -45,13 +46,13 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    budget::{ByteBudget, ByteLease, format_bytes},
+    budget::{ByteBudget, ByteLease, Leased, format_bytes},
     config::ServerConfig,
 };
 
 mod ingress;
 mod sse;
-use ingress::{Ingress, IngressMemoryExhausted, ObserveOutcome};
+use ingress::{Ingress, IngressError, ObserveOutcome};
 #[cfg(windows)]
 mod windows_job;
 
@@ -61,6 +62,8 @@ pub const MAX_TOOL_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_TOOLS: usize = 10_000;
 const MAX_TOOL_PAGES: usize = 256;
+const PREFERRED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+#[cfg(test)]
 const LINE_SHRINK_CAP: usize = 64 * 1024;
 const UTF8_BOM: &[u8; 3] = b"\xef\xbb\xbf";
 const INVALID_REQUEST_REPLY: &[u8] =
@@ -95,7 +98,8 @@ pub struct McpFailure {
     pub kind: FailureKind,
     pub message: String,
     pub outcome_unknown: bool,
-    pub rpc_error: Option<Value>,
+    pub rpc_error: Option<Arc<Value>>,
+    pub(crate) lease: Option<Arc<ByteLease>>,
 }
 
 impl fmt::Display for McpFailure {
@@ -119,6 +123,7 @@ fn failure_with_outcome(
         message: message.into(),
         outcome_unknown,
         rpc_error: None,
+        lease: None,
     }
     .into()
 }
@@ -138,6 +143,7 @@ impl TransportTermination {
                 message,
                 outcome_unknown: false,
                 rpc_error: None,
+                lease: None,
             });
         }
         drop(guard);
@@ -155,6 +161,7 @@ impl TransportTermination {
                 message,
                 outcome_unknown: false,
                 rpc_error: None,
+                lease: None,
             });
         }
     }
@@ -229,6 +236,7 @@ fn record_cleanup_failure(
                     message: message.into(),
                     outcome_unknown: false,
                     rpc_error: None,
+                    lease: None,
                 },
                 local_confirmed,
             });
@@ -239,6 +247,7 @@ fn record_cleanup_failure(
                 message: message.into(),
                 outcome_unknown: false,
                 rpc_error: None,
+                lease: None,
             };
             existing.local_confirmed = false;
         }
@@ -251,14 +260,19 @@ fn observed_result(
     expected: Option<&str>,
     calling: bool,
 ) -> Result<(&'static str, Value, ByteLease)> {
-    if let Some((method, Ok(mut response), lease)) = response
-        && expected.map_or(
+    if let Some((method, response, lease)) = response {
+        let mut owned = Leased::new(response, lease);
+        if expected.map_or(
             matches!(method, "initialize" | "server/discover"),
             |expected| expected == method,
-        )
-        && let Some(result) = response.get_mut("result")
-    {
-        return Ok((method, result.take(), lease));
+        ) && let Ok(response) = owned.value_mut()
+            && let Some(result) = response.get_mut("result")
+        {
+            let result = result.take();
+            let (envelope, lease) = owned.into_parts();
+            drop(envelope);
+            return Ok((method, result, lease));
+        }
     }
     Err(failure_with_outcome(
         FailureKind::Protocol,
@@ -275,17 +289,20 @@ fn busy_capture() -> anyhow::Error {
 }
 
 fn rpc_failure(code: i32, diagnostic: String, calling: bool, ingress: &Ingress) -> anyhow::Error {
-    let (message, rpc_error) = match ingress.take() {
-        Some((_, Ok(mut response), _lease)) if response.get("error").is_some() => {
-            (diagnostic, response.get_mut("error").map(Value::take))
-        }
+    let (message, rpc_error, lease) = match ingress.take() {
+        Some((_, Ok(mut response), lease)) if response.get("error").is_some() => (
+            diagnostic,
+            response.get_mut("error").map(Value::take).map(Arc::new),
+            Some(Arc::new(lease)),
+        ),
         Some((_, Err(_), _lease)) => (
             format!(
                 "MCP error {code}: response rejected because its JSON cannot be represented losslessly"
             ),
             None,
+            None,
         ),
-        _ => (diagnostic, None),
+        _ => (diagnostic, None, None),
     };
     let suffix = if calling {
         "; outcome unknown, the call was not retried"
@@ -297,6 +314,7 @@ fn rpc_failure(code: i32, diagnostic: String, calling: bool, ingress: &Ingress) 
         message: format!("{message}{suffix}"),
         outcome_unknown: calling,
         rpc_error,
+        lease,
     }
     .into()
 }
@@ -342,7 +360,7 @@ struct Handler {
     tools_changed: Arc<AtomicBool>,
 }
 
-impl ClientHandler for Handler {
+impl Service<RoleClient> for Handler {
     fn get_info(&self) -> ClientConfig {
         ClientConfig::new(
             ClientCapabilities::default(),
@@ -350,8 +368,50 @@ impl ClientHandler for Handler {
         )
     }
 
-    async fn on_tool_list_changed(&self, _: NotificationContext<RoleClient>) {
-        self.tools_changed.store(true, Ordering::Release);
+    fn handle_request(
+        &self,
+        request: ServerRequest,
+        context: RequestContext<RoleClient>,
+    ) -> impl Future<Output = Result<ClientResult, ErrorData>> + Send {
+        // These are the existing noninteractive defaults. Do not move remote
+        // method strings into the local unsupported-method response.
+        #[allow(deprecated)]
+        let result = match &request {
+            ServerRequest::PingRequest(_) => Ok(ClientResult::empty(())),
+            ServerRequest::CreateMessageRequest(_) => Err(ErrorData::method_not_found::<
+                rmcp::model::CreateMessageRequestMethod,
+            >()),
+            ServerRequest::ListRootsRequest(_) => Ok(ClientResult::ListRootsResult(
+                rmcp::model::ListRootsResult::default(),
+            )),
+            ServerRequest::ElicitRequest(_) => Ok(ClientResult::ElicitResult(ElicitResult::new(
+                ElicitationAction::Decline,
+            ))),
+            _ => Err(ErrorData::new(
+                ErrorCode::METHOD_NOT_FOUND,
+                "Unsupported server request",
+                None,
+            )),
+        };
+        drop(request);
+        drop(context);
+        std::future::ready(result)
+    }
+
+    fn handle_notification(
+        &self,
+        notification: ServerNotification,
+        context: NotificationContext<RoleClient>,
+    ) -> impl Future<Output = Result<(), ErrorData>> + Send {
+        if matches!(
+            &notification,
+            ServerNotification::ToolListChangedNotification(_)
+        ) {
+            self.tools_changed.store(true, Ordering::Release);
+        }
+        drop(notification);
+        drop(context);
+        std::future::ready(Ok(()))
     }
 }
 
@@ -365,10 +425,11 @@ pub struct McpConnection {
     ingress: Ingress,
     termination: Arc<TransportTermination>,
     limits: McpLimits,
-    server: Vec<u8>,
+    server: Leased<Vec<u8>>,
     closing: Option<CloseFuture>,
     cleanup: CleanupState,
     tools_changed: Arc<AtomicBool>,
+    http: bool,
 }
 
 impl McpConnection {
@@ -390,7 +451,7 @@ impl McpConnection {
             tools_changed: tools_changed.clone(),
         };
         let lifecycle = ClientLifecycleMode::Auto {
-            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+            preferred_versions: PREFERRED_PROTOCOL_VERSIONS.to_vec(),
             legacy_version: Some(ProtocolVersion::V_2025_11_25),
         };
         let connection = async {
@@ -502,22 +563,36 @@ impl McpConnection {
             .peer()
             .set_response_cache_config(ClientCacheConfig::disabled())
             .await;
-        let (source, result, _lease) = observed_result(ingress.take(), None, false)?;
+        let observed = observed_result(ingress.take(), None, false)?;
+        // Keep the owner older than the payload through the fallible peer lookup.
+        let result_lease = observed.2;
+        let (source, result) = (observed.0, observed.1);
         let protocol = service
             .peer()
             .peer_info()
             .ok_or_else(|| failure(FailureKind::Protocol, "MCP peer info is missing"))?;
-        let server = serde_json::json!({"source":source,"protocolVersion":protocol.protocol_version,"result":result});
+        let mut server = Map::new();
+        server.insert("source".into(), Value::String(source.into()));
+        server.insert(
+            "protocolVersion".into(),
+            Value::String(protocol.protocol_version.as_str().into()),
+        );
+        server.insert("result".into(), result);
+        let (server_bytes, server_lease) =
+            crate::ipc::encode_json_leased(&server, limits.max_response_bytes, &limits.budget)?;
+        drop(server);
+        drop(result_lease);
         Ok(Self {
             ingress,
             termination,
             limits,
-            server: serde_json::to_vec(&server)?,
+            server: Leased::new(server_bytes, server_lease),
             peer: service.peer().clone(),
             service: Some(service),
             closing: None,
             cleanup,
             tools_changed,
+            http: matches!(config, ServerConfig::Http { .. }),
         })
     }
 
@@ -548,29 +623,58 @@ impl McpConnection {
         self.tools_changed.swap(false, Ordering::AcqRel)
     }
 
-    pub fn server_info(&self) -> Result<Value> {
-        Ok(serde_json::from_slice(&self.server)?)
+    pub fn server_info(&self) -> Result<Leased<Value>> {
+        let lease = self
+            .limits
+            .budget
+            .try_acquire(self.server.len())
+            .ok_or_else(|| {
+                failure(
+                    FailureKind::Transport,
+                    "Server metadata exceeds the active memory limit",
+                )
+            })?;
+        let scratch = self
+            .limits
+            .budget
+            .try_acquire(crate::json::scratch_bytes(&self.server))
+            .ok_or_else(|| {
+                failure(
+                    FailureKind::Transport,
+                    "Server metadata parsing exceeds the active memory limit",
+                )
+            })?;
+        let value = serde_json::from_slice(&self.server)?;
+        drop(scratch);
+        Ok(Leased::new(value, lease))
     }
 
-    pub async fn list_tools(&self, budget: Duration) -> Result<Vec<Value>> {
+    pub async fn list_tools(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
         let (pages, _) = self.walk_tools(budget).await?;
-        Ok(pages
-            .into_iter()
-            .flat_map(|mut page| {
-                page["tools"]
-                    .take()
-                    .as_array_mut()
-                    .map(std::mem::take)
-                    .unwrap_or_default()
-            })
-            .collect())
+        let (pages, lease) = pages.into_parts();
+        Ok(Leased::new(
+            pages
+                .into_iter()
+                .flat_map(|mut page| {
+                    page["tools"]
+                        .take()
+                        .as_array_mut()
+                        .map(std::mem::take)
+                        .unwrap_or_default()
+                })
+                .collect(),
+            lease,
+        ))
     }
 
-    pub async fn list_tool_pages(&self, budget: Duration) -> Result<Vec<Value>> {
+    pub async fn list_tool_pages(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
         self.walk_tools(budget).await.map(|(pages, _)| pages)
     }
 
-    async fn walk_tools(&self, budget: Duration) -> Result<(Vec<Value>, HashSet<String>)> {
+    async fn walk_tools(
+        &self,
+        budget: Duration,
+    ) -> Result<(Leased<Vec<Value>>, Leased<HashSet<String>>)> {
         if self.termination.is_terminated() {
             self.abort_service();
             return Err(self.termination.failure(false));
@@ -578,8 +682,12 @@ impl McpConnection {
         self.termination.clear_transient();
         let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
         let listing = async {
+            let mut pages_lease = self.limits.budget.empty_lease();
+            let mut names_lease = self.limits.budget.empty_lease();
+            let mut cursors_lease = self.limits.budget.empty_lease();
             let mut pages = Vec::new();
             let mut count = 0usize;
+            let mut cursor_owner = self.limits.budget.empty_lease();
             let mut cursor = None;
             let mut cursors = HashSet::new();
             let mut names = HashSet::new();
@@ -588,7 +696,7 @@ impl McpConnection {
                 let mut params = PaginatedRequestParams::default();
                 params.cursor = cursor;
                 let list_fut = self.peer.list_tools(Some(params));
-                let page = tokio::select! {
+                let mut page = tokio::select! {
                     biased;
                     res = list_fut => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
                     () = self.termination.cancelled() => {
@@ -596,10 +704,17 @@ impl McpConnection {
                         return Err(self.termination.failure(false));
                     }
                 };
-                let (_, raw_page, _page_lease) =
+                let (_, raw_page, page_lease) =
                     observed_result(self.ingress.take(), Some("tools/list"), false)?;
-                for tool in page.tools {
-                    if tool.name.is_empty() || !names.insert(tool.name.to_string()) {
+                pages_lease.merge(page_lease);
+                for tool in std::mem::take(&mut page.tools) {
+                    if !names_lease.try_grow(tool.name.len()) {
+                        return Err(failure(
+                            FailureKind::Transport,
+                            "Tool names exceed the active memory limit",
+                        ));
+                    }
+                    if tool.name.is_empty() || !names.insert(tool.name.into_owned()) {
                         return Err(failure(
                             FailureKind::Protocol,
                             "Tool catalog contains an empty or duplicate name",
@@ -613,7 +728,7 @@ impl McpConnection {
                         ));
                     }
                 }
-                bytes = bytes.saturating_add(serde_json::to_vec(&raw_page)?.len());
+                bytes = bytes.saturating_add(crate::json::serialized_len(&raw_page)?);
                 if bytes > self.limits.max_tool_catalog_bytes {
                     return Err(failure(
                         FailureKind::Protocol,
@@ -624,9 +739,33 @@ impl McpConnection {
                     ));
                 }
                 pages.push(raw_page);
-                cursor = page.next_cursor;
+                // Charge the cursor while the application retains it between
+                // pages. SDK-owned request/cache copies are outside this owner.
+                let cursor_bytes = page.next_cursor.as_ref().map_or(0, String::capacity);
+                if !cursor_owner.try_grow(cursor_bytes.saturating_sub(cursor_owner.bytes())) {
+                    return Err(failure(
+                        FailureKind::Transport,
+                        "Tool cursors exceed the active memory limit",
+                    ));
+                }
+                cursor_owner.shrink_to(cursor_bytes);
+                cursor = page.next_cursor.take();
+                drop(page);
+                if let Some(c) = &cursor
+                    && !cursors_lease.try_grow(c.len())
+                {
+                    return Err(failure(
+                        FailureKind::Transport,
+                        "Tool cursors exceed the active memory limit",
+                    ));
+                }
                 match &cursor {
-                    None => return Ok((pages, names)),
+                    None => {
+                        return Ok((
+                            Leased::new(pages, pages_lease),
+                            Leased::new(names, names_lease),
+                        ));
+                    }
                     Some(c) if !cursors.insert(c.clone()) => {
                         return Err(failure(
                             FailureKind::Protocol,
@@ -651,7 +790,7 @@ impl McpConnection {
         name: &str,
         arguments: Map<String, Value>,
         budget: Duration,
-    ) -> Result<Value> {
+    ) -> Result<Leased<Value>> {
         let dispatched = AtomicBool::new(false);
         self.call_with_dispatch(name, arguments, budget, &dispatched)
             .await
@@ -663,34 +802,46 @@ impl McpConnection {
         arguments: Map<String, Value>,
         budget: Duration,
         dispatched: &AtomicBool,
-    ) -> Result<Value> {
-        self.call_with_dispatch_leased(name, arguments, budget, dispatched)
+    ) -> Result<Leased<Value>> {
+        let input_lease = self
+            .limits
+            .budget
+            .try_acquire(crate::json::serialized_len(&arguments)?)
+            .ok_or_else(|| {
+                failure(
+                    FailureKind::Transport,
+                    "Tool arguments exceed the active memory limit",
+                )
+            })?;
+        let arguments = Leased::new(arguments, input_lease);
+        self.call_with_dispatch_leased(name, &arguments, budget, dispatched)
             .await
-            .map(|(value, _lease)| value)
+            .map(|(value, lease)| Leased::new(value, lease))
     }
 
     pub async fn call_with_dispatch_leased(
         &self,
         name: &str,
-        arguments: Map<String, Value>,
+        arguments: &Map<String, Value>,
         budget: Duration,
         dispatched: &AtomicBool,
     ) -> Result<(Value, ByteLease)> {
         let started = tokio::time::Instant::now();
         // HTTP header annotations need the SDK's current catalog; fresh discovery
         // also prevents invoking tools rejected by the transport or withdrawn.
-        let (_, names) = self
+        let (pages, names) = self
             .walk_tools(budget)
             .await
             .map_err(|error| -> anyhow::Error {
-                let previous = error.downcast_ref::<McpFailure>();
-                McpFailure {
-                    kind: previous.map_or(FailureKind::Transport, |error| error.kind),
-                    message: format!("Tool was not dispatched: discovery failed: {error}"),
-                    outcome_unknown: false,
-                    rpc_error: previous.and_then(|error| error.rpc_error.clone()),
+                let message = format!("Tool was not dispatched: discovery failed: {error}");
+                match error.downcast::<McpFailure>() {
+                    Ok(mut error) => {
+                        error.message = message;
+                        error.outcome_unknown = false;
+                        error.into()
+                    }
+                    Err(_) => failure(FailureKind::Transport, message),
                 }
-                .into()
             })?;
         if !names.contains(name) {
             return Err(failure(
@@ -698,6 +849,42 @@ impl McpConnection {
                 "Tool was not dispatched: not present in the current catalog",
             ));
         }
+        let parameter_bytes = crate::json::serialized_len(arguments)?.saturating_add(name.len());
+        let header_bytes = if self.http
+            && self
+                .peer
+                .peer_info()
+                .is_some_and(|info| info.protocol_version >= ProtocolVersion::STANDARD_HEADERS)
+        {
+            let schema = pages
+                .iter()
+                .filter_map(|page| page.get("tools").and_then(Value::as_array))
+                .flatten()
+                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|tool| tool.get("inputSchema"));
+            call_header_payload_bound(name, arguments, schema)
+        } else {
+            0
+        };
+        drop(names);
+        drop(pages);
+        let copies = if self.http { 2 } else { 1 };
+        // HTTP holds one request plus either its POST clone or header Value
+        // projection. Header construction also has bounded temporary encodings.
+        let _parameter_lease = self
+            .limits
+            .budget
+            .try_acquire(
+                parameter_bytes
+                    .saturating_mul(copies)
+                    .saturating_add(header_bytes.saturating_mul(5)),
+            )
+            .ok_or_else(|| {
+                failure(
+                    FailureKind::Transport,
+                    "Tool arguments and headers exceed the active memory limit",
+                )
+            })?;
         let remaining = budget.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             return Err(failure(
@@ -706,7 +893,9 @@ impl McpConnection {
             ));
         }
         self.termination.clear_transient();
-        let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments);
+        // This owner covers the application's request construction and wait.
+        // It makes no claim about SDK copies retained after cancellation.
+        let request = CallToolRequestParams::new(name.to_owned()).with_arguments(arguments.clone());
         // This conservative boundary is also visible to the daemon's outer deadline.
         let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
         if self.termination.is_terminated() {
@@ -813,12 +1002,12 @@ fn init_failure(
             ingress,
         ),
         E::NoCompatibleProtocolVersion { .. } => {
-            let (rpc_error, rejected) = match ingress.take() {
-                Some((_, Ok(mut response), _)) => {
-                    (response.get_mut("error").map(Value::take), false)
+            let (rpc_error, lease, rejected) = match ingress.take() {
+                Some((_, Ok(mut response), lease)) => {
+                    (response.get_mut("error").map(Value::take).map(Arc::new), Some(Arc::new(lease)), false)
                 }
-                Some((_, Err(_), _)) => (None, true),
-                None => (None, false),
+                Some((_, Err(_), _)) => (None, None, true),
+                None => (None, None, false),
             };
             McpFailure {
                 kind: FailureKind::Protocol,
@@ -830,6 +1019,7 @@ fn init_failure(
                 .into(),
                 outcome_unknown: false,
                 rpc_error,
+                lease,
             }
             .into()
         }
@@ -841,6 +1031,74 @@ fn init_failure(
             )
         }),
     }
+}
+
+struct OutgoingHttpBody {
+    bytes: Leased<Vec<u8>>,
+    _message: ClientJsonRpcMessage,
+}
+
+impl AsRef<[u8]> for OutgoingHttpBody {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes.as_ref()
+    }
+}
+
+fn encode_mcp_message(
+    message: &ClientJsonRpcMessage,
+    limit: usize,
+    budget: &Arc<ByteBudget>,
+    termination: &TransportTermination,
+) -> std::io::Result<Leased<Vec<u8>>> {
+    crate::ipc::encode_json_leased(message, limit, budget).map(|(bytes, lease)| Leased::new(bytes, lease)).map_err(|error| {
+        let reason = if error.kind() == std::io::ErrorKind::OutOfMemory {
+            format!("MCP outgoing message exceeded the {} active memory limit", format_bytes(budget.limit()))
+        } else { format!("MCP outgoing message could not be encoded within the {} message limit: {error}", format_bytes(limit)) };
+        termination.terminate(FailureKind::Transport, reason.clone());
+        std::io::Error::new(error.kind(), reason)
+    })
+}
+
+fn call_header_payload_bound(
+    name: &str,
+    arguments: &Map<String, Value>,
+    schema: Option<&Value>,
+) -> usize {
+    fn encoded_len(bytes: usize) -> usize {
+        bytes.div_ceil(3).saturating_mul(4).saturating_add(10)
+    }
+    fn properties(schema: &Value, arguments: &Map<String, Value>) -> usize {
+        let Some(fields) = schema.get("properties").and_then(Value::as_object) else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for (key, field) in fields {
+            let Some(value) = arguments.get(key) else {
+                continue;
+            };
+            if let Some(header) = field.get("x-mcp-header").and_then(Value::as_str) {
+                let bytes = match value {
+                    Value::String(value) => Some(value.len()),
+                    Value::Number(value) => Some(value.to_string().len()),
+                    Value::Bool(value) => Some(if *value { 4 } else { 5 }),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    total = total
+                        .saturating_add(encoded_len(bytes))
+                        .saturating_add("Mcp-Param-".len())
+                        .saturating_add(header.len());
+                }
+            }
+            if let Some(arguments) = value.as_object() {
+                total = total.saturating_add(properties(field, arguments));
+            }
+        }
+        total
+    }
+    encoded_len(name.len())
+        .saturating_add("Mcp-Name".len())
+        .saturating_add(schema.map_or(0, |schema| properties(schema, arguments)))
 }
 
 fn has_media_type(content_type: &str, expected: &str) -> bool {
@@ -904,13 +1162,10 @@ enum StdioParseError {
 }
 
 fn classify_stdio_error(
-    line: &[u8],
     error: serde_json::Error,
+    ignore_notification: bool,
 ) -> std::result::Result<Option<ServerJsonRpcMessage>, StdioParseError> {
-    if let Ok(value) = serde_json::from_slice::<Value>(line)
-        && let Some(method) = value.get("method").and_then(Value::as_str)
-        && should_ignore_notification(&value, method)
-    {
+    if ignore_notification {
         return Ok(None);
     }
     match error.classify() {
@@ -920,15 +1175,6 @@ fn classify_stdio_error(
         serde_json::error::Category::Data | serde_json::error::Category::Io => {
             Err(StdioParseError::InvalidRequest)
         }
-    }
-}
-
-fn parse_stdio_message(
-    line: &[u8],
-) -> std::result::Result<Option<ServerJsonRpcMessage>, StdioParseError> {
-    match serde_json::from_slice::<ServerJsonRpcMessage>(line) {
-        Ok(message) => Ok(Some(message)),
-        Err(error) => classify_stdio_error(line, error),
     }
 }
 
@@ -1084,10 +1330,7 @@ impl<R, W> ChildTransport<R, W> {
     }
 
     fn clear_line_buf(&mut self) {
-        self.line_buf.clear();
-        if self.line_buf.capacity() > LINE_SHRINK_CAP {
-            self.line_buf = Vec::new();
-        }
+        self.line_buf = Vec::new();
         self.line_lease.release();
     }
 
@@ -1183,7 +1426,11 @@ where
                             format_bytes(self.max_line_bytes)
                         )),
                     )
-                } else if !self.line_lease.try_grow(take) {
+                } else if !self.line_lease.reserve_vec(
+                    &mut self.line_buf,
+                    next_len,
+                    self.max_line_bytes,
+                ) {
                     (
                         take,
                         false,
@@ -1319,6 +1566,8 @@ where
         }
         let write = self.write.clone();
         let termination = self.termination.clone();
+        let budget = self.budget.clone();
+        let limit = self.max_line_bytes.saturating_sub(1);
         async move {
             if terminated || termination.is_terminated() {
                 return Err(std::io::Error::new(
@@ -1326,8 +1575,8 @@ where
                     "Transport is terminated",
                 ));
             }
-            let mut bytes = serde_json::to_vec(&item).map_err(std::io::Error::other)?;
-            bytes.push(b'\n');
+            let bytes = encode_mcp_message(&item, limit, &budget, &termination)?;
+            drop(item);
             let mut guard = write.lock().await;
             if termination.is_terminated() {
                 return Err(std::io::Error::new(
@@ -1339,6 +1588,7 @@ where
                 std::io::Error::new(std::io::ErrorKind::NotConnected, "Transport is closed")
             })?;
             stdin.write_all(&bytes).await?;
+            stdin.write_all(b"\n").await?;
             stdin.flush().await
         }
     }
@@ -1358,37 +1608,48 @@ where
             if !self.read_line().await {
                 return None;
             }
-            let outcome = {
-                let without_lf = self.line_buf.strip_suffix(b"\n").unwrap_or(&self.line_buf);
-                let without_crlf = without_lf.strip_suffix(b"\r").unwrap_or(without_lf);
-                let trimmed = without_crlf
-                    .strip_prefix(UTF8_BOM.as_slice())
-                    .unwrap_or(without_crlf);
-                if trimmed.is_empty() {
-                    Ok(None)
-                } else {
-                    match self.ingress.observe_bytes(
-                        trimmed,
-                        self.max_line_bytes,
-                        &self.budget,
-                        false,
-                    ) {
-                        Err(IngressMemoryExhausted) => Err(format!(
+            let mut raw = Leased::new(std::mem::take(&mut self.line_buf), self.line_lease.take());
+            if raw.last() == Some(&b'\n') {
+                raw.value_mut().pop();
+            }
+            if raw.last() == Some(&b'\r') {
+                raw.value_mut().pop();
+            }
+            if raw.starts_with(UTF8_BOM) {
+                raw.value_mut().drain(..UTF8_BOM.len());
+            }
+            let outcome = if raw.is_empty() {
+                Ok(None)
+            } else {
+                match self
+                    .ingress
+                    .observe_owned(raw, self.max_line_bytes, &self.budget, false)
+                {
+                    Err(IngressError::MemoryExhausted) => Err((
+                        FailureKind::Transport,
+                        format!(
                             "MCP stdio response exceeded the {} active memory limit",
                             format_bytes(self.budget.limit())
-                        )),
-                        Ok(ObserveOutcome::Captured(message)) => Ok(Some(Ok(Some(*message)))),
-                        Ok(ObserveOutcome::InvalidMessage(error)) => {
-                            Ok(Some(classify_stdio_error(trimmed, error)))
-                        }
-                        Ok(ObserveOutcome::NotMatched) => Ok(Some(parse_stdio_message(trimmed))),
+                        ),
+                    )),
+                    Err(IngressError::InvalidMetadata) => Err((
+                        FailureKind::Protocol,
+                        "MCP response JSON cannot be represented losslessly".into(),
+                    )),
+                    Ok(ObserveOutcome::Captured(message)) => {
+                        self.clear_line_buf();
+                        return Some(ingress::into_sdk(message));
                     }
+                    Ok(ObserveOutcome::InvalidMessage(error, ignore)) => {
+                        Ok(Some(classify_stdio_error(error, ignore)))
+                    }
+                    Ok(ObserveOutcome::NotMatched) => Ok(Some(Ok(None))),
                 }
             };
             self.clear_line_buf();
             match outcome {
-                Err(reason) => {
-                    self.termination.terminate(FailureKind::Transport, reason);
+                Err((kind, reason)) => {
+                    self.termination.terminate(kind, reason);
                     return None;
                 }
                 Ok(None) | Ok(Some(Ok(None))) | Ok(Some(Err(StdioParseError::Ignore))) => continue,
@@ -1440,27 +1701,22 @@ impl BoundedHttp {
                 .set_transient(FailureKind::Transport, msg.clone());
             return Err(HttpError::ResponseBodyTooLarge { max_size: limit });
         }
-        let mut lease = if let Some(length) = response.content_length() {
-            let length = length as usize;
-            match self.budget.try_acquire(length) {
-                Some(lease) => lease,
-                None => {
-                    let msg = format!(
-                        "HTTP response exceeded the {} active memory limit",
-                        format_bytes(self.budget.limit())
-                    );
-                    self.termination
-                        .set_transient(FailureKind::Transport, msg.clone());
-                    return Err(HttpError::Io(std::io::Error::new(
-                        std::io::ErrorKind::OutOfMemory,
-                        msg,
-                    )));
-                }
-            }
-        } else {
-            self.budget.empty_lease()
-        };
+        let mut lease = self.budget.empty_lease();
         let mut bytes = Vec::new();
+        if let Some(length) = response.content_length()
+            && !lease.reserve_vec(&mut bytes, length as usize, limit)
+        {
+            let msg = format!(
+                "HTTP response exceeded the {} active memory limit",
+                format_bytes(self.budget.limit())
+            );
+            self.termination
+                .set_transient(FailureKind::Transport, msg.clone());
+            return Err(HttpError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                msg,
+            )));
+        }
         while let Some(chunk) = response
             .chunk()
             .await
@@ -1474,7 +1730,7 @@ impl BoundedHttp {
                 self.termination.set_transient(FailureKind::Transport, msg);
                 return Err(HttpError::ResponseBodyTooLarge { max_size: limit });
             }
-            if next_len > lease.bytes() && !lease.try_grow(next_len - lease.bytes()) {
+            if !lease.reserve_vec(&mut bytes, next_len, limit) {
                 drop(bytes);
                 lease.release();
                 let msg = format!(
@@ -1490,7 +1746,7 @@ impl BoundedHttp {
             }
             bytes.extend_from_slice(&chunk);
         }
-        lease.shrink_to(bytes.len());
+        lease.shrink_to(bytes.capacity());
         Ok((bytes, lease))
     }
 
@@ -1508,6 +1764,15 @@ impl BoundedHttp {
         }
         self.ingress.track(&message);
         let had_session = session_id.is_some();
+        let notification = !matches!(&message, ClientJsonRpcMessage::Request(_));
+        let discover_id = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if !had_session && matches!(request.request, ClientRequest::DiscoverRequest(_)) =>
+            {
+                Some(request.id.clone())
+            }
+            _ => None,
+        };
         let mut request = self
             .client
             .post(uri.as_ref())
@@ -1521,9 +1786,28 @@ impl BoundedHttp {
         if let Some(auth) = auth {
             request = request.bearer_auth(auth);
         }
-        let response = request
-            .json(&message)
-            .send()
+        let body = encode_mcp_message(
+            &message,
+            self.max_response_bytes,
+            &self.budget,
+            &self.termination,
+        )
+        .map_err(HttpError::Io)?;
+        let body = bytes::Bytes::from_owner(OutgoingHttpBody {
+            bytes: body,
+            _message: message,
+        });
+        let mut request = request
+            .body(body)
+            .build()
+            .map_err(|error| HttpError::Client(error.without_url()))?;
+        request
+            .headers_mut()
+            .entry(http::header::CONTENT_TYPE)
+            .or_insert(HeaderValue::from_static("application/json"));
+        let response = self
+            .client
+            .execute(request)
             .await
             .map_err(|error| HttpError::Client(error.without_url()))?;
         let status = response.status();
@@ -1538,7 +1822,6 @@ impl BoundedHttp {
         if status == http::StatusCode::ACCEPTED || status == http::StatusCode::NO_CONTENT {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
-        let notification = !matches!(message, ClientJsonRpcMessage::Request(_));
         if status.is_success() && notification && response.content_length() == Some(0) {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
@@ -1575,16 +1858,9 @@ impl BoundedHttp {
         if !status.is_success() {
             // Legacy middleware may reject discover before JSON-RPC dispatch.
             // Correlate only this read-only probe, never an ordinary tool call.
-            let discover_request_id = if !had_session
-                && status.is_client_error()
-                && status != http::StatusCode::TOO_MANY_REQUESTS
-                && let ClientJsonRpcMessage::Request(request) = &message
-                && matches!(request.request, ClientRequest::DiscoverRequest(_))
-            {
-                Some(request.id.clone())
-            } else {
-                None
-            };
+            let discover_request_id = discover_id.filter(|_| {
+                status.is_client_error() && status != http::StatusCode::TOO_MANY_REQUESTS
+            });
             if status == http::StatusCode::TOO_MANY_REQUESTS
                 || (discover_request_id.is_none() && !is_json)
             {
@@ -1609,24 +1885,23 @@ impl BoundedHttp {
                     )));
                 }
             };
+            let raw = Leased::new(body, lease);
+            let observed = if is_json && !raw.is_empty() {
+                Some(self.observe_response(raw, limit, true)?)
+            } else {
+                drop(raw);
+                None
+            };
             if let Some(request_id) = discover_request_id {
-                if is_json && !body.is_empty() {
-                    match self.ingress.observe_bytes(&body, limit, &self.budget, true) {
-                        Err(IngressMemoryExhausted) => {}
-                        Ok(ObserveOutcome::Captured(message)) => {
-                            if let ServerJsonRpcMessage::Error(ref error) = *message
-                                && error.id.as_ref() == Some(&request_id)
-                            {
-                                drop(body);
-                                drop(lease);
-                                return Ok(StreamableHttpPostResponse::Json(*message, None));
-                            }
-                        }
-                        Ok(_) => {}
-                    }
+                if let Some(ObserveOutcome::Captured(message)) = observed
+                    && let ServerJsonRpcMessage::Error(ref error) = **message
+                    && error.id.as_ref() == Some(&request_id)
+                {
+                    return Ok(StreamableHttpPostResponse::Json(
+                        ingress::into_sdk(message),
+                        None,
+                    ));
                 }
-                drop(body);
-                drop(lease);
                 return Ok(StreamableHttpPostResponse::Json(
                     ServerJsonRpcMessage::error(
                         ErrorData::invalid_request("server/discover is unavailable", None),
@@ -1635,90 +1910,69 @@ impl BoundedHttp {
                     None,
                 ));
             }
-            if is_json {
-                match self.ingress.observe_bytes(&body, limit, &self.budget, true) {
-                    Err(IngressMemoryExhausted) => {
-                        drop(body);
-                        drop(lease);
-                        let msg = format!(
-                            "HTTP response exceeded the {} active memory limit",
-                            format_bytes(self.budget.limit())
-                        );
-                        self.termination
-                            .set_transient(FailureKind::Transport, msg.clone());
-                        return Err(HttpError::Io(std::io::Error::new(
-                            std::io::ErrorKind::OutOfMemory,
-                            msg,
-                        )));
-                    }
-                    Ok(ObserveOutcome::Captured(message))
-                        if matches!(*message, ServerJsonRpcMessage::Error(_)) =>
-                    {
-                        drop(body);
-                        drop(lease);
-                        return Ok(StreamableHttpPostResponse::Json(*message, session));
-                    }
-                    Ok(ObserveOutcome::NotMatched) => {
-                        if let Ok(message @ ServerJsonRpcMessage::Error(_)) =
-                            serde_json::from_slice(&body)
-                        {
-                            drop(body);
-                            drop(lease);
-                            return Ok(StreamableHttpPostResponse::Json(message, session));
-                        }
-                    }
-                    Ok(_) => {}
-                }
+            if let Some(ObserveOutcome::Captured(message)) = observed
+                && matches!(**message, ServerJsonRpcMessage::Error(_))
+            {
+                return Ok(StreamableHttpPostResponse::Json(
+                    ingress::into_sdk(message),
+                    session,
+                ));
             }
-            drop(body);
-            drop(lease);
             return Err(HttpError::HttpStatus(HttpStatusError::new(
                 status.as_u16(),
                 retry_after,
             )));
         }
         let (body, lease) = self.bounded_body(response, limit).await?;
-        if notification && body.is_empty() {
-            drop(body);
-            drop(lease);
+        let raw = Leased::new(body, lease);
+        if notification && raw.is_empty() {
             return Ok(StreamableHttpPostResponse::Accepted);
         }
         if !is_json {
-            drop(body);
-            drop(lease);
             return Err(HttpError::UnexpectedContentType(None));
         }
-        let parsed = match self
-            .ingress
-            .observe_bytes(&body, limit, &self.budget, false)
-        {
-            Err(IngressMemoryExhausted) => {
-                drop(body);
-                drop(lease);
-                let msg = format!(
-                    "HTTP response exceeded the {} active memory limit",
-                    format_bytes(self.budget.limit())
-                );
-                self.termination
-                    .set_transient(FailureKind::Transport, msg.clone());
-                return Err(HttpError::Io(std::io::Error::new(
-                    std::io::ErrorKind::OutOfMemory,
-                    msg,
-                )));
+        match self.observe_response(raw, limit, false)? {
+            ObserveOutcome::Captured(message) => Ok(StreamableHttpPostResponse::Json(
+                ingress::into_sdk(message),
+                session,
+            )),
+            ObserveOutcome::NotMatched => Ok(StreamableHttpPostResponse::Accepted),
+            ObserveOutcome::InvalidMessage(..) if notification => {
+                Ok(StreamableHttpPostResponse::Accepted)
             }
-            Ok(ObserveOutcome::Captured(message)) => Ok(*message),
-            Ok(ObserveOutcome::InvalidMessage(error)) => Err(error),
-            Ok(ObserveOutcome::NotMatched) => serde_json::from_slice(&body),
-        };
-        drop(body);
-        drop(lease);
-        match parsed {
-            Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session)),
-            Err(_) if notification => Ok(StreamableHttpPostResponse::Accepted),
-            Err(_) => Err(HttpError::UnexpectedServerResponse(Cow::Borrowed(
-                "Invalid JSON-RPC response",
-            ))),
+            ObserveOutcome::InvalidMessage(..) => Err(HttpError::UnexpectedServerResponse(
+                Cow::Borrowed("Invalid JSON-RPC response"),
+            )),
         }
+    }
+
+    fn observe_response(
+        &self,
+        raw: Leased<Vec<u8>>,
+        limit: usize,
+        error_only: bool,
+    ) -> Result<ObserveOutcome, HttpError> {
+        self.ingress
+            .observe_owned(raw, limit, &self.budget, error_only)
+            .map_err(|error| {
+                let (kind, io_kind, message) = match error {
+                    IngressError::MemoryExhausted => (
+                        FailureKind::Transport,
+                        std::io::ErrorKind::OutOfMemory,
+                        format!(
+                            "HTTP response exceeded the {} active memory limit",
+                            format_bytes(self.budget.limit())
+                        ),
+                    ),
+                    IngressError::InvalidMetadata => (
+                        FailureKind::Protocol,
+                        std::io::ErrorKind::InvalidData,
+                        "MCP response JSON cannot be represented losslessly".into(),
+                    ),
+                };
+                self.termination.terminate(kind, message.clone());
+                HttpError::Io(std::io::Error::new(io_kind, message))
+            })
     }
 }
 
@@ -2016,6 +2270,33 @@ mod stdio_transport_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn fragmented_stdio_line_charges_capacity_until_release() {
+        let budget = ByteBudget::new(256);
+        let (client_io, mut server_io) = tokio::io::duplex(8);
+        let (read, write) = tokio::io::split(client_io);
+        let mut transport = ChildTransport::from_parts(
+            read,
+            write,
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+            128,
+            budget.clone(),
+        );
+        let sender = tokio::spawn(async move {
+            server_io
+                .write_all(b"abcdefghijklmnopqrstuvwxyz012345\n")
+                .await
+                .unwrap();
+        });
+        assert!(transport.read_line().await);
+        sender.await.unwrap();
+        assert_eq!(transport.line_lease.bytes(), transport.line_buf.capacity());
+        assert_eq!(budget.used(), transport.line_buf.capacity());
+        transport.clear_line_buf();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
     async fn stdio_transport_shrinks_large_line_buf_and_enforces_exact_bounds_and_leases() {
         let budget = ByteBudget::new(512 * 1024);
         let ingress = Ingress::default();
@@ -2046,6 +2327,7 @@ mod stdio_transport_tests {
         .into_bytes();
         let write_fut = tokio::spawn(async move {
             server_io.write_all(&frame).await.unwrap();
+            server_io.shutdown().await.unwrap();
             frame.clear();
             server_io
         });
@@ -2058,6 +2340,8 @@ mod stdio_transport_tests {
         let (_, captured, lease) = ingress.take().unwrap();
         let captured = captured.unwrap();
         assert_eq!(captured["result"].get("x"), Some(&Value::Null));
+        drop(captured);
+        drop(received);
         drop(lease);
         assert_eq!(budget.used(), 0);
 
@@ -2079,17 +2363,26 @@ mod stdio_transport_tests {
 
             for valid in [under, exact] {
                 let term = Arc::new(TransportTermination::default());
+                let ingress = Ingress::default();
+                let _capture = ingress.capture().unwrap();
+                let request: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/list"
+                }))
+                .unwrap();
+                ingress.track(&request);
                 let (c, mut s) = tokio::io::duplex(4096);
                 let (r, w) = tokio::io::split(c);
                 let mut t = ChildTransport::from_parts(
                     r,
                     w,
-                    Ingress::default(),
+                    ingress,
                     term.clone(),
                     limit,
                     ByteBudget::new(4096),
                 );
                 s.write_all(valid.as_bytes()).await.unwrap();
+                // EOF also makes a broken correlation fail promptly instead of hanging CI.
+                s.shutdown().await.unwrap();
                 assert!(t.receive().await.is_some());
                 assert!(!term.is_terminated());
             }
@@ -2183,13 +2476,17 @@ mod stdio_transport_tests {
 
         let second_half = b"\"result\":{\"tools\":[],\"tag\":\"intact\"}}\n";
         s.write_all(second_half).await.unwrap();
-        s.flush().await.unwrap();
+        s.shutdown().await.unwrap();
         let full_msg = ht.receive().await.expect("completed line after cancel");
         assert!(matches!(full_msg, ServerJsonRpcMessage::Response(_)));
         assert_eq!(ht.line_lease.bytes(), 0);
         let (_, val, handed) = half_ingress.take().unwrap();
         assert_eq!(val.unwrap()["result"]["tag"], "intact");
         drop(handed);
+        // The local frame and lossless capture are released. Ownership after
+        // returning the typed message to the official SDK is outside this budget.
+        assert_eq!(half_budget.used(), 0);
+        drop(full_msg);
         assert_eq!(half_budget.used(), 0);
     }
 }
@@ -2200,6 +2497,45 @@ mod http_tests {
     use std::collections::BTreeMap;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn outgoing_body_capacity_follows_bytes_clones() {
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "method":"tools/call",
+            "params":{"name":"sample", "arguments":{"text":"ordinary\ntext"}}
+        }))
+        .unwrap();
+        let length = crate::json::serialized_len(&message).unwrap();
+        let budget = ByteBudget::new(length * 4);
+        let termination = TransportTermination::default();
+        let encoded = encode_mcp_message(&message, length, &budget, &termination).unwrap();
+        let charged = encoded.capacity();
+        assert_eq!(budget.used(), charged);
+        let bytes = bytes::Bytes::from_owner(encoded);
+        let other = bytes.clone();
+        drop(bytes);
+        assert_eq!(budget.used(), charged);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&other).unwrap()["params"]["arguments"]["text"],
+            "ordinary\ntext"
+        );
+        drop(other);
+        assert_eq!(budget.used(), 0);
+        let error = encode_mcp_message(&message, length - 1, &budget, &termination).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(termination.is_terminated());
+        assert_eq!(budget.used(), 0);
+        let budget = ByteBudget::new(1);
+        let termination = TransportTermination::default();
+        assert_eq!(
+            encode_mcp_message(&message, length, &budget, &termination)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::OutOfMemory
+        );
+        assert!(termination.is_terminated());
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn media_type_essence_is_exact_and_case_insensitive() {
@@ -2242,7 +2578,7 @@ mod http_tests {
         };
         let header_str = String::from_utf8_lossy(&buf[..header_end]).into_owned();
         let mut lines = header_str.split("\r\n");
-        let req_line = lines.next().unwrap_or("").to_owned();
+        lines.next();
         let mut content_len = 0usize;
         for line in lines {
             if let Some((name, val)) = line.split_once(':')
@@ -2260,7 +2596,53 @@ mod http_tests {
         }
         let body = buf[header_end..header_end + content_len].to_vec();
         buf.drain(..header_end + content_len);
-        Some((req_line, body))
+        Some((header_str, body))
+    }
+
+    #[tokio::test]
+    async fn chunked_http_body_charges_capacity_until_release() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_framed_http(&mut socket, &mut Vec::new())
+                .await
+                .unwrap();
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\nabcdefgh\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            socket
+                .write_all(b"9\r\nijklmnopq\r\n0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let budget = ByteBudget::new(128);
+        let client = reqwest::Client::new();
+        let http = BoundedHttp {
+            client: client.clone(),
+            cleanup: CleanupState::default(),
+            ingress: Ingress::default(),
+            termination: Arc::new(TransportTermination::default()),
+            max_response_bytes: 64,
+            budget: budget.clone(),
+        };
+        let response = client
+            .get(format!("http://{address}/"))
+            .send()
+            .await
+            .unwrap();
+        let (body, lease) = http.bounded_body(response, 64).await.unwrap();
+        assert_eq!(body, b"abcdefghijklmnopq");
+        assert_eq!(budget.used(), body.capacity());
+        assert_eq!(lease.bytes(), body.capacity());
+        drop(body);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2332,6 +2714,66 @@ mod http_tests {
 mod rpc_fidelity_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn default_request_handler_drops_payload_before_context_and_bounds_errors() {
+        use rmcp::model::GetExtensions;
+        #[derive(Clone)]
+        struct Payload(Arc<AtomicBool>);
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        struct Guard(Arc<AtomicBool>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                assert!(self.0.load(Ordering::Acquire));
+            }
+        }
+        struct Idle;
+        impl Transport<RoleClient> for Idle {
+            type Error = std::io::Error;
+            fn send(
+                &mut self,
+                _: ClientJsonRpcMessage,
+            ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+                std::future::ready(Ok(()))
+            }
+            async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+                std::future::pending().await
+            }
+            async fn close(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let handler = Handler {
+            tools_changed: Arc::new(AtomicBool::new(false)),
+        };
+        let mut service = rmcp::service::serve_directly(handler.clone(), Idle, None);
+        for method in ["ping".to_owned(), "local/".to_owned() + &"x".repeat(4096)] {
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut request: ServerRequest = serde_json::from_value(
+                serde_json::json!({"method":method,"params":{"note":"ordinary text"}}),
+            )
+            .unwrap();
+            request.extensions_mut().insert(Payload(dropped.clone()));
+            let mut context =
+                RequestContext::new(rmcp::model::RequestId::Number(7), service.peer().clone());
+            context.extensions.insert(Arc::new(Guard(dropped.clone())));
+            let result = handler.handle_request(request, context).await;
+            assert!(dropped.load(Ordering::Acquire));
+            if method == "ping" {
+                assert!(result.is_ok());
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+                assert_eq!(error.message, "Unsupported server request");
+                assert!(error.data.is_none());
+            }
+        }
+        service.close().await.unwrap();
+    }
+
     #[test]
     fn rpc_error_fidelity_and_non_lossy_rejection() {
         let budget = ByteBudget::new(4096);
@@ -2351,17 +2793,29 @@ mod rpc_fidelity_tests {
         assert_eq!(raw.get("data"), Some(&Value::Null));
         assert_eq!(raw["x-extra"], 7);
         assert!(failure.outcome_unknown);
+        assert_eq!(budget.used(), ok_err.len());
+        let cloned = failure.clone();
+        assert!(Arc::ptr_eq(
+            failure.rpc_error.as_ref().unwrap(),
+            cloned.rpc_error.as_ref().unwrap()
+        ));
+        drop(error);
+        assert_eq!(budget.used(), ok_err.len());
+        let ipc_failure = crate::daemon::mcp_error(cloned.into(), true);
+        assert_eq!(budget.used(), ok_err.len());
+        let copied_failure = ipc_failure.clone();
+        drop(ipc_failure);
+        assert_eq!(budget.used(), ok_err.len());
+        drop(copied_failure);
+        assert_eq!(budget.used(), 0);
 
         ingress.track(&request);
         let bad_err = br#"{"jsonrpc":"2.0","id":17,"error":{"code":-32603,"message":"failed","data":{"x":1,"x":2}}}"#;
-        let _ = ingress
-            .observe_bytes(bad_err, 4096, &budget, false)
-            .unwrap();
-        let error = rpc_failure(-32603, "diagnostic".into(), false, &ingress);
-        let failure = error.downcast_ref::<McpFailure>().unwrap();
-        assert!(failure.rpc_error.is_none());
-        assert!(failure.message.contains("cannot be represented losslessly"));
-        assert!(!failure.outcome_unknown);
+        assert!(matches!(
+            ingress.observe_bytes(bad_err, 4096, &budget, false),
+            Err(IngressError::InvalidMetadata)
+        ));
+        assert!(ingress.take().is_none());
         assert_eq!(budget.used(), 0);
     }
 }

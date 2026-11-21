@@ -1,4 +1,4 @@
-use crate::budget::{ByteBudget, ByteLease, format_bytes};
+use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response};
 use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure, McpLimits};
@@ -68,15 +68,15 @@ struct App {
 }
 
 pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
-    if let Some(error) = error.downcast_ref::<McpFailure>() {
+    if let Ok(error) = error.downcast::<McpFailure>() {
         let (code, kind) = match error.kind {
             FailureKind::Timeout => (5, "timeout"),
             FailureKind::Protocol => (4, "mcp_protocol"),
             FailureKind::Transport => (4, "mcp_transport"),
         };
-        let mut failure =
-            Failure::new(code, kind, error.message.clone()).uncertain(error.outcome_unknown);
-        failure.rpc_error = error.rpc_error.clone();
+        let mut failure = Failure::new(code, kind, error.message).uncertain(error.outcome_unknown);
+        failure.rpc_error = error.rpc_error;
+        failure.lease = error.lease;
         failure
     } else {
         Failure::new(4, "mcp_error", "MCP operation failed").uncertain(calling)
@@ -160,9 +160,8 @@ impl App {
             if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
                 return Err(Failure::new(2, "invalid_tool", "invalid tool name"));
             }
-            let size = serde_json::to_vec(arguments)
-                .map_err(|_| Failure::new(2, "invalid_arguments", "cannot encode arguments"))?
-                .len();
+            let size = crate::json::serialized_len(arguments)
+                .map_err(|_| Failure::new(2, "invalid_arguments", "cannot encode arguments"))?;
             if size > ipc::ARGUMENT_LIMIT {
                 return Err(Failure::new(
                     2,
@@ -295,19 +294,24 @@ impl App {
                     state.lost = true;
                 }
                 result
-                    .map(|value| (value, empty(), None))
+                    .map(|value| {
+                        let (value, lease) = value.into_parts();
+                        (value, lease, None)
+                    })
                     .map_err(|e| mcp_error(e, false))
             }
             Operation::Tools { .. } => {
-                let result = connection
-                    .list_tool_pages(budget)
-                    .await
-                    .map(|pages| json!({"pages": pages}));
+                let result = connection.list_tool_pages(budget).await.map(|pages| {
+                    let (pages, lease) = pages.into_parts();
+                    let mut value = serde_json::Map::new();
+                    value.insert("pages".into(), Value::Array(pages));
+                    (Value::Object(value), lease)
+                });
                 if connection.is_closed() {
                     state.lost = true;
                 }
                 result
-                    .map(|value| (value, empty(), None))
+                    .map(|(value, lease)| (value, lease, None))
                     .map_err(|e| mcp_error(e, false))
             }
             Operation::Call {
@@ -317,13 +321,14 @@ impl App {
                 ..
             } => {
                 let result = connection
-                    .call_with_dispatch_leased(tool, arguments.clone(), budget, dispatched)
+                    .call_with_dispatch_leased(tool, arguments, budget, dispatched)
                     .await;
                 if connection.is_closed() {
                     state.lost = true;
                 }
-                let (mut value, mut lease) =
-                    result.map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))?;
+                let (mut lease, mut value) = result
+                    .map(|(value, lease)| (lease, value))
+                    .map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))?;
                 let inflight = if *inline_media {
                     None
                 } else {
@@ -346,10 +351,25 @@ async fn send(
     dispatched: bool,
     hard_deadline: Option<Instant>,
 ) {
-    let (result, result_lease, mut inflight) = match outcome {
-        Ok((value, lease, inflight)) => (Ok(value), Some(lease), inflight),
-        Err(error) => (Err(error), None, None),
+    let (result_lease, mut result, mut inflight) = match outcome {
+        Ok((value, lease, inflight)) => (Some(lease), Ok(value), inflight),
+        Err(error) => (None, Err(error), None),
     };
+    if let Some(batch) = &inflight
+        && let Err(error) = batch.begin_writeback()
+    {
+        result = Err(Failure::new(
+            1,
+            "media_cache",
+            format!("cannot start media writeback: {error:#}; the operation was not replayed"),
+        )
+        .uncertain(dispatched));
+        if let Some(batch) = inflight.take()
+            && let Err(error) = batch.abort().await
+        {
+            eprintln!("mcpcli daemon: media cache error: {error:#}");
+        }
+    }
     let response = app.response(result);
     let encoded =
         ipc::encode_frame_leased(&response, app.options.response_limit, &app.options.budget);
@@ -360,6 +380,7 @@ async fn send(
     let started = AtomicBool::new(false);
     match encoded {
         Ok((frame, frame_lease)) => {
+            let frame = Leased::new(frame, frame_lease);
             let written = ipc::write_raw_idle(
                 stream,
                 &frame,
@@ -369,18 +390,26 @@ async fn send(
             )
             .await;
             drop(frame);
-            drop(frame_lease);
             if let Some(batch) = inflight.take() {
-                if written.is_ok() {
-                    batch.complete().await;
+                let finalized = if written.is_ok() {
+                    batch.complete().await
                 } else {
-                    batch.abort().await;
+                    batch.abort().await
+                };
+                if let Err(error) = finalized {
+                    // The response is already written. Record this local commit failure
+                    // on the daemon's stderr; GC retains an unconfirmed batch.
+                    eprintln!(
+                        "mcpcli daemon: media cache writeback failed after response: {error:#}; the operation was not replayed"
+                    );
                 }
             }
         }
         Err(error) => {
-            if let Some(batch) = inflight.take() {
-                batch.abort().await;
+            if let Some(batch) = inflight.take()
+                && let Err(error) = batch.abort().await
+            {
+                eprintln!("mcpcli daemon: media cache error: {error:#}");
             }
             let fallback = match error.kind() {
                 io::ErrorKind::InvalidData => Some(
@@ -408,12 +437,13 @@ async fn send(
                 _ => None,
             };
             if let Some(failure) = fallback
-                && let Ok((fb_frame, _fb_lease)) = ipc::encode_frame_leased(
+                && let Ok((fb_frame, fb_lease)) = ipc::encode_frame_leased(
                     &app.response(Err(failure)),
                     app.options.response_limit,
                     &app.options.budget,
                 )
             {
+                let fb_frame = Leased::new(fb_frame, fb_lease);
                 let _ = ipc::write_raw_idle(
                     stream,
                     &fb_frame,
@@ -441,7 +471,7 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
     )
     .await
     {
-        Ok(Ok(Some(request))) => request,
+        Ok(Ok(Some((request, lease)))) => Leased::new(request, lease),
         _ => return,
     };
     if control && !request.operation.management() {

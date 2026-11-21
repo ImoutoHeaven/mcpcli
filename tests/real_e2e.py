@@ -57,7 +57,7 @@ def file_sha256(path):
 
 
 def text_content(result):
-    return "\n".join(block["text"] for block in result.get("content", [])
+    return "\n".join(block["text"] for block in result["result"].get("content", [])
                      if block.get("type") == "text")
 
 
@@ -238,8 +238,8 @@ class Acceptance:
     def call(self, server, tool, arguments=None, session="primary", expected=0):
         result = self.command("call", server, tool, "--stdin", session=session,
                               input_json=arguments or {}, expected=expected)
-        require(isinstance(result.get("content"), list), f"{tool}: missing MCP content")
-        require(result.get("isError", False) == (expected == 3),
+        require(isinstance(result["result"].get("content"), list), f"{tool}: missing MCP content")
+        require(result["result"].get("isError", False) == (expected == 3),
                 f"{tool}: wrong isError value")
         return result
 
@@ -368,7 +368,7 @@ class Acceptance:
                 "printf 'ready\\n'; IFS= read -r value; printf 'received:%s\\n' \"$value\"",
             "waitMs": 20, "maxBytes": 4096,
         })
-        structured = started.get("structuredContent")
+        structured = started["result"].get("structuredContent")
         require(isinstance(structured, dict) and structured.get("taskId"),
                 "structuredContent/taskId was not preserved")
         task_id = structured["taskId"]
@@ -378,12 +378,12 @@ class Acceptance:
             "eof": True, "waitMs": 5000, "maxBytes": 4096,
         })
         require("received:cross-cli" in text_content(polled), "background task state was lost")
-        require(polled["structuredContent"]["exitCode"] == 0, "background command failed")
+        require(polled["result"]["structuredContent"]["exitCode"] == 0, "background command failed")
         self.passed("real fastexec background stdin/poll across CLI processes")
 
         missing = self.call("fastexec", "read",
                             {"path": str(self.root / "does-not-exist.txt")}, expected=3)
-        require(missing["isError"] is True and text_content(missing),
+        require(missing["result"]["isError"] is True and text_content(missing),
                 "tool isError result was not retained at exit 3")
         self.passed("real tool isError uses exit 3 and retains MCP result")
 
@@ -419,7 +419,7 @@ class Acceptance:
         self.passed("two named daemon sessions isolate live browser state")
 
         screenshot = self.call("browser", "browser_take_screenshot", {"type": "png"})
-        images = [block for block in screenshot["content"] if block["type"] == "image"]
+        images = [block for block in screenshot["result"]["content"] if block["type"] == "image"]
         require(images and images[0]["mimeType"] == "image/png" and "data" not in images[0],
                 "default screenshot call did not materialize image out of inline JSON")
         saved_media = screenshot.get("savedMedia") or []

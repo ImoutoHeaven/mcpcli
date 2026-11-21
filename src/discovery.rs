@@ -1,37 +1,122 @@
-use serde_json::Value;
+use serde::ser::SerializeMap;
+use serde_json::{Map, Value};
+use std::io::{self, Write};
 
-/// Inspect the exact schemas rather than synthesizing an incomplete flag interface.
-pub fn render_tool(tool: &Value) -> String {
+/// Serialize selected fields by reference without cloning their values.
+pub struct ObjectWithout<'a>(pub &'a Map<String, Value>, pub &'a [&'a str]);
+
+impl serde::Serialize for ObjectWithout<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let count = self
+            .0
+            .keys()
+            .filter(|key| !self.1.contains(&key.as_str()))
+            .count();
+        let mut map = serializer.serialize_map(Some(count))?;
+        for (key, value) in self.0 {
+            if !self.1.contains(&key.as_str()) {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// Inspect exact schemas while retaining their existing owned payload.
+pub fn write_tool(stdout: &mut impl Write, tool: &Value) -> io::Result<()> {
     let Some(object) = tool.as_object() else {
-        return serde_json::to_string_pretty(tool).unwrap_or_default();
+        write_text_json(stdout, tool)?;
+        return writeln!(stdout);
     };
-    let mut sections = vec![single_line(
+    let title = single_line(
         object
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("<unnamed>"),
         128,
-    )];
+    );
+    stdout.write_all(title.as_bytes())?;
+    let mut emitted = !title.is_empty();
+    let mut ends_with_lf = false;
     if let Some(description) = object.get("description").and_then(Value::as_str) {
-        sections.push(safe_text(description));
+        stdout.write_all(b"\n\n")?;
+        write_safe_text(stdout, description)?;
+        emitted = true;
+        ends_with_lf = description.is_empty() || description.ends_with('\n');
     }
     if let Some(schema) = object.get("inputSchema") {
-        sections.push(format!(
-            "Input schema:\n{}",
-            serde_json::to_string_pretty(schema).unwrap()
-        ));
+        stdout.write_all(b"\n\nInput schema:\n")?;
+        write_text_json(stdout, schema)?;
+        emitted = true;
+        ends_with_lf = false;
     }
-    let mut metadata = object.clone();
-    for field in ["name", "description", "inputSchema"] {
-        metadata.remove(field);
+    let excluded = ["name", "description", "inputSchema"];
+    if object.keys().any(|key| !excluded.contains(&key.as_str())) {
+        stdout.write_all(b"\n\nMetadata:\n")?;
+        write_text_json(stdout, &ObjectWithout(object, &excluded))?;
+        emitted = true;
+        ends_with_lf = false;
     }
-    if !metadata.is_empty() {
-        sections.push(format!(
-            "Metadata:\n{}",
-            serde_json::to_string_pretty(&metadata).unwrap()
-        ));
+    if emitted && !ends_with_lf {
+        stdout.write_all(b"\n")?;
     }
-    sections.join("\n\n")
+    Ok(())
+}
+
+/// Write borrowed text spans, escaping controls without a second full string.
+pub fn write_safe_text(stdout: &mut impl Write, text: &str) -> io::Result<()> {
+    let mut start = 0;
+    for (index, character) in text.char_indices() {
+        if character == '\r' && text.as_bytes().get(index + 1) == Some(&b'\n') {
+            stdout.write_all(&text.as_bytes()[start..index])?;
+            start = index + 1;
+        } else if character.is_control() && !matches!(character, '\n' | '\t') {
+            stdout.write_all(&text.as_bytes()[start..index])?;
+            write!(stdout, "{}", character.escape_default())?;
+            start = index + character.len_utf8();
+        }
+    }
+    stdout.write_all(&text.as_bytes()[start..])
+}
+
+/// Preserve CRLF normalization when adjacent borrowed spans meet at a newline.
+pub fn write_text_parts<'a>(
+    stdout: &mut impl Write,
+    parts: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    let mut parts = parts.into_iter().filter(|part| !part.is_empty()).peekable();
+    let mut emitted = false;
+    let mut ends_with_lf = false;
+    while let Some(part) = parts.next() {
+        let part = if parts.peek().is_some_and(|next| next.starts_with('\n')) {
+            part.strip_suffix('\r').unwrap_or(part)
+        } else {
+            part
+        };
+        write_safe_text(stdout, part)?;
+        emitted |= !part.is_empty();
+        ends_with_lf = part.ends_with('\n');
+    }
+    if emitted && !ends_with_lf {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+pub fn write_text_json(stdout: &mut impl Write, value: &impl serde::Serialize) -> io::Result<()> {
+    struct SafeWriter<'a, W>(&'a mut W);
+    impl<W: Write> Write for SafeWriter<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            // Serde JSON writes complete UTF-8 string fragments and ASCII syntax.
+            let text = std::str::from_utf8(bytes).map_err(io::Error::other)?;
+            write_safe_text(self.0, text)?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+    serde_json::to_writer_pretty(SafeWriter(stdout), value).map_err(io::Error::other)
 }
 
 pub fn safe_text(text: &str) -> String {
@@ -51,22 +136,61 @@ pub fn safe_text(text: &str) -> String {
 }
 
 fn single_line(text: &str, limit: usize) -> String {
-    let normalized = safe_text(text)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let mut characters = normalized.chars();
-    let mut shortened: String = characters.by_ref().take(limit).collect();
-    if characters.next().is_some() {
-        shortened.push('…');
+    let mut result = String::new();
+    let mut count = 0;
+    let mut space = false;
+    let mut push = |character: char| {
+        if character.is_whitespace() {
+            space = count > 0;
+            return true;
+        }
+        if space {
+            if count == limit {
+                return false;
+            }
+            result.push(' ');
+            count += 1;
+            space = false;
+        }
+        if count == limit {
+            return false;
+        }
+        result.push(character);
+        count += 1;
+        true
+    };
+    let mut characters = text.chars().peekable();
+    let mut truncated = false;
+    while let Some(character) = characters.next() {
+        if character == '\r' && characters.peek() == Some(&'\n') {
+            continue;
+        }
+        let complete = if character.is_control() && !matches!(character, '\n' | '\t') {
+            character.escape_default().all(&mut push)
+        } else {
+            push(character)
+        };
+        if !complete {
+            truncated = true;
+            break;
+        }
     }
-    shortened
+    if truncated {
+        result.push('…');
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn render_tool(tool: &Value) -> String {
+        let mut bytes = Vec::new();
+        write_tool(&mut bytes, tool).unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
 
     #[test]
     fn inspect_preserves_exact_complex_schema_and_other_metadata() {
@@ -78,6 +202,34 @@ mod tests {
         assert!(rendered.contains("readOnlyHint"));
         assert!(rendered.contains("vendor"));
         assert!(!rendered.contains("--foo-bar"));
+    }
+
+    #[test]
+    fn bounded_name_rendering_preserves_whitespace_and_escape_truncation() {
+        for name in [
+            "  one\t two\r\n  three  ",
+            "é\u{85}  😀\r",
+            "one\u{a0}two",
+            "",
+            "  ",
+        ] {
+            let expected = safe_text(name)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            for limit in [0, 1, 5, 128] {
+                let mut chars = expected.chars();
+                let mut shortened: String = chars.by_ref().take(limit).collect();
+                if chars.next().is_some() {
+                    shortened.push('…');
+                }
+                assert_eq!(single_line(name, limit), shortened);
+            }
+        }
+        assert_eq!(
+            single_line(&"name".repeat(64 << 10), 128).chars().count(),
+            129
+        );
     }
 
     #[test]

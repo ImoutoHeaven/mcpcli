@@ -2,10 +2,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpcli::{
     agents,
-    budget::ByteBudget,
+    budget::{ByteBudget, Leased},
     config::{self, LoadedConfig},
     daemon,
-    discovery::{self, safe_text},
+    discovery::{self, safe_text, write_safe_text, write_text_json},
     ipc::{self, Failure, Operation},
     json as input,
     mcp::McpConnection,
@@ -354,36 +354,86 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
     ))
 }
 
+fn argument_memory_failure() -> anyhow::Error {
+    Failure::new(
+        1,
+        "memory_limit_exceeded",
+        "Tool arguments exceed the active memory limit",
+    )
+    .into()
+}
+
+async fn read_argument_bytes(
+    mut reader: impl tokio::io::AsyncRead + Unpin,
+    process_budget: &std::sync::Arc<ByteBudget>,
+) -> Result<Leased<Vec<u8>>> {
+    let mut lease = process_budget.empty_lease();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| usage("arguments", error))?;
+        if count == 0 {
+            break;
+        }
+        let needed = bytes.len().saturating_add(count);
+        if needed > ipc::ARGUMENT_LIMIT {
+            return Err(usage("arguments", "arguments exceed the 1 MiB limit"));
+        }
+        if !lease.reserve_vec(&mut bytes, needed, ipc::ARGUMENT_LIMIT) {
+            return Err(argument_memory_failure());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    Ok(Leased::new(bytes, lease))
+}
+
 async fn arguments(
     args: &Option<String>,
     file: &Option<PathBuf>,
     stdin: bool,
     budget: Duration,
-) -> Result<Map<String, Value>> {
+    process_budget: &std::sync::Arc<ByteBudget>,
+) -> Result<Leased<Map<String, Value>>> {
     let bytes = if let Some(args) = args {
-        args.as_bytes().to_vec()
-    } else if let Some(file) = file {
-        input::read_file(file, ipc::ARGUMENT_LIMIT)
-            .map_err(|e| usage("arguments", format!("{e:#}")))?
+        read_argument_bytes(args.as_bytes(), process_budget).await?
+    } else if let Some(path) = file {
+        let file = mcpcli::platform::open_input(path)
+            .with_context(|| format!("cannot read {}", path.display()))
+            .map_err(|error| usage("arguments", error))?;
+        if !file
+            .metadata()
+            .map_err(|error| usage("arguments", error))?
+            .is_file()
+        {
+            return Err(usage("arguments", "input must be a regular file"));
+        }
+        read_argument_bytes(tokio::fs::File::from_std(file), process_budget).await?
     } else if stdin {
-        let mut bytes = Vec::new();
-        let mut reader = tokio::io::stdin().take(ipc::ARGUMENT_LIMIT as u64 + 1);
-        timeout(budget, reader.read_to_end(&mut bytes))
-            .await
-            .map_err(|_| Failure::new(5, "timeout", "timed out reading JSON arguments from stdin"))?
-            .map_err(|e| usage("arguments", e))?;
-        bytes
+        timeout(
+            budget,
+            read_argument_bytes(tokio::io::stdin(), process_budget),
+        )
+        .await
+        .map_err(|_| Failure::new(5, "timeout", "timed out reading JSON arguments from stdin"))??
     } else {
-        b"{}".to_vec()
+        read_argument_bytes(&b"{}"[..], process_budget).await?
     };
-    if bytes.len() > ipc::ARGUMENT_LIMIT {
-        return Err(usage("arguments", "arguments exceed the 1 MiB limit"));
+    let value_lease = process_budget
+        .try_acquire(bytes.len())
+        .ok_or_else(argument_memory_failure)?;
+    let scratch = process_budget
+        .try_acquire(input::scratch_bytes(&bytes))
+        .ok_or_else(argument_memory_failure)?;
+    let value = input::parse(&bytes).map_err(|error| usage("arguments", format!("{error:#}")))?;
+    drop(scratch);
+    drop(bytes);
+    match value {
+        Value::Object(arguments) => Ok(Leased::new(arguments, value_lease)),
+        _ => Err(usage("arguments", "tool arguments must be a JSON object")),
     }
-    let value = input::parse(&bytes).map_err(|e| usage("arguments", format!("{e:#}")))?;
-    value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| usage("arguments", "tool arguments must be a JSON object"))
 }
 
 async fn close_after_error(connection: &mut McpConnection, error: &mut anyhow::Error) {
@@ -400,10 +450,10 @@ async fn close_after_error(connection: &mut McpConnection, error: &mut anyhow::E
 async fn remote(
     cli: &Cli,
     loaded: &LoadedConfig,
-    operation: Operation,
+    operation: Leased<Operation>,
     uncertain: &AtomicBool,
 ) -> Result<RemoteOutput> {
-    let server = match &operation {
+    let server = match &*operation {
         Operation::Server { server }
         | Operation::Tools { server }
         | Operation::Call { server, .. }
@@ -419,7 +469,7 @@ async fn remote(
     let started = Instant::now();
     if cli.oneshot {
         let oneshot_fut = async {
-            if matches!(operation, Operation::Reset { .. }) {
+            if matches!(&*operation, Operation::Reset { .. }) {
                 return Err(usage("mode", "reset cannot be used with --oneshot"));
             }
             let mut connection =
@@ -429,24 +479,23 @@ async fn remote(
             let remaining = budget.saturating_sub(started.elapsed());
             let process_budget = ByteBudget::global();
             let result: std::result::Result<(Value, mcpcli::budget::ByteLease), anyhow::Error> =
-                match &operation {
-                    Operation::Server { .. } => connection
-                        .server_info()
-                        .map(|v| (v, process_budget.empty_lease())),
-                    Operation::Tools { .. } => connection
-                        .list_tool_pages(remaining)
-                        .await
-                        .map(|pages| (json!({"pages": pages}), process_budget.empty_lease())),
+                match &*operation {
+                    Operation::Server { .. } => {
+                        connection.server_info().map(|value| value.into_parts())
+                    }
+                    Operation::Tools { .. } => {
+                        connection.list_tool_pages(remaining).await.map(|pages| {
+                            let (pages, lease) = pages.into_parts();
+                            let mut value = Map::new();
+                            value.insert("pages".into(), Value::Array(pages));
+                            (Value::Object(value), lease)
+                        })
+                    }
                     Operation::Call {
                         tool, arguments, ..
                     } => {
                         connection
-                            .call_with_dispatch_leased(
-                                tool,
-                                arguments.clone(),
-                                remaining,
-                                uncertain,
-                            )
+                            .call_with_dispatch_leased(tool, arguments, remaining, uncertain)
                             .await
                     }
                     _ => unreachable!(),
@@ -454,10 +503,10 @@ async fn remote(
                 .map_err(|error| {
                     anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
                 });
-            match result {
-                Ok((mut value, mut lease)) => {
+            match result.map(|(value, lease)| (lease, value)) {
+                Ok((mut lease, mut value)) => {
                     uncertain.store(false, Ordering::Release);
-                    let inflight = match &operation {
+                    let inflight = match &*operation {
                         Operation::Call {
                             inline_media: false,
                             ..
@@ -518,37 +567,76 @@ async fn remote(
     if remaining.is_zero() {
         return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
     }
+    let (input_lease, operation) = {
+        let (operation, lease) = operation.into_parts();
+        (lease, operation)
+    };
     let request = paths.request_with_explicit(
         &loaded.digest,
         operation,
         remaining,
         cli.has_explicit_timeout(),
     )?;
-    let response = runtime::exchange_tracked(&paths, &request, uncertain).await?;
+    let request = Leased::new(request, input_lease);
+    let (response_lease, response) = runtime::exchange_tracked(&paths, &request, uncertain)
+        .await
+        .map(|(response, lease)| (lease, response))?;
     Ok(RemoteOutput {
         value: response.result.context("daemon did not return a result")?,
         connection: None,
         inflight: None,
-        lease: None,
+        lease: Some(response_lease),
     })
 }
 
-fn server_text(value: &Value) -> Result<String> {
-    let mut metadata = value
-        .as_object()
-        .context("invalid server information")?
-        .clone();
-    let result = metadata
-        .get_mut("result")
-        .and_then(Value::as_object_mut)
-        .context("invalid MCP server result")?;
-    let instructions = result.remove("instructions");
-    let mut text = serde_json::to_string_pretty(&metadata)?;
-    if let Some(instructions) = instructions.as_ref().and_then(Value::as_str) {
-        text.push_str("\n\nInstructions:\n");
-        text.push_str(instructions);
+struct ServerView<'a> {
+    root: &'a Map<String, Value>,
+    result: &'a Map<String, Value>,
+}
+
+impl serde::Serialize for ServerView<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.root.len()))?;
+        for (key, value) in self.root {
+            if key == "result" {
+                map.serialize_entry(
+                    key,
+                    &discovery::ObjectWithout(self.result, &["instructions"]),
+                )?;
+            } else {
+                map.serialize_entry(key, value)?;
+            }
+        }
+        map.end()
     }
-    Ok(text)
+}
+
+fn server_view(value: &Value) -> Result<ServerView<'_>> {
+    let root = value.as_object().context("invalid server information")?;
+    let result = root
+        .get("result")
+        .and_then(Value::as_object)
+        .context("invalid MCP server result")?;
+    Ok(ServerView { root, result })
+}
+
+fn write_server_text(stdout: &mut impl Write, value: &Value) -> std::io::Result<()> {
+    let view = server_view(value).map_err(std::io::Error::other)?;
+    write_text_json(stdout, &view)?;
+    if let Some(instructions) = view.result.get("instructions").and_then(Value::as_str) {
+        stdout.write_all(b"\n\nInstructions:\n")?;
+        write_safe_text(stdout, instructions)?;
+        if !instructions.is_empty() && !instructions.ends_with('\n') {
+            stdout.write_all(b"\n")?;
+        }
+    } else {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 fn listed_tools(value: &Value) -> Result<impl Iterator<Item = &Value>> {
@@ -564,20 +652,42 @@ fn listed_tools(value: &Value) -> Result<impl Iterator<Item = &Value>> {
         .flat_map(|page| page["tools"].as_array().unwrap()))
 }
 
-fn tools_text(value: &Value) -> Result<String> {
-    Ok(listed_tools(value)?
-        .map(|tool| {
-            let name = tool["name"].as_str().unwrap_or("<unnamed>");
-            match tool["description"].as_str() {
-                Some(description) if !description.is_empty() => format!("{name}\n{description}"),
-                _ => name.to_owned(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n"))
+fn write_tools_text(stdout: &mut impl Write, value: &Value) -> std::io::Result<()> {
+    let tools = listed_tools(value).map_err(std::io::Error::other)?;
+    let parts = tools.enumerate().flat_map(|(index, tool)| {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        let description = tool["description"]
+            .as_str()
+            .filter(|description| !description.is_empty());
+        [
+            (index > 0).then_some("\n\n"),
+            Some(name),
+            description.map(|_| "\n"),
+            description,
+        ]
+        .into_iter()
+        .flatten()
+    });
+    discovery::write_text_parts(stdout, parts)
 }
 
-fn tool_text(result: &Value, inline_media: bool) -> String {
+fn take_listed_tool(value: &mut Value, name: &str) -> Result<Value> {
+    let _ = listed_tools(value)?;
+    for page in value["pages"].as_array_mut().expect("validated pages") {
+        for tool in page["tools"].as_array_mut().expect("validated tools") {
+            if tool["name"].as_str() == Some(name) {
+                return Ok(tool.take());
+            }
+        }
+    }
+    Err(usage("unknown_tool", format!("unknown tool {name:?}")))
+}
+
+fn write_tool_text(
+    stdout: &mut impl Write,
+    result: &Value,
+    inline_media: bool,
+) -> std::io::Result<()> {
     let mut saved_by_index = BTreeMap::new();
     if !inline_media && let Some(entries) = result.get("savedMedia").and_then(Value::as_array) {
         for entry in entries {
@@ -586,42 +696,89 @@ fn tool_text(result: &Value, inline_media: bool) -> String {
             }
         }
     }
-    let mut texts = Vec::new();
+    let remote = if inline_media {
+        result
+    } else {
+        &result["result"]
+    };
+    enum Part<'a> {
+        Text(&'a str),
+        Saved(&'a Value),
+    }
     let mut omitted = 0;
-    if let Some(content) = result.get("content").and_then(Value::as_array) {
-        for (index, block) in content.iter().enumerate() {
+    let mut emitted = false;
+    let mut ends_with_lf = false;
+    let content = remote
+        .get("content")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let mut parts = content
+        .iter()
+        .enumerate()
+        .filter_map(|(index, block)| {
             if block["type"] == "text" {
-                if let Some(text) = block["text"].as_str()
-                    && !text.is_empty()
-                {
-                    texts.push(text.to_owned());
-                }
+                block["text"]
+                    .as_str()
+                    .filter(|text| !text.is_empty())
+                    .map(Part::Text)
             } else if let Some(saved) = saved_by_index.get(&index) {
+                Some(Part::Saved(saved))
+            } else {
+                omitted += 1;
+                None
+            }
+        })
+        .peekable();
+    while let Some(part) = parts.next() {
+        if emitted {
+            stdout.write_all(b"\n")?;
+        }
+        emitted = true;
+        let followed_by_lf = parts.peek().is_some();
+        let tail = match part {
+            Part::Text(text) => text,
+            Part::Saved(saved) => {
                 let kind = saved["kind"].as_str().unwrap_or("media");
                 let mime = saved["mimeType"]
                     .as_str()
                     .unwrap_or("application/octet-stream");
                 let bytes = saved["bytes"].as_u64().unwrap_or(0);
-                let path = saved["savedPath"].as_str().unwrap_or("");
-                texts.push(format!("Saved {kind} [{mime}] ({bytes} B): {path}"));
-            } else {
-                omitted += 1;
+                stdout.write_all(b"Saved ")?;
+                write_safe_text(stdout, kind)?;
+                stdout.write_all(b" [")?;
+                write_safe_text(stdout, mime)?;
+                write!(stdout, "] ({bytes} B): ")?;
+                saved["savedPath"].as_str().unwrap_or("")
             }
-        }
+        };
+        // Joining text blocks inserts LF. Preserve CRLF normalization even when
+        // the CR belongs to the preceding block and the LF is the separator.
+        let tail = if followed_by_lf {
+            tail.strip_suffix('\r').unwrap_or(tail)
+        } else {
+            tail
+        };
+        write_safe_text(stdout, tail)?;
+        ends_with_lf = tail.ends_with('\n');
     }
     if omitted > 0 {
         eprintln!(
             "mcpcli: {omitted} non-text content block(s) are available in default JSON output"
         );
     }
-    if let Some(structured) = result.get("structuredContent") {
-        if texts.is_empty() {
-            texts.push(serde_json::to_string_pretty(structured).unwrap());
+    if let Some(structured) = remote.get("structuredContent") {
+        if !emitted {
+            write_text_json(stdout, structured)?;
+            emitted = true;
+            ends_with_lf = false;
         } else {
             eprintln!("mcpcli: structuredContent is available in default JSON output");
         }
     }
-    texts.join("\n")
+    if emitted && !ends_with_lf {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
 }
 
 async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
@@ -650,7 +807,9 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     )
                     .await
                     {
-                        Ok(response) => Ok(Output::json(response.result.unwrap())),
+                        Ok((response, lease)) => {
+                            Ok(Output::json(response.result.unwrap()).with_lease(Some(lease)))
+                        }
                         Err(_) if !paths.running()? => Ok(offline()),
                         Err(error) => Err(error),
                     }
@@ -673,11 +832,12 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     eprintln!("mcpcli: {}", safe_text(&format!("{error:#}")));
                 }
                 runtime::ensure(&paths, &loaded, true).await?;
-                let response = runtime::exchange(
+                let (response_lease, response) = runtime::exchange(
                     &paths,
                     &paths.request("", Operation::Status, Duration::from_secs(2))?,
                 )
-                .await?;
+                .await
+                .map(|(response, lease)| (lease, response))?;
                 let status = response.result.unwrap();
                 if status["config_digest"].as_str() != Some(&loaded.digest) {
                     return Err(Failure::new(
@@ -687,7 +847,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     )
                     .into());
                 }
-                Ok(Output::json(status))
+                Ok(Output::json(status).with_lease(Some(response_lease)))
             }
         };
     }
@@ -713,63 +873,57 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             let remote = remote(
                 cli,
                 &loaded,
-                Operation::Server {
-                    server: server.clone(),
-                },
+                Leased::new(
+                    Operation::Server {
+                        server: server.clone(),
+                    },
+                    ByteBudget::global().empty_lease(),
+                ),
                 uncertain,
             )
             .await?;
             Ok(remote.into_output(|value| {
-                let text = if cli.text {
-                    Some(server_text(&value)?)
-                } else {
-                    None
-                };
-                let mut output = Output::json(value);
-                output.text = text;
-                Ok(output)
+                if cli.text {
+                    server_view(&value)?;
+                }
+                Ok(Output::json(value))
             }))
         }
         Command::Tools { server } => {
             let remote = remote(
                 cli,
                 &loaded,
-                Operation::Tools {
-                    server: server.clone(),
-                },
+                Leased::new(
+                    Operation::Tools {
+                        server: server.clone(),
+                    },
+                    ByteBudget::global().empty_lease(),
+                ),
                 uncertain,
             )
             .await?;
             Ok(remote.into_output(|value| {
-                let text = if cli.text {
-                    Some(tools_text(&value)?)
-                } else {
-                    None
-                };
-                let mut output = Output::json(value);
-                output.text = text;
-                Ok(output)
+                if cli.text {
+                    let _ = listed_tools(&value)?;
+                }
+                Ok(Output::json(value))
             }))
         }
         Command::Inspect { server, tool } => {
             let remote = remote(
                 cli,
                 &loaded,
-                Operation::Tools {
-                    server: server.clone(),
-                },
+                Leased::new(
+                    Operation::Tools {
+                        server: server.clone(),
+                    },
+                    ByteBudget::global().empty_lease(),
+                ),
                 uncertain,
             )
             .await?;
-            Ok(remote.into_output(|value| {
-                let found = listed_tools(&value)?
-                    .find(|t| t["name"].as_str() == Some(tool))
-                    .ok_or_else(|| usage("unknown_tool", format!("unknown tool {tool:?}")))?;
-                Ok(Output::with_text(
-                    found.clone(),
-                    discovery::render_tool(found),
-                ))
-            }))
+            Ok(remote
+                .into_output(|mut value| Ok(Output::json(take_listed_tool(&mut value, tool)?))))
         }
         Command::Call {
             server,
@@ -787,33 +941,41 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 args_file,
                 *stdin,
                 Duration::from_secs(cli.timeout_secs()),
+                ByteBudget::global(),
             )
             .await?;
+            let (input_lease, args) = {
+                let (args, lease) = args.into_parts();
+                (lease, args)
+            };
             let remote = remote(
                 cli,
                 &loaded,
-                Operation::Call {
-                    server: server.clone(),
-                    tool: tool.clone(),
-                    arguments: args,
-                    inline_media: *inline_media,
-                },
+                Leased::new(
+                    Operation::Call {
+                        server: server.clone(),
+                        tool: tool.clone(),
+                        arguments: args,
+                        inline_media: *inline_media,
+                    },
+                    input_lease,
+                ),
                 uncertain,
             )
             .await?;
-            let code = if remote.value["isError"].as_bool() == Some(true) {
+            let result = if *inline_media {
+                &remote.value
+            } else {
+                &remote.value["result"]
+            };
+            let code = if result["isError"].as_bool() == Some(true) {
                 3
             } else {
                 0
             };
-            let text = if cli.text {
-                Some(tool_text(&remote.value, *inline_media))
-            } else {
-                None
-            };
             Ok(Output {
                 value: Some(remote.value),
-                text,
+                text: None,
                 code,
                 diagnostic: None,
                 connection: None,
@@ -828,10 +990,13 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             let remote = remote(
                 cli,
                 &loaded,
-                Operation::Reset {
-                    server: server.clone(),
-                    force: *force,
-                },
+                Leased::new(
+                    Operation::Reset {
+                        server: server.clone(),
+                        force: *force,
+                    },
+                    ByteBudget::global().empty_lease(),
+                ),
                 uncertain,
             )
             .await?;
@@ -908,19 +1073,61 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     }
 }
 
-/// Terminal boundary for all text-mode stdout, including upstream MCP text.
+/// Terminal boundary for text-mode stdout.
 fn write_text(stdout: &mut impl Write, text: &str) -> std::io::Result<()> {
-    let rendered = safe_text(text);
-    if rendered.is_empty() {
-        Ok(())
-    } else if rendered.ends_with('\n') {
-        stdout.write_all(rendered.as_bytes())
-    } else {
-        writeln!(stdout, "{rendered}")
+    write_safe_text(stdout, text)?;
+    if !text.is_empty() && !text.ends_with('\n') {
+        stdout.write_all(b"\n")?;
     }
+    Ok(())
+}
+
+fn write_diagnostic(stderr: &mut impl Write, error: &Failure) -> std::io::Result<()> {
+    #[derive(serde::Serialize)]
+    struct Diagnostic<'a> {
+        error: &'a Failure,
+    }
+    serde_json::to_writer(&mut *stderr, &Diagnostic { error }).map_err(std::io::Error::other)?;
+    writeln!(stderr)
+}
+
+fn retain_cli_input(
+    cli: Cli,
+    budget: &std::sync::Arc<ByteBudget>,
+) -> std::result::Result<Leased<Cli>, Failure> {
+    let bytes = match &cli.command {
+        Command::Call {
+            args: Some(args), ..
+        } => {
+            if args.len() > ipc::ARGUMENT_LIMIT {
+                return Err(Failure::new(
+                    2,
+                    "arguments",
+                    "arguments exceed the 1 MiB limit",
+                ));
+            }
+            args.capacity()
+        }
+        _ => 0,
+    };
+    let lease = budget.try_acquire(bytes).ok_or_else(|| {
+        Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "Tool arguments exceed the active memory limit",
+        )
+    })?;
+    Ok(Leased::new(cli, lease))
 }
 
 async fn entry(cli: Cli) -> i32 {
+    let cli = match retain_cli_input(cli, ByteBudget::global()) {
+        Ok(cli) => cli,
+        Err(error) => {
+            let _ = write_diagnostic(&mut std::io::stderr().lock(), &error);
+            return error.code;
+        }
+    };
     let foreground = matches!(
         cli.command,
         Command::Daemon {
@@ -960,23 +1167,47 @@ async fn entry(cli: Cli) -> i32 {
     }
     if let Some(error) = &output.diagnostic {
         let mut stderr = std::io::stderr().lock();
-        let _ = serde_json::to_writer(&mut stderr, &json!({"error":error}));
-        let _ = writeln!(stderr);
+        let _ = write_diagnostic(&mut stderr, error);
     }
     let Some(value) = output.value else {
         drop(output.lease.take());
-        if let Some(inflight) = output.inflight.take() {
-            inflight.abort().await;
+        if let Some(inflight) = output.inflight.take()
+            && let Err(error) = inflight.abort().await
+        {
+            eprintln!("mcpcli: media cache error: {error:#}");
+            return 1;
         }
         return output.code;
     };
+    if let Some(inflight) = &output.inflight
+        && let Err(error) = inflight.begin_writeback()
+    {
+        eprintln!("mcpcli: media cache error: {error:#}; the operation was not replayed");
+        if let Some(inflight) = output.inflight.take()
+            && let Err(error) = inflight.abort().await
+        {
+            eprintln!("mcpcli: media cache error: {error:#}");
+        }
+        return 1;
+    }
     let written = {
         let mut stdout = std::io::stdout().lock();
         let res = if cli.text {
-            let text = output
-                .text
-                .unwrap_or_else(|| serde_json::to_string_pretty(&value).unwrap());
-            write_text(&mut stdout, &text)
+            match &cli.command {
+                Command::Call { inline_media, .. } => {
+                    write_tool_text(&mut stdout, &value, *inline_media)
+                }
+                Command::Server { .. } => write_server_text(&mut stdout, &value),
+                Command::Tools { .. } => write_tools_text(&mut stdout, &value),
+                Command::Inspect { .. } => discovery::write_tool(&mut stdout, &value),
+                _ => {
+                    if let Some(text) = output.text {
+                        write_text(&mut stdout, &text)
+                    } else {
+                        write_text_json(&mut stdout, &value).and_then(|_| writeln!(stdout))
+                    }
+                }
+            }
         } else {
             serde_json::to_writer(&mut stdout, &value)
                 .map_err(std::io::Error::other)
@@ -986,12 +1217,18 @@ async fn entry(cli: Cli) -> i32 {
     };
     drop(value);
     drop(output.lease.take());
-    if let Some(inflight) = output.inflight.take() {
+    let finalized = if let Some(inflight) = output.inflight.take() {
         if written.is_ok() {
-            inflight.complete().await;
+            inflight.complete().await
         } else {
-            inflight.abort().await;
+            inflight.abort().await
         }
+    } else {
+        Ok(())
+    };
+    if let Err(error) = finalized {
+        eprintln!("mcpcli: media cache error: {error:#}; the operation was not replayed");
+        return 1;
     }
     if let Err(error) = written {
         if error.kind() != std::io::ErrorKind::BrokenPipe {
@@ -1065,24 +1302,144 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    fn server_text(value: &Value) -> Result<String> {
+        let mut bytes = Vec::new();
+        write_server_text(&mut bytes, value)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    fn tools_text(value: &Value) -> Result<String> {
+        let mut bytes = Vec::new();
+        write_tools_text(&mut bytes, value)?;
+        Ok(String::from_utf8(bytes)?)
+    }
+
+    fn tool_text(result: &Value, inline_media: bool) -> String {
+        let mut output = Vec::new();
+        write_tool_text(&mut output, result, inline_media).unwrap();
+        String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn tool_text_streams_large_borrowed_spans_and_normalizes_joined_crlf() {
+        struct BorrowedWriter {
+            start: usize,
+            end: usize,
+            borrowed: usize,
+            written: usize,
+        }
+        impl Write for BorrowedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > 1024 {
+                    let ptr = bytes.as_ptr() as usize;
+                    assert!(
+                        ptr >= self.start && ptr + bytes.len() <= self.end,
+                        "large text was copied"
+                    );
+                    self.borrowed += bytes.len();
+                }
+                self.written += bytes.len();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let value = json!({"content": [{"type":"text", "text":"x".repeat(128 << 10)}]});
+        let text = value["content"][0]["text"].as_str().unwrap();
+        let mut writer = BorrowedWriter {
+            start: text.as_ptr() as usize,
+            end: text.as_ptr() as usize + text.len(),
+            borrowed: 0,
+            written: 0,
+        };
+        write_tool_text(&mut writer, &value, true).unwrap();
+        assert_eq!(writer.borrowed, text.len());
+        assert_eq!(writer.written, text.len() + 1);
+        assert_eq!(
+            tool_text(
+                &json!({"content": [
+                    {"type":"text", "text":"first\r"}, {"type":"text", "text":"second\r\n"}
+                ]}),
+                true
+            ),
+            "first\nsecond\n"
+        );
+    }
+
+    #[test]
+    fn diagnostic_streams_shared_rpc_error_without_copying_its_value() {
+        struct BorrowedWriter {
+            start: usize,
+            end: usize,
+            borrowed: usize,
+        }
+        impl Write for BorrowedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > 1024 {
+                    let ptr = bytes.as_ptr() as usize;
+                    assert!(
+                        ptr >= self.start && ptr + bytes.len() <= self.end,
+                        "large diagnostic was copied"
+                    );
+                    self.borrowed += bytes.len();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut error = Failure::new(4, "mcp_protocol", "failed");
+        error.rpc_error = Some(std::sync::Arc::new(
+            json!({"data":{"text":"x".repeat(128 << 10)}}),
+        ));
+        let text = error.rpc_error.as_ref().unwrap()["data"]["text"]
+            .as_str()
+            .unwrap();
+        let mut writer = BorrowedWriter {
+            start: text.as_ptr() as usize,
+            end: text.as_ptr() as usize + text.len(),
+            borrowed: 0,
+        };
+        write_diagnostic(&mut writer, &error).unwrap();
+        assert_eq!(writer.borrowed, text.len());
+    }
+
+    #[test]
+    fn structured_and_fallback_text_streams_escape_c1_without_changing_json() {
+        let structured = json!({"key\u{85}": "normal é😀\u{85}\u{9b}\n"});
+        let expected = safe_text(&serde_json::to_string_pretty(&structured).unwrap());
+        assert_eq!(
+            tool_text(&json!({"structuredContent": structured}), true),
+            format!("{expected}\n")
+        );
+        let mut bytes = Vec::new();
+        write_text_json(&mut bytes, &structured).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), expected);
+        let json = serde_json::to_vec(&structured).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&json).unwrap(), structured);
+        assert_eq!(structured["key\u{85}"], "normal é😀\u{85}\u{9b}\n");
+    }
+
     #[test]
     fn empty_tool_text_blocks_preserve_structured_output_without_blank_lines() {
         for count in [1, 2] {
             let mut result = json!({
                 "content": vec![json!({"type": "text", "text": ""}); count]
             });
-            assert_eq!(tool_text(&result, false), "");
+            assert_eq!(tool_text(&result, true), "");
             result["structuredContent"] = json!({"answer": 42});
             assert_eq!(
-                tool_text(&result, false),
-                serde_json::to_string_pretty(&result["structuredContent"]).unwrap()
+                tool_text(&result, true),
+                format!(
+                    "{}\n",
+                    serde_json::to_string_pretty(&result["structuredContent"]).unwrap()
+                )
             );
         }
         assert_eq!(
-            tool_text(
-                &json!({"content": [{"type": "text", "text": " \n"}]}),
-                false
-            ),
+            tool_text(&json!({"content": [{"type": "text", "text": " \n"}]}), true),
             " \n"
         );
     }
@@ -1102,12 +1459,13 @@ mod tests {
                 "bytes": 1234
             }]
         });
+        let local = json!({"result": saved, "savedMedia": saved["savedMedia"]});
         assert_eq!(
-            tool_text(&saved, false),
-            "Read video\nSaved resource [video/mp4] (1234 B): /tmp/media/abc.mp4"
+            tool_text(&local, false),
+            "Read video\nSaved resource [video/mp4] (1234 B): /tmp/media/abc.mp4\n"
         );
         // When --inline-media is set, any remote savedMedia field is ignored.
-        assert_eq!(tool_text(&saved, true), "Read video");
+        assert_eq!(tool_text(&saved, true), "Read video\n");
     }
 
     #[test]
@@ -1135,7 +1493,7 @@ mod tests {
         let description = format!("    first\n{}  ", "x".repeat(300));
         let tools = json!({"pages":[{"tools":[{"name":"sample","description":description,"inputSchema":{}}]}]});
         let rendered = tools_text(&tools).unwrap();
-        assert_eq!(rendered, format!("sample\n{description}"));
+        assert_eq!(rendered, format!("sample\n{description}\n"));
     }
 
     #[test]
@@ -1147,7 +1505,7 @@ mod tests {
         for rendered in [
             server_text(&server).unwrap(),
             tools_text(&tools).unwrap(),
-            tool_text(&call, false),
+            tool_text(&call, true),
         ] {
             let mut bytes = Vec::new();
             write_text(&mut bytes, &rendered).unwrap();
@@ -1162,6 +1520,202 @@ mod tests {
         assert_eq!(server["result"]["instructions"], raw);
         assert_eq!(tools["pages"][0]["tools"][0]["description"], raw);
         assert_eq!(call["content"][0]["text"], raw);
+    }
+
+    #[tokio::test]
+    async fn argument_reads_and_parse_retain_the_source_value_owner() {
+        let input = serde_json::to_string(&json!({"text":"ordinary ".repeat(256) + "\n"})).unwrap();
+        let peak = input.len() * 2 + input::scratch_bytes(input.as_bytes());
+        for limit in [peak - 1, peak] {
+            let budget = ByteBudget::new(limit);
+            let result = arguments(
+                &Some(input.clone()),
+                &None,
+                false,
+                Duration::from_secs(1),
+                &budget,
+            )
+            .await;
+            if limit < peak {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Failure>().unwrap().kind,
+                    "memory_limit_exceeded"
+                );
+            } else {
+                let arguments = result.unwrap();
+                assert_eq!(arguments["text"], "ordinary ".repeat(256) + "\n");
+                assert_eq!(budget.used(), input.len());
+                drop(arguments);
+            }
+            assert_eq!(budget.used(), 0);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("arguments.json");
+        std::fs::write(&file, &input).unwrap();
+        let budget = ByteBudget::new(peak);
+        let result = arguments(&None, &Some(file), false, Duration::from_secs(1), &budget)
+            .await
+            .unwrap();
+        assert_eq!(budget.used(), input.len());
+        drop(result);
+        assert_eq!(budget.used(), 0);
+
+        let budget = ByteBudget::new(64);
+        let (mut sender, reader) = tokio::io::duplex(64);
+        tokio::io::AsyncWriteExt::write_all(&mut sender, b"part")
+            .await
+            .unwrap();
+        let mut reading = Box::pin(read_argument_bytes(reader, &budget));
+        assert!(
+            timeout(Duration::from_millis(10), &mut reading)
+                .await
+                .is_err()
+        );
+        assert_eq!(budget.used(), 4);
+        drop(reading);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn noncall_text_borrows_payloads_and_inspect_moves_the_selected_value() {
+        struct BorrowedWriter {
+            ranges: Vec<std::ops::Range<usize>>,
+            borrowed: usize,
+        }
+        impl Write for BorrowedWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > 1024 {
+                    let start = bytes.as_ptr() as usize;
+                    assert!(
+                        self.ranges
+                            .iter()
+                            .any(|range| range.start <= start && start + bytes.len() <= range.end),
+                        "large text was copied"
+                    );
+                    self.borrowed += bytes.len();
+                }
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn ranges(value: &Value, output: &mut Vec<std::ops::Range<usize>>) {
+            match value {
+                Value::String(text) if text.len() > 1024 => {
+                    let start = text.as_ptr() as usize;
+                    output.push(start..start + text.len());
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        ranges(item, output);
+                    }
+                }
+                Value::Object(fields) => {
+                    for value in fields.values() {
+                        ranges(value, output);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let server =
+            json!({"result":{"instructions":"i".repeat(128 << 10), "extra":"m".repeat(128 << 10)}});
+        let tools =
+            json!({"pages":[{"tools":[{"name":"sample", "description":"d".repeat(128 << 10)}]}]});
+        let tool = json!({"name":"sample", "description":"d".repeat(128 << 10),
+            "inputSchema":{"description":"s".repeat(128 << 10)}, "_meta":{"long":"m".repeat(128 << 10)}});
+        for (kind, value) in [(0, &server), (1, &tools), (2, &tool)] {
+            let mut writer = BorrowedWriter {
+                ranges: Vec::new(),
+                borrowed: 0,
+            };
+            ranges(value, &mut writer.ranges);
+            let expected: usize = writer.ranges.iter().map(|range| range.len()).sum();
+            match kind {
+                0 => write_server_text(&mut writer, value).unwrap(),
+                1 => write_tools_text(&mut writer, value).unwrap(),
+                _ => discovery::write_tool(&mut writer, value).unwrap(),
+            }
+            assert_eq!(writer.borrowed, expected);
+        }
+        let mut pages = json!({"pages":[{"tools":[{"name":"other"}, tool]}]});
+        let pointer = pages["pages"][0]["tools"][1]["description"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let selected = take_listed_tool(&mut pages, "sample").unwrap();
+        assert_eq!(selected["description"].as_str().unwrap().as_ptr(), pointer);
+        assert!(pages["pages"][0]["tools"][1].is_null());
+        assert_eq!(selected["_meta"]["long"].as_str().unwrap().len(), 128 << 10);
+    }
+
+    #[test]
+    fn noncall_text_keeps_control_and_separator_semantics() {
+        let tools = json!({"pages":[{"tools":[
+            {"name":"first\r","description":"body\u{85}é\r"},
+            {"name":"next"}
+        ]}]});
+        assert_eq!(tools_text(&tools).unwrap(), "first\nbody\\u{85}é\n\nnext\n");
+        assert_eq!(
+            tools_text(&json!({"pages":[{"tools":[{"name":""},{"name":""}]}]})).unwrap(),
+            "\n\n"
+        );
+        assert_eq!(tools_text(&json!({"pages":[{"tools":[]}]})).unwrap(), "");
+        let server = json!({"result":{"instructions":"","extra":"é\u{85}"}});
+        assert!(
+            server_text(&server)
+                .unwrap()
+                .ends_with("\n\nInstructions:\n")
+        );
+        assert!(server_text(&server).unwrap().contains("é\\u{85}"));
+        assert_eq!(server["result"]["extra"], "é\u{85}");
+        let tool = json!({"name":"  name\tpart ", "description":"description\r",
+            "inputSchema":{"title":"é\u{9b}"}, "extra":null});
+        let mut text = Vec::new();
+        discovery::write_tool(&mut text, &tool).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(text.starts_with("name part\n\ndescription\\r\n\nInput schema:\n"));
+        assert!(text.contains("é\\u{9b}"));
+        assert!(text.contains("\"extra\": null"));
+        assert_eq!(tool["inputSchema"]["title"], "é\u{9b}");
+    }
+
+    #[tokio::test]
+    async fn cli_argument_string_capacity_survives_reader_and_value_handoffs() {
+        for exact in [false, true] {
+            let mut cli = Cli::try_parse_from(["mcpcli", "call", "srv", "sample"]).unwrap();
+            let mut text = String::with_capacity(512);
+            text.push_str("{\"text\":\"ordinary\\ntext\"}");
+            let capacity = text.capacity();
+            let length = text.len();
+            let peak = capacity + 2 * length + input::scratch_bytes(text.as_bytes());
+            let Command::Call { args, .. } = &mut cli.command else {
+                unreachable!()
+            };
+            *args = Some(text);
+            let budget = ByteBudget::new(if exact { peak } else { peak - 1 });
+            let cli = retain_cli_input(cli, &budget).unwrap();
+            assert_eq!(budget.used(), capacity);
+            let Command::Call { args, .. } = &cli.command else {
+                unreachable!()
+            };
+            let parsed = arguments(args, &None, false, Duration::from_secs(1), &budget).await;
+            if exact {
+                let parsed = parsed.unwrap();
+                assert_eq!(parsed["text"], "ordinary\ntext");
+                assert_eq!(budget.used(), capacity + length);
+                drop(parsed);
+            } else {
+                assert_eq!(
+                    parsed.unwrap_err().downcast_ref::<Failure>().unwrap().kind,
+                    "memory_limit_exceeded"
+                );
+            }
+            assert_eq!(budget.used(), capacity);
+            drop(cli);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[test]
