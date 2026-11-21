@@ -436,10 +436,14 @@ async fn direct_http_call_discovers_header_annotations_and_rejects_invalid_tools
 
 #[tokio::test]
 async fn discovery_and_dispatch_share_deadline_and_missing_tools_never_execute() {
+    // Starting the Python fixture is outside the request deadline under test.
+    const FIXTURE_CONNECT_BUDGET: Duration = Duration::from_secs(30);
+
     let fixture = Fixture::new();
-    let mut connection = McpConnection::connect(&fixture.stdio(true, "slow_list"), BUDGET)
-        .await
-        .unwrap();
+    let mut connection =
+        McpConnection::connect(&fixture.stdio(true, "slow_list"), FIXTURE_CONNECT_BUDGET)
+            .await
+            .unwrap();
     let started = std::time::Instant::now();
     let error = connection
         .call("get", Map::new(), Duration::from_millis(220))
@@ -453,9 +457,10 @@ async fn discovery_and_dispatch_share_deadline_and_missing_tools_never_execute()
     connection.close().await.unwrap();
 
     let fixture = Fixture::new();
-    let mut connection = McpConnection::connect(&fixture.stdio(true, "normal"), BUDGET)
-        .await
-        .unwrap();
+    let mut connection =
+        McpConnection::connect(&fixture.stdio(true, "normal"), FIXTURE_CONNECT_BUDGET)
+            .await
+            .unwrap();
     let error = connection
         .call("not-advertised", Map::new(), BUDGET)
         .await
