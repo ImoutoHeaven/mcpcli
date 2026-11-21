@@ -196,7 +196,44 @@ jobs:
             tar -xzf fastexec-0.2.2-linux-amd64.tar.gz
           )
           npm ci --prefix scripts/ci/real-services
-          node scripts/ci/real-services/node_modules/playwright/cli.js install --with-deps chromium
+          playwright=scripts/ci/real-services/node_modules/playwright/cli.js
+          if node "$playwright" install --with-deps chromium; then
+            :
+          else
+            install_status=$?
+            # Some hosted images lack usable Ubuntu indexes. Keep unrelated failures fatal.
+            has_candidate() {
+              LC_ALL=C apt-cache policy "$1" | grep -Eq '^[[:blank:]]+Candidate: [^ (]'
+            }
+            if has_candidate fonts-unifont && has_candidate fonts-freefont-ttf; then
+              exit "$install_status"
+            fi
+            . /etc/os-release
+            test "$ID:$VERSION_CODENAME" = ubuntu:noble
+            fallback=/etc/apt/sources.list.d/mcpcli-playwright-noble.sources
+            if [[ -e "$fallback" || -L "$fallback" ]]; then
+              echo "Refusing to replace existing apt source: $fallback" >&2
+              exit "$install_status"
+            fi
+            trap 'sudo rm -f -- "$fallback"' EXIT
+            sudo tee "$fallback" >/dev/null <<'SOURCES'
+          Types: deb
+          URIs: https://archive.ubuntu.com/ubuntu/
+          Suites: noble noble-updates
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+          Types: deb
+          URIs: https://security.ubuntu.com/ubuntu/
+          Suites: noble-security
+          Components: main universe
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          SOURCES
+            timeout 120s sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=20 update
+            has_candidate fonts-unifont
+            has_candidate fonts-freefont-ttf
+            node "$playwright" install --with-deps chromium
+          fi
       - name: real-service E2E
         run: |
           chromium="$(node -e "console.log(require('./scripts/ci/real-services/node_modules/playwright').chromium.executablePath())")"
