@@ -350,6 +350,10 @@ pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     std::fs::rename(from, to)
 }
 
+pub fn replace_file_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    replace_file(from, to)
+}
+
 pub(super) fn open_skill_root(path: &Path) -> io::Result<File> {
     OpenOptions::new()
         .read(true)

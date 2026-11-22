@@ -265,6 +265,30 @@ pub fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Retry MoveFileExW on transient antivirus or indexer locks (ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION).
+pub fn replace_file_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+    const MAX_RETRIES: usize = 5;
+    for attempt in 0..=MAX_RETRIES {
+        match replace_file(from, to) {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if attempt < MAX_RETRIES
+                    && matches!(
+                        err.raw_os_error(),
+                        Some(code)
+                            if code == ERROR_ACCESS_DENIED as i32
+                                || code == ERROR_SHARING_VIOLATION as i32
+                    ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10u64 << attempt));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!()
+}
+
 pub fn sync_directory(_path: &Path) -> io::Result<()> {
     Ok(())
 }

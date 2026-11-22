@@ -11,6 +11,7 @@ pub mod budget;
 pub mod config;
 pub mod daemon;
 pub mod discovery;
+pub mod events_exec;
 pub mod ipc;
 pub mod json;
 pub mod mcp;
