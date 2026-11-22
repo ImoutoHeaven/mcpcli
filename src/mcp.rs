@@ -1309,9 +1309,11 @@ impl McpEventsClient {
         enum EitherStreamStart {
             Notification(Option<Leased<EventNotification>>),
             Rpc(
-                std::result::Result<
-                    std::result::Result<ServerResult, ServiceError>,
-                    tokio::sync::oneshot::error::RecvError,
+                Box<
+                    std::result::Result<
+                        std::result::Result<ServerResult, ServiceError>,
+                        tokio::sync::oneshot::error::RecvError,
+                    >,
                 >,
             ),
         }
@@ -1364,7 +1366,7 @@ impl McpEventsClient {
                 tokio::select! {
                     biased;
                     notif = rx.recv() => Ok(EitherStreamStart::Notification(notif)),
-                    rpc = &mut handle.rx => Ok(EitherStreamStart::Rpc(rpc)),
+                    rpc = &mut handle.rx => Ok(EitherStreamStart::Rpc(Box::new(rpc))),
                     () = self.termination.cancelled() => {
                         self.abort_service();
                         Err(self.termination.failure(false))
@@ -1395,7 +1397,7 @@ impl McpEventsClient {
                     );
                     return Ok((stream_handle, EventStreamReceiver::new(first, rx)));
                 }
-                Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => match rpc_res {
+                Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => match *rpc_res {
                     Ok(Err(ServiceError::McpError(ref err)))
                         if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
                     {

@@ -83,28 +83,25 @@ pub enum RawStreamEvent {
     End,
 }
 
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 pub trait EventStreamChannel: Send {
-    fn next_item(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RawStreamEvent>>> + Send + '_>>;
-    fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>>;
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>>;
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
 
 pub trait EventTransport: Send {
-    fn list_events(
-        &mut self,
-        budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>>> + Send + '_>>;
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>>;
     fn poll_events(
         &mut self,
         params: PollEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>>;
+    ) -> BoxFuture<'_, Result<Value>>;
     fn open_stream(
         &mut self,
         params: StreamEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn EventStreamChannel>>> + Send + '_>>;
+    ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>>;
 }
 
 // --- Direct (oneshot) transport ---
@@ -115,9 +112,7 @@ struct DirectChannel {
 }
 
 impl EventStreamChannel for DirectChannel {
-    fn next_item(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RawStreamEvent>>> + Send + '_>> {
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
         Box::pin(async move {
             match self.rx.recv().await {
                 Some(leased) => {
@@ -130,7 +125,7 @@ impl EventStreamChannel for DirectChannel {
         })
     }
 
-    fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             let _ = self.handle.cancel().await;
         })
@@ -152,10 +147,7 @@ impl DirectTransport {
 }
 
 impl EventTransport for DirectTransport {
-    fn list_events(
-        &mut self,
-        budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>>> + Send + '_>> {
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
         Box::pin(async move {
             let events = self
                 .connection
@@ -172,7 +164,7 @@ impl EventTransport for DirectTransport {
         &mut self,
         params: PollEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>> {
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let polled = self
                 .connection
@@ -189,7 +181,7 @@ impl EventTransport for DirectTransport {
         &mut self,
         params: StreamEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn EventStreamChannel>>> + Send + '_>> {
+    ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
             let (handle, rx) = self
                 .connection
@@ -208,9 +200,7 @@ struct DaemonChannel {
 }
 
 impl EventStreamChannel for DaemonChannel {
-    fn next_item(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<RawStreamEvent>>> + Send + '_>> {
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
         Box::pin(async move {
             match self.stream.next_frame().await? {
                 Some((StreamFrameKind::Notification { method, params }, lease)) => {
@@ -230,7 +220,7 @@ impl EventStreamChannel for DaemonChannel {
         })
     }
 
-    fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
         Box::pin(async move {
             drop(self);
         })
@@ -254,10 +244,7 @@ impl DaemonTransport {
 }
 
 impl EventTransport for DaemonTransport {
-    fn list_events(
-        &mut self,
-        budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>>> + Send + '_>> {
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
         Box::pin(async move {
             let req = self.paths.request(
                 &self.loaded.digest,
@@ -282,7 +269,7 @@ impl EventTransport for DaemonTransport {
         &mut self,
         params: PollEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>> {
+    ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
             let req = self.paths.request(
                 &self.loaded.digest,
@@ -307,7 +294,7 @@ impl EventTransport for DaemonTransport {
         &mut self,
         params: StreamEventsParams,
         budget: Duration,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn EventStreamChannel>>> + Send + '_>> {
+    ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
             let req = self.paths.request(
                 &self.loaded.digest,
@@ -998,9 +985,7 @@ mod tests {
     }
 
     impl EventStreamChannel for MockChannel {
-        fn next_item(
-            &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<Option<RawStreamEvent>>> + Send + '_>> {
+        fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
             Box::pin(async move {
                 match self.steps.pop_front() {
                     Some(MockStep::Yield(ev)) => Ok(Some(ev)),
@@ -1013,7 +998,7 @@ mod tests {
             })
         }
 
-        fn close(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        fn close(self: Box<Self>) -> BoxFuture<'static, ()> {
             Box::pin(async {})
         }
     }
@@ -1027,10 +1012,7 @@ mod tests {
     }
 
     impl EventTransport for MockTransport {
-        fn list_events(
-            &mut self,
-            _budget: Duration,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<Value>>> + Send + '_>> {
+        fn list_events(&mut self, _budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
             let listed = self.listed.clone();
             Box::pin(async move { Ok(listed) })
         }
@@ -1039,7 +1021,7 @@ mod tests {
             &mut self,
             params: PollEventsParams,
             _budget: Duration,
-        ) -> Pin<Box<dyn Future<Output = Result<Value>> + Send + '_>> {
+        ) -> BoxFuture<'_, Result<Value>> {
             self.poll_cursors.push(params.cursor);
             let next = self
                 .polls
@@ -1052,8 +1034,7 @@ mod tests {
             &mut self,
             params: StreamEventsParams,
             _budget: Duration,
-        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn EventStreamChannel>>> + Send + '_>>
-        {
+        ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
             self.stream_cursors.push(params.cursor);
             let steps = self.streams.pop_front().unwrap_or_default();
             Box::pin(
