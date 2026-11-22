@@ -551,9 +551,11 @@ async fn dispatch_marker_and_structured_uncertainty_follow_the_wire_boundary() {
     assert!(!dispatched.load(Ordering::Acquire));
     assert!(!error.downcast_ref::<McpFailure>().unwrap().outcome_unknown);
     let error = connection
-        .call_with_dispatch("slow", Map::new(), Duration::from_millis(80), &dispatched)
+        .call_with_dispatch("input_required", Map::new(), BUDGET, &dispatched)
         .await
         .unwrap_err();
+    assert_eq!(kind(&error), FailureKind::Protocol);
+    assert!(error.to_string().contains("unsupported interactive input"));
     assert!(dispatched.load(Ordering::Acquire));
     assert!(error.downcast_ref::<McpFailure>().unwrap().outcome_unknown);
     assert_eq!(fixture.count("tools/call"), 1);
