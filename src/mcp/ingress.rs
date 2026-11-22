@@ -65,6 +65,10 @@ impl Ingress {
                             _ => "tools/call",
                         };
                         if state.capture_active {
+                            state
+                                .entries
+                                .retain(|_, entry| matches!(entry, Entry::Passthrough));
+                            state.completed_captures.clear();
                             state.entries.insert(
                                 request.id.clone(),
                                 Entry::Capture {
@@ -863,6 +867,80 @@ mod tests {
             "params": {"eventId": "e1"}
         });
         assert!(!ignore_notification(&notif));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn subsequent_capture_replaces_prior_capture_while_preserving_passthrough() {
+        let budget = ByteBudget::new(64 * 1024);
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().expect("capture guard");
+
+        // Register a concurrent passthrough request alongside handshake captures.
+        let events_poll_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "events/poll",
+            "params": {"name": "task.exited"}
+        }))
+        .unwrap();
+        ingress.track(&events_poll_req);
+
+        // First capture (server/discover) completes with an error response.
+        let discover_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {}
+        }))
+        .unwrap();
+        ingress.track(&discover_req);
+        let err_raw =
+            br#"{"jsonrpc":"2.0","id":1,"error":{"code":-32022,"message":"unsupported"}}"#;
+        let ObserveOutcome::Captured(err_msg) =
+            ingress.observe_bytes(err_raw, 4096, &budget, true).unwrap()
+        else {
+            panic!("expected captured discover error");
+        };
+        drop(err_msg);
+
+        // Second capture (initialize) replaces the prior completed capture, keeping passthrough.
+        let init_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "mcpcli", "version": "0.4.0"}
+            }
+        }))
+        .unwrap();
+        ingress.track(&init_req);
+        let ok_raw = br#"{"jsonrpc":"2.0","id":2,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"srv","version":"1.0"}}}"#;
+        let ObserveOutcome::Captured(ok_msg) =
+            ingress.observe_bytes(ok_raw, 4096, &budget, false).unwrap()
+        else {
+            panic!("expected captured initialize result");
+        };
+        drop(ok_msg);
+
+        // take() must return the latest initialize result, not the stale discover error.
+        let (method, captured, lease) = ingress.take().expect("captured initialize");
+        assert_eq!(method, "initialize");
+        let val = captured.unwrap();
+        assert_eq!(val["result"]["protocolVersion"], "2025-11-25");
+        drop(lease);
+
+        // Concurrent passthrough events/poll entry survived the capture replacement.
+        let poll_raw = br#"{"jsonrpc":"2.0","id":99,"result":{"resultType":"complete","events":[],"cursor":"1:0"}}"#;
+        let ObserveOutcome::Captured(poll_msg) = ingress
+            .observe_bytes(poll_raw, 4096, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected passthrough events/poll response");
+        };
+        drop(poll_msg);
         assert_eq!(budget.used(), 0);
     }
 }
