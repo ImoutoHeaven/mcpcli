@@ -546,13 +546,16 @@ fn is_broken_pipe(err: &io::Error) -> bool {
     false
 }
 
-fn format_ndjson_line(event_json: &str) -> Result<String, ExecError> {
+fn format_ndjson_line(event_json: &str) -> Result<std::borrow::Cow<'_, str>, ExecError> {
+    if event_json.ends_with('\n') && !event_json[..event_json.len() - 1].contains(['\n', '\r']) {
+        return Ok(std::borrow::Cow::Borrowed(event_json));
+    }
     let trimmed = event_json.trim_end_matches(['\r', '\n']);
     if !trimmed.contains(['\n', '\r']) {
         let mut line = String::with_capacity(trimmed.len() + 1);
         line.push_str(trimmed);
         line.push('\n');
-        return Ok(line);
+        return Ok(line.into());
     }
     let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
         ExecError::InvalidConfig(format!("invalid event JSON for stream mode: {err}"))
@@ -561,7 +564,7 @@ fn format_ndjson_line(event_json: &str) -> Result<String, ExecError> {
         ExecError::InvalidConfig(format!("failed to serialize event JSON: {err}"))
     })?;
     line.push('\n');
-    Ok(line)
+    Ok(line.into())
 }
 
 async fn read_bounded_line(reader: &mut BufReader<ChildStdout>) -> io::Result<Option<String>> {

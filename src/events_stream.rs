@@ -1,6 +1,7 @@
 //! Foreground `mcpcli events stream` engine: push/poll auto-selection, dead-stream
 //! reconnect, cursor persistence, and at-least-once callback delivery.
 use crate::{
+    budget::{ByteBudget, ByteLease, Leased},
     config::LoadedConfig,
     daemon,
     events_exec::{CallbackExecutor, CursorStore, ExecMode},
@@ -86,20 +87,20 @@ pub enum RawStreamEvent {
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait EventStreamChannel: Send {
-    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>>;
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<Leased<RawStreamEvent>>>>;
     fn close(self: Box<Self>) -> BoxFuture<'static, ()>;
 }
 
 pub trait EventTransport: Send {
-    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>>;
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>>;
     fn poll_events(
         &mut self,
-        params: PollEventsParams,
+        params: Leased<PollEventsParams>,
         budget: Duration,
-    ) -> BoxFuture<'_, Result<Value>>;
+    ) -> BoxFuture<'_, Result<Leased<Value>>>;
     fn open_stream(
         &mut self,
-        params: StreamEventsParams,
+        params: Leased<StreamEventsParams>,
         budget: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>>;
 }
@@ -112,15 +113,17 @@ struct DirectChannel {
 }
 
 impl EventStreamChannel for DirectChannel {
-    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<Leased<RawStreamEvent>>>> {
         Box::pin(async move {
             match self.rx.recv().await {
                 Some(leased) => {
                     let (EventNotification { method, params, .. }, lease) = leased.into_parts();
-                    drop(lease);
-                    Ok(Some(RawStreamEvent::Notification { method, params }))
+                    Ok(Some(Leased::new(
+                        RawStreamEvent::Notification { method, params },
+                        lease,
+                    )))
                 }
-                None => Ok(Some(RawStreamEvent::End)),
+                None => Ok(None),
             }
         })
     }
@@ -165,7 +168,7 @@ impl DirectTransport {
 }
 
 impl EventTransport for DirectTransport {
-    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>> {
         Box::pin(async move {
             self.check_connection()?;
             let events = self
@@ -173,37 +176,35 @@ impl EventTransport for DirectTransport {
                 .list_events(budget)
                 .await
                 .map_err(|e| self.request_error(e))?;
-            let (events, lease) = events.into_parts();
-            drop(lease);
             Ok(events)
         })
     }
 
     fn poll_events(
         &mut self,
-        params: PollEventsParams,
+        params: Leased<PollEventsParams>,
         budget: Duration,
-    ) -> BoxFuture<'_, Result<Value>> {
+    ) -> BoxFuture<'_, Result<Leased<Value>>> {
         Box::pin(async move {
             self.check_connection()?;
+            let (params, _params_lease) = params.into_parts();
             let polled = self
                 .connection
                 .poll_events(params, budget)
                 .await
                 .map_err(|e| self.request_error(e))?;
-            let (value, lease) = polled.into_parts();
-            drop(lease);
-            Ok(value)
+            Ok(polled)
         })
     }
 
     fn open_stream(
         &mut self,
-        params: StreamEventsParams,
+        params: Leased<StreamEventsParams>,
         budget: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
             self.check_connection()?;
+            let (params, _params_lease) = params.into_parts();
             let (handle, rx) = self
                 .connection
                 .open_event_stream(params, budget)
@@ -221,20 +222,17 @@ struct DaemonChannel {
 }
 
 impl EventStreamChannel for DaemonChannel {
-    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
+    fn next_item(&mut self) -> BoxFuture<'_, Result<Option<Leased<RawStreamEvent>>>> {
         Box::pin(async move {
             match self.stream.next_frame().await? {
-                Some((StreamFrameKind::Notification { method, params }, lease)) => {
-                    drop(lease);
-                    Ok(Some(RawStreamEvent::Notification { method, params }))
-                }
+                Some((StreamFrameKind::Notification { method, params }, lease)) => Ok(Some(
+                    Leased::new(RawStreamEvent::Notification { method, params }, lease),
+                )),
                 Some((StreamFrameKind::Error { error }, lease)) => {
-                    drop(lease);
-                    Ok(Some(RawStreamEvent::Error(error)))
+                    Ok(Some(Leased::new(RawStreamEvent::Error(error), lease)))
                 }
                 Some((StreamFrameKind::End, lease)) => {
-                    drop(lease);
-                    Ok(Some(RawStreamEvent::End))
+                    Ok(Some(Leased::new(RawStreamEvent::End, lease)))
                 }
                 None => Ok(None),
             }
@@ -265,7 +263,7 @@ impl DaemonTransport {
 }
 
 impl EventTransport for DaemonTransport {
-    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
+    fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>> {
         Box::pin(async move {
             let req = self.paths.request(
                 &self.loaded.digest,
@@ -275,23 +273,23 @@ impl EventTransport for DaemonTransport {
                 budget,
             )?;
             let (resp, lease) = runtime::exchange(&self.paths, &req).await?;
-            let result = resp.result.unwrap_or(Value::Null);
-            drop(lease);
+            let mut result = resp.result.unwrap_or(Value::Null);
             let events = result
-                .get("events")
-                .and_then(Value::as_array)
-                .cloned()
+                .get_mut("events")
+                .and_then(Value::as_array_mut)
+                .map(std::mem::take)
                 .unwrap_or_default();
-            Ok(events)
+            Ok(Leased::new(events, lease))
         })
     }
 
     fn poll_events(
         &mut self,
-        params: PollEventsParams,
+        params: Leased<PollEventsParams>,
         budget: Duration,
-    ) -> BoxFuture<'_, Result<Value>> {
+    ) -> BoxFuture<'_, Result<Leased<Value>>> {
         Box::pin(async move {
+            let (params, params_lease) = params.into_parts();
             let req = self.paths.request(
                 &self.loaded.digest,
                 Operation::EventsPoll {
@@ -304,19 +302,20 @@ impl EventTransport for DaemonTransport {
                 },
                 budget,
             )?;
+            let req = Leased::new(req, params_lease);
             let (resp, lease) = runtime::exchange(&self.paths, &req).await?;
             let result = resp.result.unwrap_or(Value::Null);
-            drop(lease);
-            Ok(result)
+            Ok(Leased::new(result, lease))
         })
     }
 
     fn open_stream(
         &mut self,
-        params: StreamEventsParams,
+        params: Leased<StreamEventsParams>,
         budget: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
+            let (params, params_lease) = params.into_parts();
             let req = self.paths.request(
                 &self.loaded.digest,
                 Operation::EventsStream {
@@ -329,6 +328,7 @@ impl EventTransport for DaemonTransport {
                 },
                 budget,
             )?;
+            let req = Leased::new(req, params_lease);
             let stream = runtime::open_event_stream(&self.paths, &req).await?;
             Ok(Box::new(DaemonChannel { stream }) as Box<dyn EventStreamChannel>)
         })
@@ -336,6 +336,21 @@ impl EventTransport for DaemonTransport {
 }
 
 // --- Core stream runner ---
+
+fn request_params_lease(config: &StreamConfig, cursor: &Option<String>) -> Result<ByteLease> {
+    let bytes = crate::json::serialized_len(&config.arguments)?
+        .saturating_add(config.event.len())
+        .saturating_add(config.server.len())
+        .saturating_add(cursor.as_ref().map_or(0, String::len));
+    ByteBudget::global().try_acquire(bytes).ok_or_else(|| {
+        Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "event arguments exceed the active memory limit",
+        )
+        .into()
+    })
+}
 
 fn jittered_duration(base: Duration) -> Duration {
     let base_ms = base.as_millis() as u64;
@@ -468,16 +483,27 @@ impl<'a> Sink<'a> {
         deadline: Option<Instant>,
         cancel: &CancellationToken,
     ) -> Result<()> {
-        let line = serde_json::to_string(payload)?;
+        let budget = ByteBudget::global();
+        let (mut bytes, mut lease) =
+            crate::ipc::encode_json_leased(payload, crate::ipc::RESPONSE_LIMIT, budget)?;
+        let needed = bytes.len().saturating_add(1);
+        if !lease.reserve_vec(&mut bytes, needed, crate::ipc::RESPONSE_LIMIT + 1) {
+            return Err(Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "event callback exceeds the active memory limit",
+            )
+            .into());
+        }
+        bytes.push(b'\n');
+        let line = Leased::new(String::from_utf8(bytes).expect("JSON is UTF-8"), lease);
         let Some(executor) = self.executor.as_mut() else {
             if let Some(writer) = self.stdout.as_mut() {
                 writer.write_all(line.as_bytes())?;
-                writer.write_all(b"\n")?;
                 writer.flush()?;
             } else {
                 let mut stdout = std::io::stdout().lock();
                 stdout.write_all(line.as_bytes())?;
-                stdout.write_all(b"\n")?;
                 stdout.flush()?;
             }
             return Ok(());
@@ -672,6 +698,7 @@ async fn run_poll_loop<T: EventTransport>(
             return Err(Failure::new(130, "cancelled", "interrupted").into());
         }
         let poll_budget = remaining_budget(timings.handshake_timeout, deadline)?;
+        let params_lease = request_params_lease(config, current_cursor)?;
         let params = PollEventsParams {
             name: config.event.clone(),
             arguments: config.arguments.clone(),
@@ -679,6 +706,7 @@ async fn run_poll_loop<T: EventTransport>(
             max_age_ms: current_cursor.as_ref().and(initial_max_age),
             max_events: config.once.then_some(1),
         };
+        let params = Leased::new(params, params_lease);
         let polled = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Failure::new(130, "cancelled", "interrupted").into()),
@@ -710,15 +738,6 @@ async fn run_poll_loop<T: EventTransport>(
             pending_truncated = true;
         }
 
-        let events = response
-            .get("events")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let next_cursor = response
-            .get("cursor")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
         let has_more = response
             .get("hasMore")
             .and_then(Value::as_bool)
@@ -728,9 +747,21 @@ async fn run_poll_loop<T: EventTransport>(
             .and_then(Value::as_u64)
             .unwrap_or(MIN_POLL_INTERVAL_MS);
 
-        let batch_len = events.len();
+        let (mut response, lease) = response.into_parts();
+        let events = response
+            .get_mut("events")
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let next_cursor = response
+            .get_mut("cursor")
+            .map(Value::take)
+            .unwrap_or(Value::Null);
+        let mut batch = Leased::new((events, next_cursor), lease);
+        drop(response);
+        let batch_len = batch.0.len();
         let mut delivered_any = false;
-        for event in events {
+        for event in batch.value_mut().0.drain(..) {
             let payload = inject_truncated(event, pending_truncated);
             sink.deliver_with_retry(&payload, timings, deadline, cancel)
                 .await?;
@@ -745,13 +776,14 @@ async fn run_poll_loop<T: EventTransport>(
             persist_cursor(
                 config.cursor_file.as_ref(),
                 current_cursor,
-                next_cursor.as_deref(),
+                batch.1.as_str(),
             )?;
         }
 
         if config.once && delivered_any {
             return Ok(());
         }
+        drop(batch);
 
         if has_more {
             continue;
@@ -780,6 +812,7 @@ async fn run_push_loop<T: EventTransport>(
             return Err(Failure::new(130, "cancelled", "interrupted").into());
         }
         let open_budget = remaining_budget(timings.handshake_timeout, deadline)?;
+        let params_lease = request_params_lease(config, current_cursor)?;
         let params = StreamEventsParams {
             name: config.event.clone(),
             arguments: config.arguments.clone(),
@@ -787,6 +820,7 @@ async fn run_push_loop<T: EventTransport>(
             max_age_ms: current_cursor.as_ref().and(initial_max_age),
             heartbeat_ms: config.heartbeat_ms,
         };
+        let params = Leased::new(params, params_lease);
         let open_res = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Failure::new(130, "cancelled", "interrupted").into()),
@@ -863,11 +897,20 @@ async fn run_push_loop<T: EventTransport>(
                     reconnect_reason = format!("stream read error: {err:#}");
                     break;
                 }
-                Ok(Ok(None)) | Ok(Ok(Some(RawStreamEvent::End))) => {
+                Ok(Ok(None)) => {
                     reconnect_reason = "event stream closed by server".to_owned();
                     break;
                 }
-                Ok(Ok(Some(RawStreamEvent::Error(failure)))) => {
+                Ok(Ok(Some(item))) => item,
+            };
+            let (item, lease) = item.into_parts();
+            let mut notification = match item {
+                RawStreamEvent::End => {
+                    reconnect_reason = "event stream closed by server".to_owned();
+                    break;
+                }
+                RawStreamEvent::Error(mut failure) => {
+                    failure.lease = Some(std::sync::Arc::new(lease));
                     let err: anyhow::Error = failure.into();
                     if is_fatal_error(&err) {
                         channel.close().await;
@@ -876,10 +919,12 @@ async fn run_push_loop<T: EventTransport>(
                     reconnect_reason = format!("stream error: {err:#}");
                     break;
                 }
-                Ok(Ok(Some(RawStreamEvent::Notification { method, params }))) => (method, params),
+                RawStreamEvent::Notification { method, params } => {
+                    Leased::new((method, params), lease)
+                }
             };
 
-            let (method, params) = item;
+            let (method, params) = notification.value_mut();
             match method.as_str() {
                 "notifications/events/active" => {
                     let was_active = active_received;
@@ -936,11 +981,7 @@ async fn run_push_loop<T: EventTransport>(
                     }
                 }
                 "notifications/events/event" => {
-                    let event_obj = params.unwrap_or_else(|| Value::Object(Map::new()));
-                    let event_cursor = event_obj
-                        .get("cursor")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
+                    let event_obj = params.take().unwrap_or_else(|| Value::Object(Map::new()));
                     let payload = inject_truncated(event_obj, pending_truncated);
                     if let Err(err) = sink
                         .deliver_with_retry(&payload, timings, deadline, cancel)
@@ -953,7 +994,7 @@ async fn run_push_loop<T: EventTransport>(
                     if let Err(err) = persist_cursor(
                         config.cursor_file.as_ref(),
                         current_cursor,
-                        event_cursor.as_deref(),
+                        payload.get("cursor").and_then(Value::as_str),
                     ) {
                         channel.close().await;
                         return Err(err);
@@ -1018,19 +1059,32 @@ mod tests {
 
     struct MockChannel {
         steps: VecDeque<MockStep>,
+        budget: std::sync::Arc<ByteBudget>,
     }
 
     impl EventStreamChannel for MockChannel {
-        fn next_item(&mut self) -> BoxFuture<'_, Result<Option<RawStreamEvent>>> {
+        fn next_item(&mut self) -> BoxFuture<'_, Result<Option<Leased<RawStreamEvent>>>> {
             Box::pin(async move {
-                match self.steps.pop_front() {
-                    Some(MockStep::Yield(ev)) => Ok(Some(ev)),
+                let event = match self.steps.pop_front() {
+                    Some(MockStep::Yield(ev)) => ev,
                     Some(MockStep::DelayThen(d, ev)) => {
                         sleep(d).await;
-                        Ok(Some(ev))
+                        ev
                     }
-                    None => Ok(Some(RawStreamEvent::End)),
-                }
+                    None => return Ok(None),
+                };
+                let bytes = match &event {
+                    RawStreamEvent::Notification { method, params } => {
+                        method.len() + crate::json::serialized_len(params)?
+                    }
+                    RawStreamEvent::Error(error) => crate::json::serialized_len(error)?,
+                    RawStreamEvent::End => 0,
+                };
+                let lease = self
+                    .budget
+                    .try_acquire(bytes)
+                    .expect("test notification budget");
+                Ok(Some(Leased::new(event, lease)))
             })
         }
 
@@ -1045,37 +1099,49 @@ mod tests {
         poll_cursors: Vec<Option<String>>,
         streams: VecDeque<VecDeque<MockStep>>,
         stream_cursors: Vec<Option<String>>,
+        budget: std::sync::Arc<ByteBudget>,
     }
 
     impl EventTransport for MockTransport {
-        fn list_events(&mut self, _budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
+        fn list_events(&mut self, _budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>> {
+            let lease = self
+                .budget
+                .try_acquire(crate::json::serialized_len(&self.listed).unwrap())
+                .unwrap();
             let listed = self.listed.clone();
-            Box::pin(async move { Ok(listed) })
+            Box::pin(async move { Ok(Leased::new(listed, lease)) })
         }
 
         fn poll_events(
             &mut self,
-            params: PollEventsParams,
+            params: Leased<PollEventsParams>,
             _budget: Duration,
-        ) -> BoxFuture<'_, Result<Value>> {
+        ) -> BoxFuture<'_, Result<Leased<Value>>> {
+            let (params, _params_lease) = params.into_parts();
             self.poll_cursors.push(params.cursor);
             let next = self
                 .polls
                 .pop_front()
                 .unwrap_or_else(|| json!({"events": [], "hasMore": false, "nextPollMs": 1000}));
-            Box::pin(async move { Ok(next) })
+            let lease = self
+                .budget
+                .try_acquire(crate::json::serialized_len(&next).unwrap())
+                .unwrap();
+            Box::pin(async move { Ok(Leased::new(next, lease)) })
         }
 
         fn open_stream(
             &mut self,
-            params: StreamEventsParams,
+            params: Leased<StreamEventsParams>,
             _budget: Duration,
         ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
+            let (params, _params_lease) = params.into_parts();
             self.stream_cursors.push(params.cursor);
             let steps = self.streams.pop_front().unwrap_or_default();
-            Box::pin(
-                async move { Ok(Box::new(MockChannel { steps }) as Box<dyn EventStreamChannel>) },
-            )
+            let budget = self.budget.clone();
+            Box::pin(async move {
+                Ok(Box::new(MockChannel { steps, budget }) as Box<dyn EventStreamChannel>)
+            })
         }
     }
 
@@ -1131,6 +1197,7 @@ mod tests {
             poll_cursors: Vec::new(),
             streams: VecDeque::new(),
             stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
         };
         let mut cfg = base_config(Some(store.clone()));
         cfg.once = true;
@@ -1198,6 +1265,7 @@ mod tests {
                 ]),
             ]),
             stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
         };
 
         let mut cfg = base_config(Some(store.clone()));
@@ -1237,6 +1305,7 @@ mod tests {
                 }),
             ])]),
             stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
         };
 
         let cfg = base_config(None);
@@ -1284,6 +1353,7 @@ mod tests {
                 }),
             ])]),
             stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
         };
 
         let mut cfg = base_config(Some(store.clone()));
@@ -1345,6 +1415,7 @@ mod tests {
                         }),
                     ])]),
                     stream_cursors: vec![],
+                    budget: ByteBudget::new(1 << 20),
                 };
                 let mut cfg = base_config(Some(store.clone()));
                 cfg.mode = mode;
@@ -1380,6 +1451,7 @@ mod tests {
                 poll_cursors: vec![],
                 streams: VecDeque::new(),
                 stream_cursors: vec![],
+                budget: ByteBudget::new(1 << 20),
             };
             let mut cfg = base_config(Some(store.clone()));
             cfg.mode = StreamMode::Poll;
@@ -1403,6 +1475,70 @@ mod tests {
                 "mode={mode:?}"
             );
             assert_eq!(store.read().unwrap().as_deref(), Some("before"));
+        }
+    }
+    #[tokio::test]
+    async fn event_payload_lease_survives_callback_wait_for_push_and_poll() {
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        for mode in [StreamMode::Push, StreamMode::Poll] {
+            for exec_mode in [ExecMode::Oneshot, ExecMode::Stream] {
+                let dir = tempfile::tempdir().unwrap();
+                let ready = dir.path().join("ready");
+                let release = dir.path().join("release");
+                let budget = ByteBudget::new(64 * 1024);
+                let data = "normal event payload".repeat(400);
+                let event = json!({"eventId":"e1","name":"pr.merged","data":data,"cursor":"after"});
+                let mut transport = MockTransport {
+                    listed: vec![],
+                    polls: VecDeque::from([
+                        json!({"events":[event.clone()],"cursor":"after","hasMore":false}),
+                    ]),
+                    poll_cursors: vec![],
+                    streams: VecDeque::from([VecDeque::from([
+                        MockStep::Yield(RawStreamEvent::Notification {
+                            method: "notifications/events/active".into(),
+                            params: Some(json!({"cursor":"before","heartbeatMs":1000})),
+                        }),
+                        MockStep::Yield(RawStreamEvent::Notification {
+                            method: "notifications/events/event".into(),
+                            params: Some(event),
+                        }),
+                    ])]),
+                    stream_cursors: vec![],
+                    budget: budget.clone(),
+                };
+                let mut cfg = base_config(None);
+                cfg.mode = mode;
+                cfg.once = true;
+                cfg.timeout = Some(Duration::from_secs(10));
+                cfg.exec_timeout = Duration::from_secs(10);
+                cfg.exec_mode = exec_mode;
+                cfg.callback_argv = Some(vec![python.clone(), "-c".into(),
+                    "import pathlib,sys,time\nsys.stdin.readline()\npathlib.Path(sys.argv[1]).write_text('ready')\nwhile not pathlib.Path(sys.argv[2]).exists(): time.sleep(.01)\nprint('{\"ok\":true}',flush=True)".into(),
+                    ready.to_string_lossy().into_owned(), release.to_string_lossy().into_owned()]);
+                let run = run_stream(
+                    &mut transport,
+                    &cfg,
+                    fast_timings(),
+                    CancellationToken::new(),
+                    None,
+                );
+                tokio::pin!(run);
+                tokio::select! {
+                    result = &mut run => panic!("callback returned before release: {result:?}"),
+                    observed = timeout(Duration::from_secs(5), async {
+                        while !ready.exists() { sleep(Duration::from_millis(10)).await; }
+                    }) => observed.expect("callback must receive the event"),
+                }
+                assert!(
+                    budget.used() >= data.len(),
+                    "event lost its lease while callback waited: {mode:?}/{exec_mode:?}"
+                );
+                std::fs::write(&release, "continue").unwrap();
+                run.await.unwrap();
+                assert_eq!(budget.used(), 0, "payload lease remained after delivery");
+            }
         }
     }
 }

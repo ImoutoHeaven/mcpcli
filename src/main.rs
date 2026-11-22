@@ -1366,7 +1366,7 @@ async fn run_events_stream(
         .servers
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
-    let parsed_args = if args.is_some() || args_file.is_some() || *stdin {
+    let (parsed_args, input_lease) = if args.is_some() || args_file.is_some() || *stdin {
         let leased = arguments(
             args,
             args_file,
@@ -1376,28 +1376,30 @@ async fn run_events_stream(
         )
         .await?;
         let (map, lease) = leased.into_parts();
-        drop(lease);
-        Some(map)
+        (Some(map), lease)
     } else {
-        None
+        (None, ByteBudget::global().empty_lease())
     };
-    let stream_cfg = StreamConfig {
-        server: server.clone(),
-        event: event.clone(),
-        arguments: parsed_args,
-        mode: (*mode).into(),
-        initial_cursor: cursor.clone(),
-        cursor_file: cursor_file.as_ref().map(CursorStore::new),
-        max_age_ms: *max_age_ms,
-        heartbeat_ms: *heartbeat_ms,
-        once: *once,
-        timeout: cli.timeout.map(Duration::from_millis),
-        callback_argv: (!callback.is_empty()).then(|| callback.clone()),
-        exec_mode: (*exec_mode).into(),
-        exec_timeout: exec_timeout
-            .map(Duration::from_millis)
-            .unwrap_or(DEFAULT_EXEC_TIMEOUT),
-    };
+    let stream_cfg = Leased::new(
+        StreamConfig {
+            server: server.clone(),
+            event: event.clone(),
+            arguments: parsed_args,
+            mode: (*mode).into(),
+            initial_cursor: cursor.clone(),
+            cursor_file: cursor_file.as_ref().map(CursorStore::new),
+            max_age_ms: *max_age_ms,
+            heartbeat_ms: *heartbeat_ms,
+            once: *once,
+            timeout: cli.timeout.map(Duration::from_millis),
+            callback_argv: (!callback.is_empty()).then(|| callback.clone()),
+            exec_mode: (*exec_mode).into(),
+            exec_timeout: exec_timeout
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_EXEC_TIMEOUT),
+        },
+        input_lease,
+    );
 
     if cli.oneshot {
         let connect_budget = stream_cfg

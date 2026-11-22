@@ -212,6 +212,25 @@ impl App {
         Ok(())
     }
 
+    fn event_arguments_lease(
+        &self,
+        event: &str,
+        arguments: &Option<serde_json::Map<String, Value>>,
+        cursor: &Option<String>,
+    ) -> std::result::Result<ByteLease, Failure> {
+        let bytes = crate::json::serialized_len(arguments)
+            .map_err(|_| Failure::new(2, "invalid_arguments", "cannot encode event arguments"))?
+            .saturating_add(event.len())
+            .saturating_add(cursor.as_ref().map_or(0, String::len));
+        self.options.budget.try_acquire(bytes).ok_or_else(|| {
+            Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "event arguments exceed the active memory limit",
+            )
+        })
+    }
+
     fn stream_frame(&self, kind: StreamFrameKind) -> StreamFrame {
         StreamFrame {
             protocol: ipc::PROTOCOL,
@@ -352,6 +371,7 @@ impl App {
                         "request deadline exceeded before dispatch",
                     ));
                 }
+                let _params_lease = self.event_arguments_lease(event, arguments, cursor)?;
                 let params = PollEventsParams {
                     name: event.clone(),
                     arguments: arguments.clone(),
@@ -750,6 +770,13 @@ async fn handle_events_stream(
         return;
     }
 
+    let params_lease = match app.event_arguments_lease(event, arguments, cursor) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = write_stream_frame(&mut writer, &app, StreamFrameKind::Error { error }).await;
+            return;
+        }
+    };
     let params = StreamEventsParams {
         name: event.clone(),
         arguments: arguments.clone(),
@@ -774,6 +801,7 @@ async fn handle_events_stream(
         }
     };
 
+    drop(params_lease);
     let (stream_handle, mut rx) = match open_result {
         Ok(pair) => pair,
         Err(error) => {
@@ -852,8 +880,6 @@ async fn handle_events_stream(
             method: notif.method,
             params: notif.params,
         };
-        drop(notif_lease);
-
         let write_ok = tokio::select! {
             biased;
             _ = reader.read(&mut extra) => {
@@ -862,6 +888,7 @@ async fn handle_events_stream(
             }
             res = write_stream_frame(&mut writer, &app, kind) => res.is_ok(),
         };
+        drop(notif_lease);
         if !write_ok {
             let _ = stream_handle.cancel().await;
             return;
