@@ -12,6 +12,7 @@ parser.add_argument("--log", required=True)
 parser.add_argument("--discover-delay", type=float, default=0)
 parser.add_argument("--list-delay", type=float, default=0)
 parser.add_argument("--event-delay", type=float, default=0)
+parser.add_argument("--payload-bytes", type=int, default=0)
 args = parser.parse_args()
 output_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -64,7 +65,7 @@ def handle(request):
             send({"jsonrpc": "2.0", "method": "notifications/events/event",
                   "params": {"name": "test.event", "eventId": "one",
                              "timestamp": "2026-11-22T00:00:00Z",
-                             "data": {"message": "ordinary event"}, "cursor": "after", "_meta": meta}})
+                             "data": {"message": "ordinary event 中文 😀", "padding": "x" * args.payload_bytes}, "cursor": "after", "_meta": meta}})
             record("delivered", request_id=request["id"])
     else:
         send({"jsonrpc": "2.0", "id": request["id"],

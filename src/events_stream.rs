@@ -18,11 +18,14 @@ use std::{
     collections::hash_map::RandomState,
     future::Future,
     hash::{BuildHasher, Hasher},
-    io::Write,
+    io::{self, Write},
     pin::Pin,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::time::{Instant, sleep, timeout};
+use tokio::{
+    io::{AsyncWrite, AsyncWriteExt},
+    time::{Instant, sleep, timeout},
+};
 use tokio_util::sync::CancellationToken;
 
 pub const ACTIVE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -428,32 +431,43 @@ fn select_auto_mode(events: &[Value], event_name: &str) -> StreamMode {
     StreamMode::Push
 }
 
+fn check_running(deadline: Option<Instant>, cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Failure::new(130, "cancelled", "interrupted").into());
+    }
+    if deadline.is_some_and(|dl| Instant::now() >= dl) {
+        return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into());
+    }
+    Ok(())
+}
+
+async fn wait_for_command<T>(
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T> {
+    check_running(deadline, cancel)?;
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return Err(Failure::new(130, "cancelled", "interrupted").into()),
+        _ = async {
+            match deadline {
+                Some(dl) => tokio::time::sleep_until(dl).await,
+                None => std::future::pending::<()>().await,
+            }
+        } => return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into()),
+        result = future => result,
+    };
+    check_running(deadline, cancel)?;
+    Ok(result)
+}
+
 async fn sleep_interruptible(
     duration: Duration,
     deadline: Option<Instant>,
     cancel: &CancellationToken,
 ) -> Result<()> {
-    let wait = match deadline {
-        Some(dl) => {
-            let rem = dl.saturating_duration_since(Instant::now());
-            if rem.is_zero() {
-                return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into());
-            }
-            duration.min(rem)
-        }
-        None => duration,
-    };
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(Failure::new(130, "cancelled", "interrupted").into()),
-        _ = sleep(wait) => {
-            if deadline.is_some_and(|dl| Instant::now() >= dl) {
-                Err(Failure::new(5, "timeout", "event stream timeout exceeded").into())
-            } else {
-                Ok(())
-            }
-        }
-    }
+    wait_for_command(deadline, cancel, sleep(duration)).await
 }
 
 fn remaining_budget(default: Duration, deadline: Option<Instant>) -> Result<Duration> {
@@ -470,25 +484,101 @@ fn remaining_budget(default: Duration, deadline: Option<Instant>) -> Result<Dura
     }
 }
 
-/// Keep bootstrap and discovery inside the foreground command's original deadline.
+/// Keep each complete operation inside the foreground command's original deadline.
 pub async fn wait_with_budget<T>(
     maximum: Duration,
     deadline: Option<Instant>,
     cancel: &CancellationToken,
     future: impl Future<Output = Result<T>>,
 ) -> Result<T> {
-    let budget = remaining_budget(maximum, deadline)?;
-    tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Err(Failure::new(130, "cancelled", "interrupted").into()),
-        result = timeout(budget, future) => result
-            .map_err(|_| Failure::new(5, "timeout", "event stream timeout exceeded"))?,
+    wait_for_command(deadline, cancel, timeout(maximum, future))
+        .await?
+        .map_err(|_| Failure::new(5, "timeout", "event stream timeout exceeded"))?
+}
+
+fn write_stdout_line(line: &str) -> io::Result<()> {
+    // A blocked write must not hold Rust's global stdout lock during process shutdown.
+    #[cfg(unix)]
+    let mut stdout = {
+        use std::os::fd::AsFd;
+        std::fs::File::from(std::io::stdout().as_fd().try_clone_to_owned()?)
+    };
+    #[cfg(windows)]
+    let mut stdout = {
+        use std::os::windows::io::AsHandle;
+        std::fs::File::from(std::io::stdout().as_handle().try_clone_to_owned()?)
+    };
+    #[cfg(windows)]
+    {
+        use std::{io::IsTerminal, os::windows::io::AsRawHandle};
+        use windows_sys::Win32::System::Console::WriteConsoleW;
+
+        if stdout.is_terminal() {
+            let mut chars = line.chars().peekable();
+            let mut buffer = [0u16; 1024];
+            while chars.peek().is_some() {
+                let mut len = 0;
+                while let Some(ch) = chars.peek() {
+                    let needed = ch.len_utf16();
+                    if len + needed > buffer.len() {
+                        break;
+                    }
+                    chars.next().unwrap().encode_utf16(&mut buffer[len..]);
+                    len += needed;
+                }
+                let mut written = 0;
+                while written < len {
+                    let mut count = 0;
+                    // SAFETY: stdout owns the console handle and the UTF-16 slice is valid
+                    // for the synchronous call. The fixed scratch buffer adds no heap copy.
+                    let ok = unsafe {
+                        WriteConsoleW(
+                            stdout.as_raw_handle(),
+                            buffer[written..len].as_ptr(),
+                            (len - written) as u32,
+                            &mut count,
+                            std::ptr::null(),
+                        )
+                    };
+                    if ok == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    if count == 0 {
+                        return Err(io::ErrorKind::WriteZero.into());
+                    }
+                    written += count as usize;
+                }
+            }
+            return Ok(());
+        }
     }
+    stdout.write_all(line.as_bytes())?;
+    stdout.flush()
+}
+
+async fn write_blocking(
+    line: Leased<String>,
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
+    write: impl FnOnce(&str) -> io::Result<()> + Send + 'static,
+) -> Result<()> {
+    let worker_cancel = cancel.clone();
+    wait_for_command(deadline, cancel, async move {
+        // Cancellation stops waiting; the worker retains its buffer and lease until I/O ends.
+        tokio::task::spawn_blocking(move || {
+            check_running(deadline, &worker_cancel)?;
+            write(&line)?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await?
+    })
+    .await??;
+    Ok(())
 }
 
 struct Sink<'a> {
     executor: Option<CallbackExecutor>,
-    stdout: Option<&'a mut (dyn Write + Send)>,
+    stdout: Option<&'a mut (dyn AsyncWrite + Unpin + Send)>,
 }
 
 impl<'a> Sink<'a> {
@@ -499,6 +589,7 @@ impl<'a> Sink<'a> {
         deadline: Option<Instant>,
         cancel: &CancellationToken,
     ) -> Result<()> {
+        check_running(deadline, cancel)?;
         let budget = ByteBudget::global();
         let (mut bytes, mut lease) =
             crate::ipc::encode_json_leased(payload, crate::ipc::RESPONSE_LIMIT, budget)?;
@@ -515,38 +606,20 @@ impl<'a> Sink<'a> {
         let line = Leased::new(String::from_utf8(bytes).expect("JSON is UTF-8"), lease);
         let Some(executor) = self.executor.as_mut() else {
             if let Some(writer) = self.stdout.as_mut() {
-                writer.write_all(line.as_bytes())?;
-                writer.flush()?;
+                wait_for_command(deadline, cancel, async {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.flush().await
+                })
+                .await??;
             } else {
-                let mut stdout = std::io::stdout().lock();
-                stdout.write_all(line.as_bytes())?;
-                stdout.flush()?;
+                write_blocking(line, deadline, cancel, write_stdout_line).await?;
             }
-            return Ok(());
+            return check_running(deadline, cancel);
         };
 
         let mut backoff = timings.initial_backoff;
         loop {
-            if cancel.is_cancelled() {
-                return Err(Failure::new(130, "cancelled", "interrupted").into());
-            }
-            if deadline.is_some_and(|dl| Instant::now() >= dl) {
-                return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into());
-            }
-            let deliver_res = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    return Err(Failure::new(130, "cancelled", "interrupted").into());
-                }
-                _ = async {
-                    match deadline {
-                        Some(dl) => tokio::time::sleep_until(dl).await,
-                        None => std::future::pending::<()>().await,
-                    }
-                } => return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into()),
-                res = executor.deliver(&line) => res,
-            };
-            match deliver_res {
+            match wait_for_command(deadline, cancel, executor.deliver(&line)).await? {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     eprintln!(
@@ -571,7 +644,10 @@ fn persist_cursor(
     cursor_store: Option<&CursorStore>,
     current: &mut Option<String>,
     candidate: Option<&str>,
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
 ) -> Result<()> {
+    check_running(deadline, cancel)?;
     if current.as_deref() == candidate {
         return Ok(());
     }
@@ -599,9 +675,10 @@ pub async fn run_stream<T: EventTransport>(
     config: &StreamConfig,
     timings: StreamTimings,
     cancel: CancellationToken,
-    stdout_override: Option<&mut (dyn Write + Send)>,
+    stdout_override: Option<&mut (dyn AsyncWrite + Unpin + Send)>,
 ) -> Result<()> {
     let deadline = config.deadline;
+    check_running(deadline, &cancel)?;
     let mut current_cursor = match (&config.initial_cursor, &config.cursor_file) {
         (Some(c), _) => Some(c.clone()),
         (None, Some(store)) => store.read()?,
@@ -649,14 +726,15 @@ async fn run_stream_inner<T: EventTransport>(
         StreamMode::Poll => StreamMode::Poll,
         StreamMode::Auto => {
             let list_budget = remaining_budget(timings.handshake_timeout, deadline)?;
-            match wait_with_budget(
+            let listed = wait_with_budget(
                 list_budget,
                 deadline,
                 cancel,
                 transport.list_events(list_budget),
             )
-            .await
-            {
+            .await;
+            check_running(deadline, cancel)?;
+            match listed {
                 Ok(events) => select_auto_mode(&events, &config.event),
                 Err(err) if is_fatal_error(&err) => return Err(err),
                 Err(_) => StreamMode::Push,
@@ -730,11 +808,14 @@ async fn run_poll_loop<T: EventTransport>(
             max_events: config.once.then_some(1),
         };
         let params = Leased::new(params, params_lease);
-        let polled = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Failure::new(130, "cancelled", "interrupted").into()),
-            res = transport.poll_events(params, poll_budget) => res,
-        };
+        let polled = wait_with_budget(
+            poll_budget,
+            deadline,
+            cancel,
+            transport.poll_events(params, poll_budget),
+        )
+        .await;
+        check_running(deadline, cancel)?;
         let response = match polled {
             Ok(val) => {
                 backoff = timings.initial_backoff;
@@ -800,11 +881,13 @@ async fn run_poll_loop<T: EventTransport>(
                 config.cursor_file.as_ref(),
                 current_cursor,
                 batch.1.as_str(),
+                deadline,
+                cancel,
             )?;
         }
 
         if config.once && delivered_any {
-            return Ok(());
+            return check_running(deadline, cancel);
         }
         drop(batch);
 
@@ -844,11 +927,14 @@ async fn run_push_loop<T: EventTransport>(
             heartbeat_ms: config.heartbeat_ms,
         };
         let params = Leased::new(params, params_lease);
-        let open_res = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => return Err(Failure::new(130, "cancelled", "interrupted").into()),
-            res = transport.open_stream(params, open_budget) => res,
-        };
+        let open_res = wait_with_budget(
+            open_budget,
+            deadline,
+            cancel,
+            transport.open_stream(params, open_budget),
+        )
+        .await;
+        check_running(deadline, cancel)?;
         let mut channel = match open_res {
             Ok(ch) => ch,
             Err(err) if is_fatal_error(&err) => return Err(err),
@@ -882,14 +968,16 @@ async fn run_push_loop<T: EventTransport>(
                 }
             };
 
-            let frame_res = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    channel.close().await;
-                    return Err(Failure::new(130, "cancelled", "interrupted").into());
-                }
-                res = timeout(step_wait, channel.next_item()) => res,
-            };
+            let frame_res =
+                match wait_for_command(deadline, cancel, timeout(step_wait, channel.next_item()))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        channel.close().await;
+                        return Err(err);
+                    }
+                };
 
             let item = match frame_res {
                 Err(_) => {
@@ -984,9 +1072,13 @@ async fn run_push_loop<T: EventTransport>(
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
                         .and_then(Value::as_str);
-                    if let Err(err) =
-                        persist_cursor(config.cursor_file.as_ref(), current_cursor, cursor)
-                    {
+                    if let Err(err) = persist_cursor(
+                        config.cursor_file.as_ref(),
+                        current_cursor,
+                        cursor,
+                        deadline,
+                        cancel,
+                    ) {
                         channel.close().await;
                         return Err(err);
                     }
@@ -996,9 +1088,13 @@ async fn run_push_loop<T: EventTransport>(
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
                         .and_then(Value::as_str);
-                    if let Err(err) =
-                        persist_cursor(config.cursor_file.as_ref(), current_cursor, cursor)
-                    {
+                    if let Err(err) = persist_cursor(
+                        config.cursor_file.as_ref(),
+                        current_cursor,
+                        cursor,
+                        deadline,
+                        cancel,
+                    ) {
                         channel.close().await;
                         return Err(err);
                     }
@@ -1018,13 +1114,16 @@ async fn run_push_loop<T: EventTransport>(
                         config.cursor_file.as_ref(),
                         current_cursor,
                         payload.get("cursor").and_then(Value::as_str),
+                        deadline,
+                        cancel,
                     ) {
                         channel.close().await;
                         return Err(err);
                     }
                     if config.once {
+                        let outcome = check_running(deadline, cancel);
                         channel.close().await;
-                        return Ok(());
+                        return outcome;
                     }
                 }
                 "notifications/events/error" => {
@@ -1562,6 +1661,269 @@ mod tests {
                 run.await.unwrap();
                 assert_eq!(budget.used(), 0, "payload lease remained after delivery");
             }
+        }
+    }
+    struct DelayedTransport {
+        inner: MockTransport,
+        phase: StreamMode,
+        delay: Duration,
+    }
+
+    impl EventTransport for DelayedTransport {
+        fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>> {
+            let wait = (self.phase == StreamMode::Auto).then_some(self.delay);
+            let future = self.inner.list_events(budget);
+            Box::pin(async move {
+                let result = future.await;
+                if let Some(wait) = wait {
+                    sleep(wait).await;
+                }
+                result
+            })
+        }
+
+        fn poll_events(
+            &mut self,
+            params: Leased<PollEventsParams>,
+            budget: Duration,
+        ) -> BoxFuture<'_, Result<Leased<Value>>> {
+            let wait = (self.phase == StreamMode::Poll).then_some(self.delay);
+            let future = self.inner.poll_events(params, budget);
+            Box::pin(async move {
+                let result = future.await;
+                if let Some(wait) = wait {
+                    sleep(wait).await;
+                }
+                result
+            })
+        }
+
+        fn open_stream(
+            &mut self,
+            params: Leased<StreamEventsParams>,
+            budget: Duration,
+        ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
+            let wait = (self.phase == StreamMode::Push).then_some(self.delay);
+            let future = self.inner.open_stream(params, budget);
+            Box::pin(async move {
+                let result = future.await;
+                if let Some(wait) = wait {
+                    sleep(wait).await;
+                }
+                result
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_transport_waits_obey_deadline_and_cancel_before_delivery() {
+        for mode in [StreamMode::Auto, StreamMode::Poll, StreamMode::Push] {
+            for interrupted in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = CursorStore::new(dir.path().join("cursor"));
+                store.write("before").unwrap();
+                let budget = ByteBudget::new(1 << 20);
+                let mut transport = DelayedTransport {
+                    inner: MockTransport {
+                        listed: vec![json!({"name": "pr.merged", "delivery": ["poll"]})],
+                        polls: VecDeque::from([json!({
+                            "events": [{"eventId": "one", "name": "pr.merged", "data": {}}],
+                            "cursor": "after", "hasMore": false
+                        })]),
+                        poll_cursors: vec![],
+                        streams: VecDeque::new(),
+                        stream_cursors: vec![],
+                        budget: budget.clone(),
+                    },
+                    phase: mode,
+                    delay: Duration::from_secs(5),
+                };
+                let cancel = CancellationToken::new();
+                let mut cfg = base_config(Some(store.clone()));
+                cfg.mode = mode;
+                cfg.once = true;
+                cfg.deadline = if interrupted {
+                    None
+                } else {
+                    Some(Instant::now() + Duration::from_millis(40))
+                };
+                let cancellation = async {
+                    if interrupted {
+                        sleep(Duration::from_millis(40)).await;
+                        cancel.cancel();
+                    }
+                };
+                let mut output = Vec::new();
+                let started = Instant::now();
+                let (result, ()) = tokio::join!(
+                    run_stream(
+                        &mut transport,
+                        &cfg,
+                        StreamTimings::default(),
+                        cancel.clone(),
+                        Some(&mut output)
+                    ),
+                    cancellation
+                );
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Failure>().unwrap().code,
+                    if interrupted { 130 } else { 5 },
+                    "{mode:?}"
+                );
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "{mode:?} did not stop its wait"
+                );
+                assert!(output.is_empty(), "{mode:?} delivered a late response");
+                assert_eq!(store.read().unwrap().as_deref(), Some("before"));
+                assert_eq!(budget.used(), 0, "{mode:?} retained a cancelled response");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_results_are_rechecked_before_confirmation() {
+        let cancel = CancellationToken::new();
+        let error = wait_for_command(None, &cancel, async {
+            cancel.cancel();
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().code, 130);
+
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let error = wait_for_command(Some(deadline), &cancel, async {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().code, 5);
+    }
+
+    #[tokio::test]
+    async fn blocking_output_retains_lease_until_writer_finishes_after_cancellation() {
+        let budget = ByteBudget::new(1024);
+        let line = "{\"data\":\"ordinary event\"}\n".to_owned();
+        let bytes = line.capacity();
+        let line = Leased::new(line, budget.try_acquire(bytes).unwrap());
+        let cancel = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writing = write_blocking(line, None, &cancel, move |line| {
+            assert!(line.ends_with('\n'));
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            Ok(())
+        });
+        tokio::pin!(writing);
+        tokio::select! {
+            result = &mut writing => panic!("write finished before release: {result:?}"),
+            result = started_rx => result.unwrap(),
+        }
+        cancel.cancel();
+        let error = writing.await.unwrap_err();
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().code, 130);
+        assert_eq!(
+            budget.used(),
+            bytes,
+            "cancelled waiter dropped the writer's lease"
+        );
+        release_tx.send(()).unwrap();
+        timeout(Duration::from_secs(2), async {
+            while budget.used() != 0 {
+                sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("finished writer must release its lease");
+    }
+
+    #[tokio::test]
+    async fn asynchronous_output_backpressure_does_not_commit_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = CursorStore::new(dir.path().join("cursor"));
+        store.write("before").unwrap();
+        let mut transport = MockTransport {
+            listed: vec![],
+            polls: VecDeque::from([json!({
+                "events": [{"eventId": "one", "name": "pr.merged", "data": "normal".repeat(100)}],
+                "cursor": "after", "hasMore": false
+            })]),
+            poll_cursors: vec![],
+            streams: VecDeque::new(),
+            stream_cursors: vec![],
+            budget: ByteBudget::new(1 << 20),
+        };
+        let mut cfg = base_config(Some(store.clone()));
+        cfg.mode = StreamMode::Poll;
+        cfg.once = true;
+        cfg.deadline = Some(Instant::now() + Duration::from_millis(40));
+        let (mut output, _reader) = tokio::io::duplex(8);
+        let error = run_stream(
+            &mut transport,
+            &cfg,
+            fast_timings(),
+            CancellationToken::new(),
+            Some(&mut output),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().code, 5);
+        assert_eq!(store.read().unwrap().as_deref(), Some("before"));
+    }
+    #[tokio::test]
+    async fn confirmed_callback_success_survives_bounded_eof_cleanup() {
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        for mode in [StreamMode::Poll, StreamMode::Push] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = CursorStore::new(dir.path().join("cursor"));
+            store.write("before").unwrap();
+            let event =
+                json!({"eventId": "one", "name": "pr.merged", "data": {}, "cursor": "after"});
+            let mut transport = MockTransport {
+                listed: vec![],
+                polls: VecDeque::from([json!({
+                    "events": [event.clone()], "cursor": "after", "hasMore": false
+                })]),
+                poll_cursors: vec![],
+                streams: VecDeque::from([VecDeque::from([
+                    MockStep::Yield(RawStreamEvent::Notification {
+                        method: "notifications/events/active".into(),
+                        params: Some(json!({"cursor": "before", "heartbeatMs": 1000})),
+                    }),
+                    MockStep::Yield(RawStreamEvent::Notification {
+                        method: "notifications/events/event".into(),
+                        params: Some(event),
+                    }),
+                ])]),
+                stream_cursors: vec![],
+                budget: ByteBudget::new(1 << 20),
+            };
+            let mut cfg = base_config(Some(store.clone()));
+            cfg.mode = mode;
+            cfg.once = true;
+            cfg.deadline = Some(Instant::now() + Duration::from_secs(1));
+            cfg.exec_mode = ExecMode::Stream;
+            cfg.callback_argv = Some(vec![
+                python.clone(), "-c".into(),
+                "import sys,time; sys.stdin.readline(); print('{\"ok\":true}',flush=True); sys.stdin.read(); time.sleep(1.2)".into(),
+            ]);
+            run_stream(
+                &mut transport,
+                &cfg,
+                fast_timings(),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert!(
+                Instant::now() >= cfg.deadline.unwrap(),
+                "cleanup must cross the business deadline"
+            );
+            assert_eq!(store.read().unwrap().as_deref(), Some("after"));
         }
     }
 }

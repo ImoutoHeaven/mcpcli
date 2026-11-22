@@ -569,13 +569,13 @@ def stdin_deadline(f):
     assert not f.events("call")
 
 
-def configure_events(f, discover_delay=0, list_delay=0, event_delay=0):
+def configure_events(f, discover_delay=0, list_delay=0, event_delay=0, payload_bytes=0):
     script = f.script.with_name("events_server.py")
     f.settings["servers"] = {"state": {
         "transport": "stdio", "command": sys.executable,
         "args": [str(script), "--log", str(f.log),
                  "--discover-delay", str(discover_delay), "--list-delay", str(list_delay),
-                 "--event-delay", str(event_delay)],
+                 "--event-delay", str(event_delay), "--payload-bytes", str(payload_bytes)],
     }}
     f.save_config()
 
@@ -603,6 +603,44 @@ def events_deadline_spans_bootstrap_and_callback(f):
     assert marker.exists(), "callback did not start"
     assert not result.stdout and error_value(result)["kind"] == "timeout"
     assert cursor.read_text(encoding="utf-8") == "before", "unconfirmed event advanced the cursor"
+
+
+
+def events_stdout_backpressure_is_interruptible(f):
+    configure_events(f, payload_bytes=512 * 1024)
+    cursor = f.root / "cursor"
+    signals = [(signal.CTRL_BREAK_EVENT, 143)] if WINDOWS else [(signal.SIGINT, 130)]
+    for signum, expected in [(None, 5), *signals]:
+        cursor.write_text("before", encoding="utf-8")
+        previous = len(f.events("delivered"))
+        process = f.start("--oneshot", "events", "stream", "state", "test.event",
+                          "--mode", "push", "--once", "--cursor-file", str(cursor),
+                          timeout=3000 if signum is None else 10000,
+                          signal_console=signum is not None)
+        wait_for(lambda: len(f.events("delivered")) > previous,
+                 "stdout test never reached event delivery", seconds=5)
+        prefix = []
+        first_byte = threading.Thread(target=lambda: prefix.append(process.stdout.read(1)), daemon=True)
+        first_byte.start()
+        first_byte.join(timeout=2)
+        assert prefix == ["{"], "event output never started"
+        if signum is not None:
+            interrupt(process, signum)
+        assert process.wait(timeout=7) == expected, "blocked stdout prevented foreground exit"
+        assert cursor.read_text(encoding="utf-8") == "before", "blocked output advanced the cursor"
+        # Read only after process exit; resuming earlier could hide a stdout shutdown lock.
+        stdout, stderr = process.communicate(timeout=3)
+        assert "\n" not in "".join(prefix) + stdout, "test output did not encounter backpressure"
+        assert error_value(subprocess.CompletedProcess([], expected, stdout, stderr))["kind"] == (
+            "timeout" if signum is None else "cancelled"
+        )
+
+
+def events_stdout_preserves_unicode(f):
+    configure_events(f)
+    result = f.invoke("--oneshot", "events", "stream", "state", "test.event",
+                      "--mode", "push", "--once", timeout=5000)
+    assert json.loads(result.stdout)["data"]["message"] == "ordinary event 中文 😀"
 
 
 def events_stdin_deadline(f):
@@ -1043,6 +1081,7 @@ CASES = [
     interrupted_stdin, stdin_deadline, configuration_errors_redact_values,
     events_deadline_spans_bootstrap, events_deadline_spans_bootstrap_and_callback,
     events_stdin_deadline, events_interrupts_bootstrap_and_active,
+    events_stdout_backpressure_is_interruptible, events_stdout_preserves_unicode,
     oneshot_signals_clean_process_group, saturated_control_channel,
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
