@@ -81,6 +81,7 @@ struct BoundedSseStream<S> {
     budget: Arc<ByteBudget>,
     ingress: Ingress,
     termination: Arc<TransportTermination>,
+    strip_sse_id: bool,
     bom: BomState,
     skip_leading_lf: bool,
     line_buf: Vec<u8>,
@@ -99,6 +100,7 @@ impl<S> BoundedSseStream<S> {
         budget: Arc<ByteBudget>,
         ingress: Ingress,
         termination: Arc<TransportTermination>,
+        strip_sse_id: bool,
     ) -> Self {
         let line_lease = budget.empty_lease();
         let current_lease = budget.empty_lease();
@@ -108,6 +110,7 @@ impl<S> BoundedSseStream<S> {
             budget,
             ingress,
             termination,
+            strip_sse_id,
             bom: BomState::Start,
             skip_leading_lf: false,
             line_buf: Vec::new(),
@@ -184,6 +187,10 @@ impl<S> BoundedSseStream<S> {
     fn dispatch_event(&mut self) -> Result<(), SseError> {
         self.current_raw_bytes = 0;
         if let Some(mut sse) = self.current.take() {
+            if self.strip_sse_id {
+                // Disable rmcp's automatic GET + Last-Event-Id reconnection on events/stream.
+                sse.id = None;
+            }
             let mut lease = self.current_lease.take();
             lease.shrink_to(sse_retained_capacity(&sse));
             match self
@@ -491,8 +498,17 @@ pub(super) fn bounded_stream(
     budget: Arc<ByteBudget>,
     ingress: Ingress,
     termination: Arc<TransportTermination>,
+    strip_sse_id: bool,
 ) -> BoxStream<'static, Result<Sse, SseError>> {
-    BoundedSseStream::new(response.bytes_stream(), limit, budget, ingress, termination).boxed()
+    BoundedSseStream::new(
+        response.bytes_stream(),
+        limit,
+        budget,
+        ingress,
+        termination,
+        strip_sse_id,
+    )
+    .boxed()
 }
 
 #[cfg(test)]
@@ -513,6 +529,7 @@ mod tests {
             budget,
             ingress,
             termination,
+            false,
         )
     }
 
@@ -542,6 +559,7 @@ mod tests {
                     budget.clone(),
                     Ingress::default(),
                     term.clone(),
+                    false,
                 );
                 let event = stream.next().await.unwrap();
                 if bytes <= MAX_SSE_ID_BYTES {
@@ -826,5 +844,32 @@ mod tests {
                 .contains("active memory limit")
         );
         assert_eq!(tight.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn strip_sse_id_clears_id_and_releases_budget_for_events_stream() {
+        let budget = ByteBudget::new(4096);
+        let term = Arc::new(TransportTermination::default());
+        let source = futures_util::stream::iter(
+            vec![Ok::<_, std::io::Error>(
+                &b"id: evt-42\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/events/heartbeat\",\"params\":{\"cursor\":\"1:1\"}}\n\n"[..],
+            )],
+        );
+        let mut stream = BoundedSseStream::new(
+            source,
+            4096,
+            budget.clone(),
+            Ingress::default(),
+            term.clone(),
+            true,
+        );
+        let ev = stream.next().await.unwrap().unwrap();
+        assert_eq!(ev.id, None);
+        assert_eq!(ev.event.as_deref(), Some("message"));
+        assert!(ev.data.as_deref().unwrap().contains("notifications/events/heartbeat"));
+        drop(ev);
+        assert!(stream.next().await.is_none());
+        assert!(!term.is_terminated());
+        assert_eq!(budget.used(), 0);
     }
 }

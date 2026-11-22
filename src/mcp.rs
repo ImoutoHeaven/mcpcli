@@ -19,13 +19,14 @@ use rmcp::{
     RoleClient,
     model::{
         CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig,
-        ClientJsonRpcMessage, ClientRequest, ClientResult, ElicitResult, ElicitationAction,
-        ErrorCode, ErrorData, Implementation, PaginatedRequestParams, ProtocolVersion,
-        ServerJsonRpcMessage, ServerNotification, ServerRequest,
+        ClientJsonRpcMessage, ClientRequest, ClientResult, CustomRequest, CustomResult,
+        ElicitResult, ElicitationAction, ErrorCode, ErrorData, ExtensionCapabilities,
+        Implementation, PaginatedRequestParams, ProtocolVersion, ServerJsonRpcMessage,
+        ServerNotification, ServerRequest, ServerResult,
     },
     service::{
         ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer,
-        QuitReason, RequestContext, RunningService, Service, ServiceError,
+        PeerRequestOptions, QuitReason, RequestContext, RunningService, Service, ServiceError,
     },
     transport::{
         Transport,
@@ -50,8 +51,14 @@ use crate::{
     config::ServerConfig,
 };
 
+mod events;
 mod ingress;
 mod sse;
+pub use events::{
+    EVENTS_EXTENSION_ID, EventNotification, EventStreamHandle, EventStreamReceiver,
+    MAX_EVENT_NOTIFICATION_BYTES, MAX_EVENT_PAGES, PollEventsParams, StreamEventsParams,
+};
+use events::{EventNotificationTransport, EventRouter, EventSchemaCache};
 use ingress::{Ingress, IngressError, ObserveOutcome};
 #[cfg(windows)]
 mod windows_job;
@@ -362,8 +369,12 @@ struct Handler {
 
 impl Service<RoleClient> for Handler {
     fn get_info(&self) -> ClientConfig {
+        let mut extensions = ExtensionCapabilities::new();
+        extensions.insert(EVENTS_EXTENSION_ID.to_owned(), Map::new());
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.extensions = Some(extensions);
         ClientConfig::new(
-            ClientCapabilities::default(),
+            capabilities,
             Implementation::new("mcpcli", env!("CARGO_PKG_VERSION")),
         )
     }
@@ -423,6 +434,8 @@ pub struct McpConnection {
     service: Option<RunningService<RoleClient, Handler>>,
     peer: Peer<RoleClient>,
     ingress: Ingress,
+    event_router: EventRouter,
+    event_schemas: EventSchemaCache,
     termination: Arc<TransportTermination>,
     limits: McpLimits,
     server: Leased<Vec<u8>>,
@@ -445,6 +458,8 @@ impl McpConnection {
         let tools_changed = Arc::new(AtomicBool::new(false));
         let cleanup = CleanupState::default();
         let ingress = Ingress::default();
+        let event_router = EventRouter::new(limits.budget.clone());
+        let event_schemas = EventSchemaCache::default();
         let termination = Arc::new(TransportTermination::default());
         let _capture = ingress.capture().ok_or_else(busy_capture)?;
         let handler = Handler {
@@ -482,6 +497,11 @@ impl McpConnection {
                             format!("Cannot start MCP server: {e}"),
                         )
                     })?;
+                    let transport = EventNotificationTransport::new(
+                        transport,
+                        event_router.clone(),
+                        termination.clone(),
+                    );
                     let serve = handler.serve_with_lifecycle(transport, lifecycle);
                     tokio::select! {
                         biased;
@@ -540,11 +560,17 @@ impl McpConnection {
                             client,
                             cleanup: cleanup.clone(),
                             ingress: ingress.clone(),
+                            event_schemas: event_schemas.clone(),
                             termination: termination.clone(),
                             max_response_bytes: limits.max_response_bytes,
                             budget: limits.budget.clone(),
                         },
                         transport_config,
+                    );
+                    let transport = EventNotificationTransport::new(
+                        transport,
+                        event_router.clone(),
+                        termination.clone(),
                     );
                     let serve = handler.serve_with_lifecycle(transport, lifecycle);
                     tokio::select! {
@@ -584,6 +610,8 @@ impl McpConnection {
         drop(result_lease);
         Ok(Self {
             ingress,
+            event_router,
+            event_schemas,
             termination,
             limits,
             server: Leased::new(server_bytes, server_lease),
@@ -948,6 +976,285 @@ impl McpConnection {
         }
     }
 
+    pub fn supports_events(&self) -> bool {
+        self.check_events_support().is_ok()
+    }
+
+    pub fn check_events_support(&self) -> Result<()> {
+        events::check_events_capability(self.peer.peer_info().as_deref())
+    }
+
+    pub async fn list_events(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
+        self.check_events_support()?;
+        if self.termination.is_terminated() {
+            self.abort_service();
+            return Err(self.termination.failure(false));
+        }
+        self.termination.clear_transient();
+        let listing = async {
+            let mut events = Vec::new();
+            let mut lease = self.limits.budget.empty_lease();
+            let mut schemas = HashMap::new();
+            let mut cursors = HashSet::new();
+            let mut cursor: Option<String> = None;
+
+            for _ in 0..MAX_EVENT_PAGES {
+                let params = cursor.take().map(|c| {
+                    let mut map = Map::new();
+                    map.insert("cursor".into(), Value::String(c));
+                    Value::Object(map)
+                });
+                let request =
+                    ClientRequest::CustomRequest(CustomRequest::new("events/list", params));
+                let send_fut = self.peer.send_request(request);
+                let result = tokio::select! {
+                    biased;
+                    res = send_fut => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
+                    () = self.termination.cancelled() => {
+                        self.abort_service();
+                        return Err(self.termination.failure(false));
+                    }
+                };
+                let ServerResult::CustomResult(CustomResult(mut page)) = result else {
+                    return Err(failure(
+                        FailureKind::Protocol,
+                        "MCP server returned an unexpected events/list response",
+                    ));
+                };
+                let next_cursor = page
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let page_events = page
+                    .get_mut("events")
+                    .and_then(Value::as_array_mut)
+                    .map(std::mem::take)
+                    .unwrap_or_default();
+                for event in page_events {
+                    if let Some(schema) = event.get("inputSchema").and_then(Value::as_object) {
+                        if events::validate_param_header_annotations(schema).is_err() {
+                            // Omit events with invalid x-mcp-header annotations.
+                            continue;
+                        }
+                        if let Some(name) = event.get("name").and_then(Value::as_str) {
+                            schemas.insert(name.to_owned(), schema.clone());
+                        }
+                    }
+                    let item_bytes = crate::json::serialized_len(&event)?;
+                    if !lease.try_grow(item_bytes) {
+                        return Err(failure(
+                            FailureKind::Transport,
+                            "Event catalog exceeds the active memory limit",
+                        ));
+                    }
+                    events.push(event);
+                }
+                match next_cursor {
+                    None => {
+                        if let Ok(mut guard) = self.event_schemas.write() {
+                            *guard = schemas;
+                        }
+                        return Ok(Leased::new(events, lease));
+                    }
+                    Some(next) if !cursors.insert(next.clone()) => {
+                        return Err(failure(
+                            FailureKind::Protocol,
+                            "Event catalog repeated a pagination cursor",
+                        ));
+                    }
+                    Some(next) => cursor = Some(next),
+                }
+            }
+            Err(failure(
+                FailureKind::Protocol,
+                "Event catalog exceeds the 100-page pagination limit",
+            ))
+        };
+        timeout(budget, listing)
+            .await
+            .map_err(|_| failure(FailureKind::Timeout, "Event discovery timed out"))?
+    }
+
+    pub async fn poll_events(
+        &self,
+        params: PollEventsParams,
+        budget: Duration,
+    ) -> Result<Leased<Value>> {
+        self.check_events_support()?;
+        if self.termination.is_terminated() {
+            self.abort_service();
+            return Err(self.termination.failure(false));
+        }
+        let started = tokio::time::Instant::now();
+        self.termination.clear_transient();
+        for attempt in 0..2 {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(failure(FailureKind::Timeout, "Event poll timed out"));
+            }
+            let request = ClientRequest::CustomRequest(CustomRequest::new(
+                "events/poll",
+                Some(params.to_json()),
+            ));
+            let res = timeout(remaining, async {
+                let send_fut = self.peer.send_request(request);
+                tokio::select! {
+                    biased;
+                    res = send_fut => res,
+                    () = self.termination.cancelled() => {
+                        self.abort_service();
+                        Err(ServiceError::TransportClosed)
+                    }
+                }
+            })
+            .await
+            .map_err(|_| failure(FailureKind::Timeout, "Event poll timed out"))?;
+            match res {
+                Ok(ServerResult::CustomResult(CustomResult(value))) => {
+                    let bytes = crate::json::serialized_len(&value)?;
+                    let lease = self.limits.budget.try_acquire(bytes).ok_or_else(|| {
+                        failure(
+                            FailureKind::Transport,
+                            "Event poll response exceeds the active memory limit",
+                        )
+                    })?;
+                    return Ok(Leased::new(value, lease));
+                }
+                Ok(_) => {
+                    return Err(failure(
+                        FailureKind::Protocol,
+                        "MCP server returned an unexpected events/poll response",
+                    ));
+                }
+                Err(ServiceError::McpError(ref err))
+                    if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
+                {
+                    let refresh_budget = budget.saturating_sub(started.elapsed());
+                    let _ = self.list_events(refresh_budget).await?;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(service_failure(
+                        error,
+                        false,
+                        &self.ingress,
+                        &self.termination,
+                    ));
+                }
+            }
+        }
+        unreachable!("poll_events retry loop always returns")
+    }
+
+    pub async fn open_event_stream(
+        &self,
+        params: StreamEventsParams,
+        budget: Duration,
+    ) -> Result<(EventStreamHandle, EventStreamReceiver)> {
+        enum EitherStreamStart {
+            Notification(Option<Leased<EventNotification>>),
+            Rpc(std::result::Result<std::result::Result<ServerResult, ServiceError>, tokio::sync::oneshot::error::RecvError>),
+        }
+        self.check_events_support()?;
+        if self.termination.is_terminated() {
+            self.abort_service();
+            return Err(self.termination.failure(false));
+        }
+        let started = tokio::time::Instant::now();
+        self.termination.clear_transient();
+        for attempt in 0..2 {
+            let remaining = budget.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(failure(FailureKind::Timeout, "Event stream open timed out"));
+            }
+            let request = ClientRequest::CustomRequest(CustomRequest::new(
+                "events/stream",
+                Some(params.to_json()),
+            ));
+            let mut handle = timeout(
+                remaining,
+                self.peer
+                    .send_cancellable_request(request, PeerRequestOptions::no_options()),
+            )
+            .await
+            .map_err(|_| failure(FailureKind::Timeout, "Event stream open timed out"))?
+            .map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?;
+            let id = handle.id.clone();
+            let mut rx = self.event_router.take_receiver(&id);
+            let wait_budget = budget.saturating_sub(started.elapsed());
+            let first_outcome = timeout(wait_budget, async {
+                tokio::select! {
+                    biased;
+                    notif = rx.recv() => Ok(EitherStreamStart::Notification(notif)),
+                    rpc = &mut handle.rx => Ok(EitherStreamStart::Rpc(rpc)),
+                    () = self.termination.cancelled() => {
+                        self.abort_service();
+                        Err(self.termination.failure(false))
+                    }
+                }
+            })
+            .await;
+
+            match first_outcome {
+                Err(_) => {
+                    self.event_router.unregister(&id);
+                    self.ingress.untrack(&id);
+                    let _ = handle.cancel(Some("handshake timeout".into())).await;
+                    return Err(failure(
+                        FailureKind::Timeout,
+                        "Timed out waiting for event stream start",
+                    ));
+                }
+                Ok(Err(err)) => {
+                    self.event_router.unregister(&id);
+                    self.ingress.untrack(&id);
+                    return Err(err);
+                }
+                Ok(Ok(EitherStreamStart::Notification(first))) => {
+                    let stream_handle = EventStreamHandle::new(
+                        handle,
+                        self.event_router.clone(),
+                        self.ingress.clone(),
+                    );
+                    return Ok((stream_handle, EventStreamReceiver::new(first, rx)));
+                }
+                Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => {
+                    self.event_router.unregister(&id);
+                    self.ingress.untrack(&id);
+                    match rpc_res {
+                        Ok(Err(ServiceError::McpError(ref err)))
+                            if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
+                        {
+                            let refresh_budget = budget.saturating_sub(started.elapsed());
+                            let _ = self.list_events(refresh_budget).await?;
+                            continue;
+                        }
+                        Ok(Err(err)) => {
+                            return Err(service_failure(
+                                err,
+                                false,
+                                &self.ingress,
+                                &self.termination,
+                            ));
+                        }
+                        Ok(Ok(_)) => {
+                            let stream_handle = EventStreamHandle::new(
+                                handle,
+                                self.event_router.clone(),
+                                self.ingress.clone(),
+                            );
+                            return Ok((stream_handle, EventStreamReceiver::new(None, rx)));
+                        }
+                        Err(_) => {
+                            return Err(self.termination.failure(false));
+                        }
+                    }
+                }
+            }
+        }
+        unreachable!("open_event_stream retry loop always returns")
+    }
+
     pub async fn close(&mut self) -> Result<()> {
         if self.closing.is_none()
             && let Some(mut service) = self.service.take()
@@ -1150,6 +1457,9 @@ fn is_standard_method(method: &str) -> bool {
 }
 
 fn should_ignore_notification(json_value: &Value, method: &str) -> bool {
+    if method.starts_with("notifications/events/") {
+        return false;
+    }
     if json_value.get("id").is_none() && !is_standard_method(method) {
         return true;
     }
@@ -1680,6 +1990,7 @@ struct BoundedHttp {
     client: reqwest::Client,
     cleanup: CleanupState,
     ingress: Ingress,
+    event_schemas: EventSchemaCache,
     termination: Arc<TransportTermination>,
     max_response_bytes: usize,
     budget: Arc<ByteBudget>,
@@ -1765,6 +2076,21 @@ impl BoundedHttp {
         self.ingress.track(&message);
         let had_session = session_id.is_some();
         let notification = !matches!(&message, ClientJsonRpcMessage::Request(_));
+        let is_events_stream = matches!(
+            &message,
+            ClientJsonRpcMessage::Request(request) if request.request.method() == "events/stream"
+        );
+        let event_headers = match &message {
+            ClientJsonRpcMessage::Request(request) => match &request.request {
+                ClientRequest::CustomRequest(custom) => events::event_request_headers(
+                    &custom.method,
+                    custom.params.as_ref(),
+                    &self.event_schemas,
+                ),
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
         let discover_id = match &message {
             ClientJsonRpcMessage::Request(request)
                 if !had_session && matches!(request.request, ClientRequest::DiscoverRequest(_)) =>
@@ -1778,6 +2104,9 @@ impl BoundedHttp {
             .post(uri.as_ref())
             .header("accept", "application/json, text/event-stream");
         for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        for (name, value) in event_headers {
             request = request.header(name, value);
         }
         if let Some(session) = session_id {
@@ -1844,6 +2173,7 @@ impl BoundedHttp {
                     self.budget.clone(),
                     self.ingress.clone(),
                     self.termination.clone(),
+                    is_events_stream,
                 ),
                 session,
             ));
@@ -2106,6 +2436,7 @@ impl StreamableHttpClient for BoundedHttp {
             self.budget.clone(),
             self.ingress.clone(),
             self.termination.clone(),
+            false,
         ))
     }
 
@@ -2626,6 +2957,7 @@ mod http_tests {
             client: client.clone(),
             cleanup: CleanupState::default(),
             ingress: Ingress::default(),
+            event_schemas: EventSchemaCache::default(),
             termination: Arc::new(TransportTermination::default()),
             max_response_bytes: 64,
             budget: budget.clone(),
@@ -2706,6 +3038,299 @@ mod http_tests {
             "stale discover transient leaked into initialize failure: {msg}"
         );
         assert!(msg.contains("initialization failed"), "unexpected: {msg}");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn http_events_list_poll_header_retry_and_stream_terminated_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_get_reconnect = Arc::new(AtomicBool::new(false));
+        let saw_cancelled = Arc::new(AtomicBool::new(false));
+        let poll_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let saw_get_srv = saw_get_reconnect.clone();
+        let saw_cancel_srv = saw_cancelled.clone();
+        let poll_attempts_srv = poll_attempts.clone();
+        let list_calls_srv = list_calls.clone();
+
+        let srv = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let saw_get_srv = saw_get_srv.clone();
+                let saw_cancel_srv = saw_cancel_srv.clone();
+                let poll_attempts_srv = poll_attempts_srv.clone();
+                let list_calls_srv = list_calls_srv.clone();
+                tokio::spawn(async move {
+                    let mut pending = Vec::new();
+                    while let Some((header_str, body)) =
+                        read_framed_http(&mut sock, &mut pending).await
+                    {
+                        if header_str.starts_with("GET ") {
+                            if header_str.to_ascii_lowercase().contains("last-event-id:") {
+                                saw_get_srv.store(true, Ordering::Release);
+                            }
+                            let _ = sock
+                                .write_all(
+                                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                                )
+                                .await;
+                            continue;
+                        }
+                        let msg: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        let lower_headers = header_str.to_ascii_lowercase();
+
+                        let send_json = |status: &str, payload: Value| {
+                            let encoded = serde_json::to_string(&payload).unwrap();
+                            format!(
+                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                                encoded.len(),
+                                encoded
+                            )
+                        };
+
+                        match method {
+                            "server/discover" => {
+                                let resp = send_json(
+                                    "200 OK",
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": {
+                                            "resultType": "complete",
+                                            "supportedVersions": ["2026-07-28"],
+                                            "capabilities": {
+                                                "extensions": {
+                                                    "io.modelcontextprotocol/events": { "listChanged": false }
+                                                }
+                                            },
+                                            "ttlMs": 60000,
+                                            "cacheScope": "public",
+                                            "_meta": {
+                                                "io.modelcontextprotocol/serverInfo": {
+                                                    "name": "events-demo",
+                                                    "version": "1.0"
+                                                }
+                                            }
+                                        }
+                                    }),
+                                );
+                                let _ = sock.write_all(resp.as_bytes()).await;
+                            }
+                            "events/list" => {
+                                let call_num = list_calls_srv.fetch_add(1, Ordering::AcqRel);
+                                let cursor = msg
+                                    .get("params")
+                                    .and_then(|p| p.get("cursor"))
+                                    .and_then(Value::as_str);
+                                let payload = if cursor.is_none() && call_num == 0 {
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": {
+                                            "resultType": "complete",
+                                            "events": [
+                                                {
+                                                    "name": "bad.event",
+                                                    "inputSchema": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "x": { "type": "object", "x-mcp-header": "InvalidObj" }
+                                                        }
+                                                    }
+                                                }
+                                            ],
+                                            "nextCursor": "page-2"
+                                        }
+                                    })
+                                } else {
+                                    serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": {
+                                            "resultType": "complete",
+                                            "events": [
+                                                {
+                                                    "name": "pr.merged",
+                                                    "inputSchema": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "repo": { "type": "string", "x-mcp-header": "Repo" }
+                                                        }
+                                                    }
+                                                }
+                                            ]
+                                        }
+                                    })
+                                };
+                                let resp = send_json("200 OK", payload);
+                                let _ = sock.write_all(resp.as_bytes()).await;
+                            }
+                            "events/poll" => {
+                                let attempt = poll_attempts_srv.fetch_add(1, Ordering::AcqRel);
+                                let has_name = lower_headers.contains("mcp-name: pr.merged");
+                                let has_param = lower_headers.contains("mcp-param-repo: org/app");
+                                if attempt == 0 {
+                                    // Simulate stale schema header mismatch (-32020) on first attempt.
+                                    let resp = send_json(
+                                        "400 Bad Request",
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "error": { "code": -32020, "message": "header mismatch" }
+                                        }),
+                                    );
+                                    let _ = sock.write_all(resp.as_bytes()).await;
+                                } else if has_name && has_param {
+                                    let resp = send_json(
+                                        "200 OK",
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "result": {
+                                                "resultType": "complete",
+                                                "events": [{"eventId": "ev-1", "data": {"ok": true}}],
+                                                "cursor": "1:1",
+                                                "truncated": false,
+                                                "hasMore": false,
+                                                "nextPollMs": 2000
+                                            }
+                                        }),
+                                    );
+                                    let _ = sock.write_all(resp.as_bytes()).await;
+                                } else {
+                                    let resp = send_json(
+                                        "400 Bad Request",
+                                        serde_json::json!({
+                                            "jsonrpc": "2.0",
+                                            "id": id,
+                                            "error": { "code": -32020, "message": "missing headers" }
+                                        }),
+                                    );
+                                    let _ = sock.write_all(resp.as_bytes()).await;
+                                }
+                            }
+                            "events/stream" => {
+                                assert!(lower_headers.contains("mcp-name: pr.merged"));
+                                assert!(lower_headers.contains("mcp-param-repo: org/app"));
+                                let active = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/events/active",
+                                    "params": {
+                                        "cursor": "1:1",
+                                        "truncated": false,
+                                        "heartbeatMs": 30000,
+                                        "_meta": { "io.modelcontextprotocol/subscriptionId": id }
+                                    }
+                                });
+                                let terminated = serde_json::json!({
+                                    "jsonrpc": "2.0",
+                                    "method": "notifications/events/terminated",
+                                    "params": {
+                                        "error": { "code": -32025, "message": "done" },
+                                        "_meta": { "io.modelcontextprotocol/subscriptionId": id }
+                                    }
+                                });
+                                let sse_body = format!(
+                                    "id: sse-1\ndata: {active}\n\nid: sse-2\ndata: {terminated}\n\n"
+                                );
+                                let resp = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                                    sse_body.len(),
+                                    sse_body
+                                );
+                                let _ = sock.write_all(resp.as_bytes()).await;
+                            }
+                            "notifications/cancelled" => {
+                                saw_cancel_srv.store(true, Ordering::Release);
+                                let _ = sock
+                                    .write_all(
+                                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                            }
+                            _ => {
+                                let _ = sock
+                                    .write_all(
+                                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let cfg = ServerConfig::Http {
+            url: format!("http://127.0.0.1:{port}/mcp"),
+            headers: BTreeMap::new(),
+            description: None,
+        };
+        let mut conn = McpConnection::connect(&cfg, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(conn.supports_events());
+
+        let events = conn.list_events(Duration::from_secs(5)).await.unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["name"], "pr.merged");
+        drop(events);
+
+        let mut args = Map::new();
+        args.insert("repo".into(), Value::String("org/app".into()));
+        let poll = conn
+            .poll_events(
+                PollEventsParams {
+                    name: "pr.merged".into(),
+                    arguments: Some(args.clone()),
+                    cursor: None,
+                    max_age_ms: None,
+                    max_events: Some(10),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll["cursor"], "1:1");
+        assert_eq!(poll_attempts.load(Ordering::Acquire), 2);
+        drop(poll);
+
+        let (handle, mut rx) = conn
+            .open_event_stream(
+                StreamEventsParams {
+                    name: "pr.merged".into(),
+                    arguments: Some(args),
+                    cursor: Some("1:1".into()),
+                    max_age_ms: None,
+                    heartbeat_ms: Some(30_000),
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.method, "notifications/events/active");
+        let second = rx.recv().await.unwrap();
+        assert_eq!(second.method, "notifications/events/terminated");
+        drop(first);
+        drop(second);
+
+        // Verify RequestHandle was automatically cancelled upon notifications/events/terminated.
+        timeout(Duration::from_secs(2), async {
+            while !handle.is_cancelled().await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!saw_get_reconnect.load(Ordering::Acquire));
+        let _ = saw_cancelled.load(Ordering::Acquire);
+
+        handle.cancel().await.unwrap();
+        conn.close().await.unwrap();
         srv.abort();
     }
 }

@@ -1,12 +1,16 @@
 //! Capture verified raw JSON-RPC responses alongside dedicated byte leases.
 use crate::budget::{ByteBudget, ByteLease, Leased};
 use rmcp::model::{
-    ClientJsonRpcMessage, ErrorCode, ErrorData, RequestId, ServerJsonRpcMessage, ServerResult,
+    ClientJsonRpcMessage, ClientNotification, ErrorCode, ErrorData, RequestId,
+    ServerJsonRpcMessage, ServerResult,
 };
 use serde::Deserialize;
 use serde_json::Value;
 use sse_stream::Sse;
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug)]
 pub(super) enum IngressError {
@@ -34,35 +38,94 @@ pub(super) struct Ingress(Arc<Mutex<State>>);
 
 #[derive(Default)]
 struct State {
-    active: bool,
-    pending: Option<Pending>,
+    capture_active: bool,
+    entries: HashMap<RequestId, Entry>,
+    completed_captures: VecDeque<RequestId>,
 }
 
-struct Pending {
-    method: &'static str,
-    id: RequestId,
-    response: Option<(anyhow::Result<Value>, ByteLease)>,
+enum Entry {
+    Capture {
+        method: &'static str,
+        response: Option<(anyhow::Result<Value>, ByteLease)>,
+    },
+    Passthrough,
 }
 
 impl Ingress {
     pub(super) fn track(&self, message: &ClientJsonRpcMessage) {
-        let ClientJsonRpcMessage::Request(request) = message else {
-            return;
-        };
-        let method = match request.request.method() {
-            "initialize" => "initialize",
-            "server/discover" => "server/discover",
-            "tools/list" => "tools/list",
-            "tools/call" => "tools/call",
-            _ => return,
-        };
+        match message {
+            ClientJsonRpcMessage::Request(request) => {
+                let mut state = self.0.lock().expect("response observation mutex");
+                match request.request.method() {
+                    "initialize" => {
+                        if state.capture_active {
+                            state.entries.insert(
+                                request.id.clone(),
+                                Entry::Capture {
+                                    method: "initialize",
+                                    response: None,
+                                },
+                            );
+                        }
+                    }
+                    "server/discover" => {
+                        if state.capture_active {
+                            state.entries.insert(
+                                request.id.clone(),
+                                Entry::Capture {
+                                    method: "server/discover",
+                                    response: None,
+                                },
+                            );
+                        }
+                    }
+                    "tools/list" => {
+                        if state.capture_active {
+                            state.entries.insert(
+                                request.id.clone(),
+                                Entry::Capture {
+                                    method: "tools/list",
+                                    response: None,
+                                },
+                            );
+                        }
+                    }
+                    "tools/call" => {
+                        if state.capture_active {
+                            state.entries.insert(
+                                request.id.clone(),
+                                Entry::Capture {
+                                    method: "tools/call",
+                                    response: None,
+                                },
+                            );
+                        }
+                    }
+                    "events/list" | "events/poll" | "events/stream" => {
+                        state.entries.insert(request.id.clone(), Entry::Passthrough);
+                    }
+                    _ => {}
+                }
+            }
+            ClientJsonRpcMessage::Notification(notification) => {
+                if let ClientNotification::CancelledNotification(cancelled) =
+                    &notification.notification
+                    && let Some(id) = &cancelled.params.request_id
+                {
+                    let mut state = self.0.lock().expect("response observation mutex");
+                    if matches!(state.entries.get(id), Some(Entry::Passthrough)) {
+                        state.entries.remove(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn untrack(&self, id: &RequestId) {
         let mut state = self.0.lock().expect("response observation mutex");
-        if state.active {
-            state.pending = Some(Pending {
-                method,
-                id: request.id.clone(),
-                response: None,
-            });
+        if matches!(state.entries.get(id), Some(Entry::Passthrough)) {
+            state.entries.remove(id);
         }
     }
 
@@ -71,15 +134,18 @@ impl Ingress {
         impl Drop for Clear {
             fn drop(&mut self) {
                 let mut state = self.0.0.lock().expect("response observation mutex");
-                state.active = false;
-                state.pending = None;
+                state.capture_active = false;
+                state
+                    .entries
+                    .retain(|_, entry| matches!(entry, Entry::Passthrough));
+                state.completed_captures.clear();
             }
         }
         let mut state = self.0.lock().expect("response observation mutex");
-        if state.active {
+        if state.capture_active {
             return None;
         }
-        state.active = true;
+        state.capture_active = true;
         Some(Clear(self.clone()))
     }
 
@@ -128,24 +194,35 @@ impl Ingress {
                 };
                 let correlated = (fallback.get("error").is_some()
                     || (!error_only && fallback.get("result").is_some()))
-                    && self
-                        .0
-                        .lock()
-                        .expect("response observation mutex")
-                        .pending
-                        .as_ref()
-                        .is_some_and(|pending| {
-                            pending.response.is_none()
-                                && match &pending.id {
-                                    RequestId::Number(id) => {
-                                        fallback.get("id").and_then(Value::as_i64) == Some(*id)
-                                    }
-                                    RequestId::String(id) => {
-                                        fallback.get("id").and_then(Value::as_str)
-                                            == Some(id.as_ref())
-                                    }
+                    && {
+                        let mut state = self.0.lock().expect("response observation mutex");
+                        let matched_id = state.entries.iter().find_map(|(id, entry)| {
+                            let awaiting = match entry {
+                                Entry::Capture { response, .. } => response.is_none(),
+                                Entry::Passthrough => true,
+                            };
+                            if !awaiting {
+                                return None;
+                            }
+                            let id_matches = match id {
+                                RequestId::Number(n) => {
+                                    fallback.get("id").and_then(Value::as_i64) == Some(*n)
                                 }
+                                RequestId::String(s) => {
+                                    fallback.get("id").and_then(Value::as_str) == Some(s.as_ref())
+                                }
+                            };
+                            id_matches.then(|| id.clone())
                         });
+                        if let Some(id) = matched_id {
+                            if matches!(state.entries.get(&id), Some(Entry::Passthrough)) {
+                                state.entries.remove(&id);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    };
                 if correlated {
                     return Err(IngressError::InvalidMetadata);
                 }
@@ -196,14 +273,26 @@ impl Ingress {
             }
             _ => return Ok(ObserveOutcome::NotMatched),
         };
+        let request_id = id.clone();
         let pending_method = {
-            let state = self.0.lock().expect("response observation mutex");
-            match state.pending.as_ref() {
-                Some(pending) if &pending.id == id && pending.response.is_none() => pending.method,
+            let mut state = self.0.lock().expect("response observation mutex");
+            match state.entries.get(&request_id) {
+                Some(Entry::Passthrough) => {
+                    state.entries.remove(&request_id);
+                    drop(state);
+                    drop(response);
+                    return Ok(ObserveOutcome::Captured(Leased::new(
+                        Box::new(message),
+                        sdk_lease,
+                    )));
+                }
+                Some(Entry::Capture {
+                    method,
+                    response: None,
+                }) => *method,
                 _ => return Ok(ObserveOutcome::NotMatched),
             }
         };
-        let request_id = id.clone();
         match &mut message {
             ServerJsonRpcMessage::Response(response) => {
                 match (pending_method, &mut response.result) {
@@ -255,13 +344,16 @@ impl Ingress {
             _ => unreachable!("only correlated responses reach capture"),
         }
         let mut state = self.0.lock().expect("response observation mutex");
-        if let Some(pending) = state.pending.as_mut()
-            && pending.id == request_id
-            && pending.method == pending_method
-            && pending.response.is_none()
+        if let Some(Entry::Capture {
+            method,
+            response: slot,
+        }) = state.entries.get_mut(&request_id)
+            && *method == pending_method
+            && slot.is_none()
         {
             let (response, value_lease) = response.into_parts();
-            pending.response = Some((Ok(response), value_lease));
+            *slot = Some((Ok(response), value_lease));
+            state.completed_captures.push_back(request_id);
             return Ok(ObserveOutcome::Captured(Leased::new(
                 Box::new(message),
                 sdk_lease,
@@ -309,14 +401,17 @@ impl Ingress {
     }
 
     pub(super) fn take(&self) -> Option<(&'static str, anyhow::Result<Value>, ByteLease)> {
-        let mut pending = self
-            .0
-            .lock()
-            .expect("response observation mutex")
-            .pending
-            .take()?;
-        let (response, lease) = pending.response.take()?;
-        Some((pending.method, response, lease))
+        let mut state = self.0.lock().expect("response observation mutex");
+        while let Some(id) = state.completed_captures.pop_front() {
+            if let Some(Entry::Capture {
+                method,
+                response: Some((response, lease)),
+            }) = state.entries.remove(&id)
+            {
+                return Some((method, response, lease));
+            }
+        }
+        None
     }
 }
 
@@ -690,6 +785,108 @@ mod tests {
         ));
         assert!(ingress.take().is_none());
         drop(raw_lease);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_events_passthrough_does_not_block_or_get_swallowed_by_tools_call() {
+        let budget = ByteBudget::new(1 << 20);
+        let ingress = Ingress::default();
+        let capture = ingress.capture().unwrap();
+
+        let tool_req = request(10, "tools/call");
+        let events_list_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "events/list",
+            "params": {}
+        }))
+        .unwrap();
+        let events_poll_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "poll-1",
+            "method": "events/poll",
+            "params": {"name": "task.exited"}
+        }))
+        .unwrap();
+        let events_stream_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "events/stream",
+            "params": {"name": "task.exited"}
+        }))
+        .unwrap();
+
+        ingress.track(&tool_req);
+        ingress.track(&events_list_req);
+        ingress.track(&events_poll_req);
+        ingress.track(&events_stream_req);
+
+        // events/list response passes straight through unstubbed while tools/call is still in flight.
+        let list_raw = br#"{"jsonrpc":"2.0","id":11,"result":{"resultType":"complete","events":[{"name":"task.exited"}]}}"#;
+        let ObserveOutcome::Captured(list_msg) = ingress
+            .observe_bytes(list_raw, 4096, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected passthrough events/list response");
+        };
+        assert_eq!(budget.used(), list_raw.len());
+        let ServerJsonRpcMessage::Response(list_resp) = &**list_msg else {
+            panic!("expected response");
+        };
+        let ServerResult::CustomResult(list_custom) = &list_resp.result else {
+            panic!("expected CustomResult");
+        };
+        assert_eq!(list_custom.0["events"][0]["name"], "task.exited");
+        drop(list_msg);
+        assert_eq!(budget.used(), 0);
+
+        // tools/call response is still captured and stubbed normally.
+        let tool_raw = br#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+        let ObserveOutcome::Captured(tool_msg) = ingress
+            .observe_bytes(tool_raw, 4096, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured tools/call response");
+        };
+        let (method, captured, lease) = ingress.take().unwrap();
+        assert_eq!(method, "tools/call");
+        assert_eq!(captured.unwrap()["result"]["content"][0]["text"], "ok");
+        drop(lease);
+        drop(tool_msg);
+
+        // Dropping capture guard must NOT drop still-pending passthrough events/* entries.
+        drop(capture);
+        let poll_raw = br#"{"jsonrpc":"2.0","id":"poll-1","result":{"resultType":"complete","events":[],"cursor":"1:0"}}"#;
+        let ObserveOutcome::Captured(poll_msg) = ingress
+            .observe_bytes(poll_raw, 4096, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected passthrough events/poll response after capture drop");
+        };
+        drop(poll_msg);
+
+        // CancelledNotification untracks a passthrough events/stream entry.
+        let cancel: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": 12}
+        }))
+        .unwrap();
+        ingress.track(&cancel);
+        let stream_raw = br#"{"jsonrpc":"2.0","id":12,"result":{"resultType":"complete"}}"#;
+        assert!(matches!(
+            ingress.observe_bytes(stream_raw, 4096, &budget, false).unwrap(),
+            ObserveOutcome::NotMatched
+        ));
+
+        // notifications/events/* must never be silently ignored.
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": {"eventId": "e1"}
+        });
+        assert!(!ignore_notification(&notif));
         assert_eq!(budget.used(), 0);
     }
 }
