@@ -1509,6 +1509,18 @@ async fn entry(cli: Cli) -> i32 {
             }
         };
         match (res, interrupted_code) {
+            (Ok(mut out), Some(code))
+                if out
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|d| d.kind == "cancelled") =>
+            {
+                out.code = code;
+                if let Some(diag) = out.diagnostic.as_mut() {
+                    diag.code = code;
+                }
+                Ok(out)
+            }
             (Err(mut err), Some(code)) => {
                 if let Some(failure) = err.downcast_mut::<Failure>()
                     && failure.kind == "cancelled"

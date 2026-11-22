@@ -387,7 +387,7 @@ fn is_unsupported_error(error: &anyhow::Error) -> bool {
 fn select_auto_mode(events: &[Value], event_name: &str) -> StreamMode {
     for event in events {
         if event.get("name").and_then(Value::as_str) == Some(event_name)
-            && let Some(modes) = event.get("deliveryModes").and_then(Value::as_array)
+            && let Some(modes) = event.get("delivery").and_then(Value::as_array)
         {
             let has_push = modes.iter().any(|m| m.as_str() == Some("push"));
             let has_poll = modes.iter().any(|m| m.as_str() == Some("poll"));
@@ -708,6 +708,7 @@ async fn run_poll_loop<T: EventTransport>(
             .and_then(Value::as_u64)
             .unwrap_or(MIN_POLL_INTERVAL_MS);
 
+        let batch_len = events.len();
         let mut delivered_any = false;
         for event in events {
             let payload = inject_truncated(event, pending_truncated);
@@ -720,7 +721,9 @@ async fn run_poll_loop<T: EventTransport>(
             }
         }
 
-        if let Some(c) = next_cursor.as_deref() {
+        if (!config.once || batch_len <= 1)
+            && let Some(c) = next_cursor.as_deref()
+        {
             persist_cursor(config.cursor_file.as_ref(), current_cursor, c)?;
         }
 
@@ -891,8 +894,11 @@ async fn run_push_loop<T: EventTransport>(
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
                         .and_then(Value::as_str)
+                        && let Err(err) =
+                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
                     {
-                        persist_cursor(config.cursor_file.as_ref(), current_cursor, c)?;
+                        channel.close().await;
+                        return Err(err);
                     }
                 }
                 "notifications/events/heartbeat" => {
@@ -900,8 +906,11 @@ async fn run_push_loop<T: EventTransport>(
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
                         .and_then(Value::as_str)
+                        && let Err(err) =
+                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
                     {
-                        persist_cursor(config.cursor_file.as_ref(), current_cursor, c)?;
+                        channel.close().await;
+                        return Err(err);
                     }
                 }
                 "notifications/events/event" => {
@@ -919,8 +928,12 @@ async fn run_push_loop<T: EventTransport>(
                         return Err(err);
                     }
                     pending_truncated = false;
-                    if let Some(c) = event_cursor.as_deref() {
-                        persist_cursor(config.cursor_file.as_ref(), current_cursor, c)?;
+                    if let Some(c) = event_cursor.as_deref()
+                        && let Err(err) =
+                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
+                    {
+                        channel.close().await;
+                        return Err(err);
                     }
                     if config.once {
                         channel.close().await;
@@ -1081,7 +1094,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CursorStore::new(dir.path().join("poll.cursor"));
         let mut transport = MockTransport {
-            listed: vec![json!({"name": "pr.merged", "deliveryModes": ["poll"]})],
+            listed: vec![json!({"name": "pr.merged", "delivery": ["poll"]})],
             polls: VecDeque::from([
                 json!({
                     "events": [],
@@ -1127,7 +1140,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = CursorStore::new(dir.path().join("push.cursor"));
         let mut transport = MockTransport {
-            listed: vec![json!({"name": "pr.merged", "deliveryModes": ["push", "poll"]})],
+            listed: vec![json!({"name": "pr.merged", "delivery": ["push", "poll"]})],
             polls: VecDeque::new(),
             poll_cursors: Vec::new(),
             streams: VecDeque::from([
@@ -1193,7 +1206,7 @@ mod tests {
     #[tokio::test]
     async fn push_exits_nonzero_on_terminated_notification() {
         let mut transport = MockTransport {
-            listed: vec![json!({"name": "pr.merged", "deliveryModes": ["push"]})],
+            listed: vec![json!({"name": "pr.merged", "delivery": ["push"]})],
             polls: VecDeque::new(),
             poll_cursors: Vec::new(),
             streams: VecDeque::from([VecDeque::from([
@@ -1238,7 +1251,7 @@ mod tests {
             f = flag.display()
         );
         let mut transport = MockTransport {
-            listed: vec![json!({"name": "pr.merged", "deliveryModes": ["push"]})],
+            listed: vec![json!({"name": "pr.merged", "delivery": ["push"]})],
             polls: VecDeque::new(),
             poll_cursors: Vec::new(),
             streams: VecDeque::from([VecDeque::from([

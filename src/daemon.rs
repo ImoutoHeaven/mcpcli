@@ -1175,7 +1175,7 @@ mod tests {
                                     "resultType": "complete",
                                     "events": [{
                                         "name": "task.exited",
-                                        "deliveryModes": ["push", "poll"]
+                                        "delivery": ["push", "poll"]
                                     }]
                                 }
                             });
