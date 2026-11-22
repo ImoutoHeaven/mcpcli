@@ -279,13 +279,10 @@ impl ProcessTree {
         platform::configure_child_process_group(&mut command);
 
         #[cfg(windows)]
-        {
-            let mut flags = windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
-            if mode == ExecMode::Stream {
-                flags |= windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-            }
-            command.creation_flags(flags);
-        }
+        command.creation_flags(
+            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
+                | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+        );
 
         #[cfg_attr(not(windows), allow(unused_mut))]
         let mut child = command.spawn()?;
@@ -293,27 +290,15 @@ impl ProcessTree {
         let group = child.id().map(|id| id as i32);
 
         #[cfg(windows)]
-        let job = match mode {
-            ExecMode::Stream => match windows_job::Job::adopt(&child) {
-                Ok(job) => Some(job),
-                Err(error) => {
-                    let _ = child.start_kill();
-                    tokio::spawn(async move {
-                        let _ = child.wait().await;
-                    });
-                    return Err(error);
-                }
-            },
-            ExecMode::Oneshot => match windows_job::Job::assign_running(&child) {
-                Ok(job) => job,
-                Err(error) => {
-                    let _ = child.start_kill();
-                    tokio::spawn(async move {
-                        let _ = child.wait().await;
-                    });
-                    return Err(error);
-                }
-            },
+        let job = match windows_job::Job::adopt(&child) {
+            Ok(job) => Some(job),
+            Err(error) => {
+                let _ = child.start_kill();
+                tokio::spawn(async move {
+                    let _ = child.wait().await;
+                });
+                return Err(error);
+            }
         };
 
         Ok(Self {
@@ -1141,6 +1126,131 @@ done
             "-Command".to_owned(),
             script.to_owned(),
         ]
+    }
+
+    #[cfg(windows)]
+    mod callback_tree_tests {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::{
+            Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{
+                OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess,
+                WaitForSingleObject,
+            },
+        };
+
+        struct Worker(OwnedHandle);
+
+        impl Worker {
+            fn open(pid: u32) -> Self {
+                // SAFETY: the PID belongs to the worker just reported by this test's callback.
+                let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid) };
+                assert!(
+                    !raw.is_null(),
+                    "cannot open callback worker: {}",
+                    io::Error::last_os_error()
+                );
+                // SAFETY: OpenProcess returned a new handle owned by this test.
+                let worker = Self(unsafe { OwnedHandle::from_raw_handle(raw) });
+                assert_eq!(
+                    worker.state(),
+                    WAIT_TIMEOUT,
+                    "callback worker exited before cleanup"
+                );
+                worker
+            }
+
+            fn state(&self) -> u32 {
+                // SAFETY: the process handle stays live through this nonblocking wait.
+                unsafe { WaitForSingleObject(self.0.as_raw_handle(), 0) }
+            }
+
+            async fn assert_stopped(&self) {
+                timeout(Duration::from_secs(5), async {
+                    loop {
+                        match self.state() {
+                            WAIT_OBJECT_0 => return,
+                            WAIT_TIMEOUT => tokio::time::sleep(Duration::from_millis(10)).await,
+                            other => panic!("cannot observe callback worker exit: {other}"),
+                        }
+                    }
+                })
+                .await
+                .expect("callback worker survived process-tree cleanup");
+            }
+        }
+
+        impl Drop for Worker {
+            fn drop(&mut self) {
+                if self.state() == WAIT_TIMEOUT {
+                    // SAFETY: retain this exact worker handle for cleanup if an assertion fails.
+                    unsafe {
+                        TerminateProcess(self.0.as_raw_handle(), 1);
+                        WaitForSingleObject(self.0.as_raw_handle(), 3000);
+                    }
+                }
+            }
+        }
+
+        async fn start_callback(mode: ExecMode) -> (tempfile::TempDir, ProcessTree, Worker) {
+            let dir = tempfile::tempdir().unwrap();
+            let pid_file = dir.path().join("worker.pid");
+            let quoted_path = pid_file.to_string_lossy().replace('\'', "''");
+            let script = format!(
+                r#"$ErrorActionPreference = 'Stop'
+$start = [System.Diagnostics.ProcessStartInfo]::new()
+$start.FileName = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
+$start.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 60"'
+$start.UseShellExecute = $false
+$start.CreateNoWindow = $true
+$worker = [System.Diagnostics.Process]::Start($start)
+[System.IO.File]::WriteAllText('{quoted_path}', $worker.Id.ToString())
+$worker.WaitForExit()
+"#
+            );
+            let mut tree = ProcessTree::spawn(&ps(&script), mode).unwrap();
+            let worker = timeout(Duration::from_secs(15), async {
+                loop {
+                    if let Ok(text) = std::fs::read_to_string(&pid_file)
+                        && let Ok(pid) = text.parse::<u32>()
+                    {
+                        break Worker::open(pid);
+                    }
+                    assert!(
+                        tree.child.as_mut().unwrap().try_wait().unwrap().is_none(),
+                        "callback exited before reporting its worker"
+                    );
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("callback did not start its worker");
+            (dir, tree, worker)
+        }
+
+        #[tokio::test]
+        async fn windows_callback_timeout_reaps_immediately_spawned_worker() {
+            for mode in [ExecMode::Oneshot, ExecMode::Stream] {
+                let (_dir, mut tree, worker) = start_callback(mode).await;
+                assert!(
+                    timeout(Duration::from_millis(50), tree.wait_exit())
+                        .await
+                        .is_err()
+                );
+                tree.kill_tree(Duration::ZERO).await;
+                worker.assert_stopped().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn windows_callback_drop_reaps_immediately_spawned_worker() {
+            for mode in [ExecMode::Oneshot, ExecMode::Stream] {
+                let (_dir, tree, worker) = start_callback(mode).await;
+                drop(tree);
+                worker.assert_stopped().await;
+            }
+        }
     }
 
     #[cfg(windows)]

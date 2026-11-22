@@ -66,26 +66,6 @@ impl Job {
         Ok(job)
     }
 
-    /// Bind an already-running short-lived child without CREATE_SUSPENDED.
-    /// Returns Ok(None) if the child exited before assignment (ERROR_ACCESS_DENIED).
-    pub(crate) fn assign_running(child: &Child) -> io::Result<Option<Self>> {
-        let Some(process) = child.raw_handle() else {
-            return Ok(None);
-        };
-        let job = Self::create_kill_on_close()?;
-        // SAFETY: the child process handle and newly created job handle are live.
-        if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), process) } == 0 {
-            let err = io::Error::last_os_error();
-            if err.raw_os_error()
-                == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
-            {
-                return Ok(None);
-            }
-            return Err(err);
-        }
-        Ok(Some(job))
-    }
-
     pub(crate) fn terminate(&self) -> io::Result<()> {
         // SAFETY: this owned handle has JOB_OBJECT_TERMINATE access.
         if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
