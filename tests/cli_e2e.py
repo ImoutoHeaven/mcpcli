@@ -569,6 +569,77 @@ def stdin_deadline(f):
     assert not f.events("call")
 
 
+def configure_events(f, discover_delay=0, list_delay=0, event_delay=0):
+    script = f.script.with_name("events_server.py")
+    f.settings["servers"] = {"state": {
+        "transport": "stdio", "command": sys.executable,
+        "args": [str(script), "--log", str(f.log),
+                 "--discover-delay", str(discover_delay), "--list-delay", str(list_delay),
+                 "--event-delay", str(event_delay)],
+    }}
+    f.save_config()
+
+
+def events_deadline_spans_bootstrap(f):
+    configure_events(f, discover_delay=1.2, event_delay=1.2)
+    result = f.invoke("--oneshot", "events", "stream", "state", "test.event",
+                      "--mode", "push", "--once", timeout=2000, code=5)
+    assert not result.stdout and error_value(result)["kind"] == "timeout"
+    assert f.events("active"), "deadline expired before reaching the stream"
+    assert not f.events("delivered"), "bootstrap received a second full timeout"
+
+
+def events_deadline_spans_bootstrap_and_callback(f):
+    configure_events(f, discover_delay=1.2)
+    marker = f.root / "callback-started"
+    cursor = f.root / "cursor"
+    cursor.write_text("before", encoding="utf-8")
+    callback = ("import pathlib,sys,time; sys.stdin.readline(); "
+                "pathlib.Path(sys.argv[1]).write_text('started'); time.sleep(1.2)")
+    result = f.invoke("--oneshot", "events", "stream", "state", "test.event",
+                      "--mode", "push", "--once", "--cursor-file", str(cursor),
+                      "--exec-timeout", "5000", "--", sys.executable, "-c", callback, str(marker),
+                      timeout=2000, code=5)
+    assert marker.exists(), "callback did not start"
+    assert not result.stdout and error_value(result)["kind"] == "timeout"
+    assert cursor.read_text(encoding="utf-8") == "before", "unconfirmed event advanced the cursor"
+
+
+def events_stdin_deadline(f):
+    configure_events(f)
+    process = f.start("--oneshot", "events", "stream", "state", "test.event",
+                      "--stdin", "--mode", "push", timeout=500, open_stdin=True)
+    process.stdin.write('{"unfinished":')
+    process.stdin.flush()
+    assert process.wait(timeout=5.5) == 5, "event timeout did not bound incomplete stdin"
+    stdout, stderr = process.communicate()
+    assert not stdout and json.loads(stderr)["error"]["kind"] == "timeout"
+    assert not f.events("start"), "incomplete input started the MCP connection"
+
+
+def events_interrupts_bootstrap_and_active(f):
+    signals = [(signal.CTRL_BREAK_EVENT, 143)] if WINDOWS else [(signal.SIGINT, 130), (signal.SIGTERM, 143)]
+    for stage in ("discover", "list", "active"):
+        for signum, expected in signals:
+            configure_events(f, discover_delay=3 if stage == "discover" else 0,
+                             list_delay=3 if stage == "list" else 0, event_delay=30)
+            previous = len(f.events(stage))
+            process = f.start("--oneshot", "events", "stream", "state", "test.event",
+                              "--mode", "auto" if stage == "list" else "push",
+                              timeout=10000, signal_console=True)
+            observed = wait_for(lambda: f.events(stage)[-1] if len(f.events(stage)) > previous else None,
+                                f"event command never reached {stage}", seconds=8)
+            interrupted_at = time.monotonic()
+            interrupt(process, signum)
+            stdout, stderr = process.communicate(timeout=5)
+            assert process.returncode == expected, (stage, process.returncode, stderr)
+            assert time.monotonic() - interrupted_at < 2, f"{stage} ignored interruption"
+            assert not stdout and json.loads(stderr)["error"]["kind"] == "cancelled"
+            wait_for(lambda: not running(observed["pid"]), "event cancellation leaked MCP server")
+            if stage == "active":
+                assert len(f.events("cancel", pid=observed["pid"], matched=True)) <= 1
+
+
 def configuration_errors_redact_values(f):
     sentinel = "SECRET_SENTINEL_DO_NOT_ECHO"
     f.settings["servers"] = {"bad": {
@@ -970,6 +1041,8 @@ CASES = [
     raw_semantic_disclosure, offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, multimodal_media_and_inline_flag, session_and_restart,
     changed_and_deleted_config, simultaneous_startup, timeout_and_disconnect,
     interrupted_stdin, stdin_deadline, configuration_errors_redact_values,
+    events_deadline_spans_bootstrap, events_deadline_spans_bootstrap_and_callback,
+    events_stdin_deadline, events_interrupts_bootstrap_and_active,
     oneshot_signals_clean_process_group, saturated_control_channel,
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,

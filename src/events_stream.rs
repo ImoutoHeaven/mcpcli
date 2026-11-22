@@ -49,7 +49,7 @@ pub struct StreamConfig {
     pub max_age_ms: Option<u64>,
     pub heartbeat_ms: Option<u64>,
     pub once: bool,
-    pub timeout: Option<Duration>,
+    pub deadline: Option<Instant>,
     pub callback_argv: Option<Vec<String>>,
     pub exec_mode: ExecMode,
     pub exec_timeout: Duration,
@@ -470,6 +470,22 @@ fn remaining_budget(default: Duration, deadline: Option<Instant>) -> Result<Dura
     }
 }
 
+/// Keep bootstrap and discovery inside the foreground command's original deadline.
+pub async fn wait_with_budget<T>(
+    maximum: Duration,
+    deadline: Option<Instant>,
+    cancel: &CancellationToken,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let budget = remaining_budget(maximum, deadline)?;
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(Failure::new(130, "cancelled", "interrupted").into()),
+        result = timeout(budget, future) => result
+            .map_err(|_| Failure::new(5, "timeout", "event stream timeout exceeded"))?,
+    }
+}
+
 struct Sink<'a> {
     executor: Option<CallbackExecutor>,
     stdout: Option<&'a mut (dyn Write + Send)>,
@@ -585,7 +601,7 @@ pub async fn run_stream<T: EventTransport>(
     cancel: CancellationToken,
     stdout_override: Option<&mut (dyn Write + Send)>,
 ) -> Result<()> {
-    let deadline = config.timeout.map(|d| Instant::now() + d);
+    let deadline = config.deadline;
     let mut current_cursor = match (&config.initial_cursor, &config.cursor_file) {
         (Some(c), _) => Some(c.clone()),
         (None, Some(store)) => store.read()?,
@@ -633,7 +649,14 @@ async fn run_stream_inner<T: EventTransport>(
         StreamMode::Poll => StreamMode::Poll,
         StreamMode::Auto => {
             let list_budget = remaining_budget(timings.handshake_timeout, deadline)?;
-            match transport.list_events(list_budget).await {
+            match wait_with_budget(
+                list_budget,
+                deadline,
+                cancel,
+                transport.list_events(list_budget),
+            )
+            .await
+            {
                 Ok(events) => select_auto_mode(&events, &config.event),
                 Err(err) if is_fatal_error(&err) => return Err(err),
                 Err(_) => StreamMode::Push,
@@ -1156,7 +1179,7 @@ mod tests {
             max_age_ms: None,
             heartbeat_ms: Some(50),
             once: false,
-            timeout: Some(Duration::from_secs(5)),
+            deadline: Some(Instant::now() + Duration::from_secs(5)),
             callback_argv: None,
             exec_mode: ExecMode::Oneshot,
             exec_timeout: Duration::from_secs(5),
@@ -1456,7 +1479,7 @@ mod tests {
             let mut cfg = base_config(Some(store.clone()));
             cfg.mode = StreamMode::Poll;
             cfg.once = true;
-            cfg.timeout = Some(Duration::from_millis(100));
+            cfg.deadline = Some(Instant::now() + Duration::from_millis(100));
             cfg.exec_mode = mode;
             cfg.exec_timeout = Duration::from_secs(5);
             cfg.callback_argv = Some(vec![python.clone(), "-c".into(), "import sys,time; sys.stdin.readline(); time.sleep(.3); print('{\"ok\":true}', flush=True)".into()]);
@@ -1511,7 +1534,7 @@ mod tests {
                 let mut cfg = base_config(None);
                 cfg.mode = mode;
                 cfg.once = true;
-                cfg.timeout = Some(Duration::from_secs(10));
+                cfg.deadline = Some(Instant::now() + Duration::from_secs(10));
                 cfg.exec_timeout = Duration::from_secs(10);
                 cfg.exec_mode = exec_mode;
                 cfg.callback_argv = Some(vec![python.clone(), "-c".into(),

@@ -1335,6 +1335,14 @@ async fn run_events_stream(
     cli: &Cli,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<Output> {
+    let deadline = cli
+        .timeout
+        .map(|ms| {
+            Instant::now()
+                .checked_add(Duration::from_millis(ms))
+                .ok_or_else(|| usage("timeout", "event stream timeout is too large"))
+        })
+        .transpose()?;
     let Command::Events {
         command:
             EventsCommand::Stream {
@@ -1367,12 +1375,17 @@ async fn run_events_stream(
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
     let (parsed_args, input_lease) = if args.is_some() || args_file.is_some() || *stdin {
-        let leased = arguments(
-            args,
-            args_file,
-            *stdin,
+        let leased = events_stream::wait_with_budget(
             Duration::from_secs(30),
-            ByteBudget::global(),
+            deadline,
+            &cancel,
+            arguments(
+                args,
+                args_file,
+                *stdin,
+                Duration::from_secs(30),
+                ByteBudget::global(),
+            ),
         )
         .await?;
         let (map, lease) = leased.into_parts();
@@ -1391,7 +1404,7 @@ async fn run_events_stream(
             max_age_ms: *max_age_ms,
             heartbeat_ms: *heartbeat_ms,
             once: *once,
-            timeout: cli.timeout.map(Duration::from_millis),
+            deadline,
             callback_argv: (!callback.is_empty()).then(|| callback.clone()),
             exec_mode: (*exec_mode).into(),
             exec_timeout: exec_timeout
@@ -1402,13 +1415,13 @@ async fn run_events_stream(
     );
 
     if cli.oneshot {
-        let connect_budget = stream_cfg
-            .timeout
-            .map(|d| d.min(Duration::from_secs(30)))
-            .unwrap_or(Duration::from_secs(30));
-        let connection = McpConnection::connect(server_config, connect_budget)
-            .await
-            .map_err(|error| daemon::mcp_error(error, false))?;
+        let connection =
+            events_stream::wait_with_budget(Duration::from_secs(30), deadline, &cancel, async {
+                McpConnection::connect(server_config, Duration::from_secs(30))
+                    .await
+                    .map_err(|error| daemon::mcp_error(error, false).into())
+            })
+            .await?;
         let mut transport = DirectTransport::new(connection);
         let outcome = events_stream::run_stream(
             &mut transport,
@@ -1434,13 +1447,13 @@ async fn run_events_stream(
     }
 
     let paths = Paths::new(loaded.path.clone(), &cli.session)?;
-    let ensure_budget = stream_cfg
-        .timeout
-        .map(|d| d.min(runtime::START_WAIT))
-        .unwrap_or(runtime::START_WAIT);
-    timeout(ensure_budget, runtime::ensure(&paths, &loaded, false))
-        .await
-        .map_err(|_| Failure::new(5, "timeout", "deadline elapsed while starting the daemon"))??;
+    events_stream::wait_with_budget(
+        runtime::START_WAIT,
+        deadline,
+        &cancel,
+        runtime::ensure(&paths, &loaded, false),
+    )
+    .await?;
     let mut transport = DaemonTransport::new(paths, loaded, server.clone());
     events_stream::run_stream(
         &mut transport,
@@ -1484,6 +1497,7 @@ async fn entry(cli: Cli) -> i32 {
     let uncertain = AtomicBool::new(false);
     let signal = mcpcli::platform::interrupted();
     tokio::pin!(signal);
+    let mut signal_consumed = false;
     let result = if foreground {
         run(&cli, &uncertain).await
     } else if is_event_stream {
@@ -1495,7 +1509,8 @@ async fn entry(cli: Cli) -> i32 {
             tokio::select! {
                 biased;
                 res = &mut stream_fut => break res,
-                sig = &mut signal, if interrupted_code.is_none() => {
+                sig = &mut signal, if !signal_consumed => {
+                    signal_consumed = true;
                     match sig {
                         Ok(code) => {
                             interrupted_code = Some(code);
@@ -1537,11 +1552,14 @@ async fn entry(cli: Cli) -> i32 {
         tokio::select! {
             biased;
             result = run(&cli, &uncertain) => result,
-            signal = &mut signal => match signal {
-                Ok(code) => Err(Failure::new(code, "cancelled", "interrupted; cancellation is not rollback")
-                    .uncertain(uncertain.load(Ordering::Acquire))
-                    .into()),
-                Err(error) => Err(error.into()),
+            signal = &mut signal => {
+                signal_consumed = true;
+                match signal {
+                    Ok(code) => Err(Failure::new(code, "cancelled", "interrupted; cancellation is not rollback")
+                        .uncertain(uncertain.load(Ordering::Acquire))
+                        .into()),
+                    Err(error) => Err(error.into()),
+                }
             },
         }
     };
@@ -1552,7 +1570,7 @@ async fn entry(cli: Cli) -> i32 {
             biased;
             result = connection.close() => result.err().map(|error|
                 Failure::new(1, "cleanup", format!("MCP operation finished; connection cleanup failed: {error}; do not replay the operation"))),
-            interrupted = &mut signal => Some(match interrupted {
+            interrupted = &mut signal, if !signal_consumed => Some(match interrupted {
                 Ok(code) => Failure::new(code, "cancelled", "MCP result received; connection cleanup interrupted; do not replay the operation"),
                 Err(error) => Failure::new(1, "cleanup", format!("MCP result received; signal handling failed during cleanup: {error}")),
             }),
