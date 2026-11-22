@@ -305,12 +305,12 @@ impl App {
             Operation::Status => return Ok((self.status(), empty(), None)),
             Operation::Stop => return Ok((json!({"stopping":true}), empty(), None)),
             Operation::EventsList { server } => {
-                let _work = self
+                let (client, _) = self.ensure_events_client(server, deadline).await?;
+                let work = self
                     .work
                     .acquire()
                     .await
                     .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
-                let (client, _) = self.ensure_events_client(server, deadline).await?;
                 let budget = deadline.saturating_duration_since(Instant::now());
                 if budget.is_zero() {
                     return Err(Failure::new(
@@ -320,6 +320,7 @@ impl App {
                     ));
                 }
                 let result = client.list_events(budget).await;
+                drop(work);
                 if client.is_closed() {
                     self.mark_server_lost_if_closed(server).await;
                 }
@@ -337,12 +338,12 @@ impl App {
                 max_age_ms,
                 max_events,
             } => {
-                let _work = self
+                let (client, _) = self.ensure_events_client(server, deadline).await?;
+                let work = self
                     .work
                     .acquire()
                     .await
                     .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
-                let (client, _) = self.ensure_events_client(server, deadline).await?;
                 let budget = deadline.saturating_duration_since(Instant::now());
                 if budget.is_zero() {
                     return Err(Failure::new(
@@ -359,6 +360,7 @@ impl App {
                     max_events: *max_events,
                 };
                 let result = client.poll_events(params, budget).await;
+                drop(work);
                 if client.is_closed() {
                     self.mark_server_lost_if_closed(server).await;
                 }
@@ -1415,6 +1417,70 @@ mod tests {
 
         let _ = runtime::stop(&paths).await;
         let _ = daemon_task.await;
+        server_task.abort();
+    }
+    #[tokio::test]
+    async fn queued_events_do_not_block_an_earlier_ordinary_request() {
+        let (url, server_task) = start_mock_events_http_server().await;
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_vec(&json!({"servers": {"srv": {"transport": "http", "url": url}}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "lock-order", &base_path.join("run")).unwrap();
+        let app = App {
+            paths,
+            config,
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            shutdown: CancellationToken::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        app.ensure_events_client("srv", deadline).await.unwrap();
+        let state = app.servers["srv"].lock().await;
+        let running = app.work.acquire().await.unwrap();
+        let operation = Operation::Server {
+            server: "srv".into(),
+        };
+        let dispatched = AtomicBool::new(false);
+        let mut ordinary = Box::pin(app.execute(&operation, deadline, &dispatched));
+        assert!(futures_util::poll!(ordinary.as_mut()).is_pending());
+        let operations: Vec<_> = (0..MAX_IN_FLIGHT)
+            .map(|_| Operation::EventsList {
+                server: "srv".into(),
+            })
+            .collect();
+        let mut events: Vec<_> = operations
+            .iter()
+            .map(|op| Box::pin(app.execute(op, deadline, &dispatched)))
+            .collect();
+        for event in &mut events {
+            assert!(futures_util::poll!(event.as_mut()).is_pending());
+        }
+        drop(state);
+        drop(running);
+        timeout(Duration::from_secs(2), async {
+            ordinary.await.unwrap();
+            for event in events {
+                event.await.unwrap();
+            }
+        })
+        .await
+        .expect("mixed ordinary/events requests must make progress before their deadlines");
+        let mut state = app.servers["srv"].lock().await;
+        state.connection.as_mut().unwrap().close().await.unwrap();
         server_task.abort();
     }
 }

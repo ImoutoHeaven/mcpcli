@@ -89,11 +89,17 @@ impl CursorStore {
         }
         let text = String::from_utf8(buf)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(trimmed.to_owned()))
+        Ok(Some(text))
+    }
+
+    pub fn clear(&self) -> io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {
+                let parent = self.path.parent().filter(|p| !p.as_os_str().is_empty());
+                platform::sync_directory(parent.unwrap_or(Path::new(".")))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
         }
     }
 
@@ -832,12 +838,19 @@ mod tests {
     }
 
     #[test]
-    fn cursor_store_trims_trailing_newline_and_cleans_up_on_replace_failure() {
+    fn cursor_store_preserves_opaque_bytes_and_cleans_up_on_replace_failure() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.cursor");
         std::fs::write(&path, "boot:99\r\n").unwrap();
         let store = CursorStore::new(&path);
-        assert_eq!(store.read().unwrap().as_deref(), Some("boot:99"));
+        assert_eq!(store.read().unwrap().as_deref(), Some("boot:99\r\n"));
+        for cursor in ["", " ", " leading and trailing ", "\nopaque\r\n", "游标 "] {
+            store.write(cursor).unwrap();
+            assert_eq!(store.read().unwrap().as_deref(), Some(cursor));
+        }
+        store.clear().unwrap();
+        assert_eq!(store.read().unwrap(), None);
+        store.clear().unwrap();
 
         // Target is a directory so rename/replace fails and temp file must be removed.
         let target_dir = dir.path().join("occupied");

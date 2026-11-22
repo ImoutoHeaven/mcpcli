@@ -144,16 +144,35 @@ impl DirectTransport {
     pub fn into_connection(self) -> McpConnection {
         self.connection
     }
+
+    fn check_connection(&self) -> Result<()> {
+        if self.connection.is_closed() {
+            return Err(Failure::new(
+                6,
+                "session_lost",
+                "direct MCP connection closed; restart the command to open a new session",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn request_error(&self, error: anyhow::Error) -> anyhow::Error {
+        self.check_connection()
+            .err()
+            .unwrap_or_else(|| daemon::mcp_error(error, false).into())
+    }
 }
 
 impl EventTransport for DirectTransport {
     fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Vec<Value>>> {
         Box::pin(async move {
+            self.check_connection()?;
             let events = self
                 .connection
                 .list_events(budget)
                 .await
-                .map_err(|e| anyhow::Error::from(daemon::mcp_error(e, false)))?;
+                .map_err(|e| self.request_error(e))?;
             let (events, lease) = events.into_parts();
             drop(lease);
             Ok(events)
@@ -166,11 +185,12 @@ impl EventTransport for DirectTransport {
         budget: Duration,
     ) -> BoxFuture<'_, Result<Value>> {
         Box::pin(async move {
+            self.check_connection()?;
             let polled = self
                 .connection
                 .poll_events(params, budget)
                 .await
-                .map_err(|e| anyhow::Error::from(daemon::mcp_error(e, false)))?;
+                .map_err(|e| self.request_error(e))?;
             let (value, lease) = polled.into_parts();
             drop(lease);
             Ok(value)
@@ -183,11 +203,12 @@ impl EventTransport for DirectTransport {
         budget: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
+            self.check_connection()?;
             let (handle, rx) = self
                 .connection
                 .open_event_stream(params, budget)
                 .await
-                .map_err(|e| anyhow::Error::from(daemon::mcp_error(e, false)))?;
+                .map_err(|e| self.request_error(e))?;
             Ok(Box::new(DirectChannel { handle, rx }) as Box<dyn EventStreamChannel>)
         })
     }
@@ -341,6 +362,9 @@ fn is_fatal_error(error: &anyhow::Error) -> bool {
     let Some(failure) = error.downcast_ref::<Failure>() else {
         return false;
     };
+    if failure.kind == "mcp_protocol" && failure.rpc_error.is_none() {
+        return true;
+    }
     if matches!(
         failure.kind.as_str(),
         "unknown_server"
@@ -472,6 +496,12 @@ impl<'a> Sink<'a> {
                 _ = cancel.cancelled() => {
                     return Err(Failure::new(130, "cancelled", "interrupted").into());
                 }
+                _ = async {
+                    match deadline {
+                        Some(dl) => tokio::time::sleep_until(dl).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => return Err(Failure::new(5, "timeout", "event stream timeout exceeded").into()),
                 res = executor.deliver(&line) => res,
             };
             match deliver_res {
@@ -498,15 +528,18 @@ impl<'a> Sink<'a> {
 fn persist_cursor(
     cursor_store: Option<&CursorStore>,
     current: &mut Option<String>,
-    candidate: &str,
+    candidate: Option<&str>,
 ) -> Result<()> {
-    if candidate.is_empty() || current.as_deref() == Some(candidate) {
+    if current.as_deref() == candidate {
         return Ok(());
     }
     if let Some(store) = cursor_store {
-        store.write(candidate)?;
+        match candidate {
+            Some(cursor) => store.write(cursor)?,
+            None => store.clear()?,
+        }
     }
-    *current = Some(candidate.to_owned());
+    *current = candidate.map(str::to_owned);
     Ok(())
 }
 
@@ -708,10 +741,12 @@ async fn run_poll_loop<T: EventTransport>(
             }
         }
 
-        if (!config.once || batch_len <= 1)
-            && let Some(c) = next_cursor.as_deref()
-        {
-            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)?;
+        if !config.once || batch_len <= 1 {
+            persist_cursor(
+                config.cursor_file.as_ref(),
+                current_cursor,
+                next_cursor.as_deref(),
+            )?;
         }
 
         if config.once && delivered_any {
@@ -877,24 +912,24 @@ async fn run_push_loop<T: EventTransport>(
                         }
                         pending_truncated = true;
                     }
-                    if let Some(c) = params
+                    let cursor = params
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
-                        .and_then(Value::as_str)
-                        && let Err(err) =
-                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
+                        .and_then(Value::as_str);
+                    if let Err(err) =
+                        persist_cursor(config.cursor_file.as_ref(), current_cursor, cursor)
                     {
                         channel.close().await;
                         return Err(err);
                     }
                 }
                 "notifications/events/heartbeat" => {
-                    if let Some(c) = params
+                    let cursor = params
                         .as_ref()
                         .and_then(|p| p.get("cursor"))
-                        .and_then(Value::as_str)
-                        && let Err(err) =
-                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
+                        .and_then(Value::as_str);
+                    if let Err(err) =
+                        persist_cursor(config.cursor_file.as_ref(), current_cursor, cursor)
                     {
                         channel.close().await;
                         return Err(err);
@@ -915,10 +950,11 @@ async fn run_push_loop<T: EventTransport>(
                         return Err(err);
                     }
                     pending_truncated = false;
-                    if let Some(c) = event_cursor.as_deref()
-                        && let Err(err) =
-                            persist_cursor(config.cursor_file.as_ref(), current_cursor, c)
-                    {
+                    if let Err(err) = persist_cursor(
+                        config.cursor_file.as_ref(),
+                        current_cursor,
+                        event_cursor.as_deref(),
+                    ) {
                         channel.close().await;
                         return Err(err);
                     }
@@ -1265,5 +1301,108 @@ mod tests {
 
         assert!(flag.exists());
         assert_eq!(store.read().unwrap().as_deref(), Some("b:2"));
+    }
+    #[test]
+    fn protocol_capability_errors_are_fatal_without_hiding_transient_rpc_errors() {
+        let missing: anyhow::Error =
+            Failure::new(4, "mcp_protocol", "events extension missing").into();
+        assert!(is_fatal_error(&missing));
+        let mut busy = Failure::new(4, "mcp_protocol", "subscription limit reached");
+        busy.rpc_error = Some(std::sync::Arc::new(
+            json!({"code": -32025, "message": "busy"}),
+        ));
+        assert!(!is_fatal_error(&busy.into()));
+        let network: anyhow::Error = Failure::new(4, "mcp_transport", "HTTP stream ended").into();
+        assert!(!is_fatal_error(&network));
+    }
+
+    #[tokio::test]
+    async fn delivered_cursor_preserves_empty_tokens_and_clears_null_or_omitted_tokens() {
+        for mode in [StreamMode::Poll, StreamMode::Push] {
+            for cursor in [Some(json!("")), Some(Value::Null), None] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = CursorStore::new(dir.path().join("cursor"));
+                store.write("old").unwrap();
+                let expected = cursor.as_ref().and_then(Value::as_str).map(str::to_owned);
+                let mut event = json!({"eventId": "e1", "name": "pr.merged", "data": {}});
+                let mut polled = json!({"events": [event.clone()], "hasMore": false});
+                if let Some(cursor) = cursor {
+                    event["cursor"] = cursor.clone();
+                    polled["cursor"] = cursor;
+                }
+                let mut transport = MockTransport {
+                    listed: vec![],
+                    polls: VecDeque::from([polled]),
+                    poll_cursors: vec![],
+                    streams: VecDeque::from([VecDeque::from([
+                        MockStep::Yield(RawStreamEvent::Notification {
+                            method: "notifications/events/active".into(),
+                            params: Some(json!({"cursor": "old", "heartbeatMs": 1000})),
+                        }),
+                        MockStep::Yield(RawStreamEvent::Notification {
+                            method: "notifications/events/event".into(),
+                            params: Some(event),
+                        }),
+                    ])]),
+                    stream_cursors: vec![],
+                };
+                let mut cfg = base_config(Some(store.clone()));
+                cfg.mode = mode;
+                cfg.once = true;
+                let mut out = Vec::new();
+                run_stream(
+                    &mut transport,
+                    &cfg,
+                    fast_timings(),
+                    CancellationToken::new(),
+                    Some(&mut out),
+                )
+                .await
+                .unwrap();
+                assert_eq!(store.read().unwrap(), expected, "mode={mode:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn total_deadline_cancels_both_callback_modes_without_committing_cursor() {
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        for mode in [ExecMode::Oneshot, ExecMode::Stream] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = CursorStore::new(dir.path().join("callback.cursor"));
+            store.write("before").unwrap();
+            let mut transport = MockTransport {
+                listed: vec![],
+                polls: VecDeque::from([
+                    json!({"events": [{"eventId": "e1", "name": "pr.merged", "data": {}}], "cursor": "after", "hasMore": false}),
+                ]),
+                poll_cursors: vec![],
+                streams: VecDeque::new(),
+                stream_cursors: vec![],
+            };
+            let mut cfg = base_config(Some(store.clone()));
+            cfg.mode = StreamMode::Poll;
+            cfg.once = true;
+            cfg.timeout = Some(Duration::from_millis(100));
+            cfg.exec_mode = mode;
+            cfg.exec_timeout = Duration::from_secs(5);
+            cfg.callback_argv = Some(vec![python.clone(), "-c".into(), "import sys,time; sys.stdin.readline(); time.sleep(.3); print('{\"ok\":true}', flush=True)".into()]);
+            let error = run_stream(
+                &mut transport,
+                &cfg,
+                fast_timings(),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<Failure>().unwrap().kind,
+                "timeout",
+                "mode={mode:?}"
+            );
+            assert_eq!(store.read().unwrap().as_deref(), Some("before"));
+        }
     }
 }
