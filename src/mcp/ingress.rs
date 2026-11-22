@@ -57,45 +57,18 @@ impl Ingress {
             ClientJsonRpcMessage::Request(request) => {
                 let mut state = self.0.lock().expect("response observation mutex");
                 match request.request.method() {
-                    "initialize" => {
+                    m @ ("initialize" | "server/discover" | "tools/list" | "tools/call") => {
+                        let method = match m {
+                            "initialize" => "initialize",
+                            "server/discover" => "server/discover",
+                            "tools/list" => "tools/list",
+                            _ => "tools/call",
+                        };
                         if state.capture_active {
                             state.entries.insert(
                                 request.id.clone(),
                                 Entry::Capture {
-                                    method: "initialize",
-                                    response: None,
-                                },
-                            );
-                        }
-                    }
-                    "server/discover" => {
-                        if state.capture_active {
-                            state.entries.insert(
-                                request.id.clone(),
-                                Entry::Capture {
-                                    method: "server/discover",
-                                    response: None,
-                                },
-                            );
-                        }
-                    }
-                    "tools/list" => {
-                        if state.capture_active {
-                            state.entries.insert(
-                                request.id.clone(),
-                                Entry::Capture {
-                                    method: "tools/list",
-                                    response: None,
-                                },
-                            );
-                        }
-                    }
-                    "tools/call" => {
-                        if state.capture_active {
-                            state.entries.insert(
-                                request.id.clone(),
-                                Entry::Capture {
-                                    method: "tools/call",
+                                    method,
                                     response: None,
                                 },
                             );
@@ -842,7 +815,8 @@ mod tests {
         assert_eq!(budget.used(), 0);
 
         // tools/call response is still captured and stubbed normally.
-        let tool_raw = br#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
+        let tool_raw =
+            br#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"ok"}]}}"#;
         let ObserveOutcome::Captured(tool_msg) = ingress
             .observe_bytes(tool_raw, 4096, &budget, false)
             .unwrap()
@@ -876,7 +850,9 @@ mod tests {
         ingress.track(&cancel);
         let stream_raw = br#"{"jsonrpc":"2.0","id":12,"result":{"resultType":"complete"}}"#;
         assert!(matches!(
-            ingress.observe_bytes(stream_raw, 4096, &budget, false).unwrap(),
+            ingress
+                .observe_bytes(stream_raw, 4096, &budget, false)
+                .unwrap(),
             ObserveOutcome::NotMatched
         ));
 

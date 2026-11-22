@@ -6,9 +6,13 @@ use mcpcli::{
     config::{self, LoadedConfig},
     daemon,
     discovery::{self, safe_text, write_safe_text, write_text_json},
+    events_exec::{CursorStore, DEFAULT_EXEC_TIMEOUT, ExecMode},
+    events_stream::{
+        self, DaemonTransport, DirectTransport, StreamConfig, StreamMode, StreamTimings,
+    },
     ipc::{self, Failure, Operation},
     json as input,
-    mcp::McpConnection,
+    mcp::{McpConnection, PollEventsParams},
     media::{InflightBatch, MediaStore},
     runtime::{self, Paths},
     skills,
@@ -42,8 +46,8 @@ struct Cli {
     #[arg(
         long,
         global = true,
-        value_parser = clap::value_parser!(u64).range(1..=3600),
-        help = "Request deadline in seconds, including queue and connection time [default: 60]"
+        value_parser = clap::value_parser!(u64).range(1..),
+        help = "Request deadline in seconds (1-3600, default 60), or milliseconds for `events stream`"
     )]
     timeout: Option<u64>,
     #[arg(
@@ -64,7 +68,19 @@ struct Cli {
 
 impl Cli {
     fn timeout_secs(&self) -> u64 {
-        self.timeout.unwrap_or(60)
+        self.timeout.unwrap_or(60).min(3600)
+    }
+
+    fn validate_request_timeout(&self) -> Result<()> {
+        if let Some(secs) = self.timeout
+            && secs > 3600
+        {
+            return Err(usage(
+                "invalid_timeout",
+                "timeout must be between 1 and 3600 seconds",
+            ));
+        }
+        Ok(())
     }
 
     fn has_explicit_timeout(&self) -> bool {
@@ -140,10 +156,99 @@ enum Command {
         #[command(subcommand)]
         command: SkillCommand,
     },
+    /// List, poll, or stream MCP events from a server.
+    Events {
+        #[command(subcommand)]
+        command: EventsCommand,
+    },
     /// Manage the daemon for the selected config and session.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliStreamMode {
+    Auto,
+    Push,
+    Poll,
+}
+
+impl From<CliStreamMode> for StreamMode {
+    fn from(mode: CliStreamMode) -> Self {
+        match mode {
+            CliStreamMode::Auto => Self::Auto,
+            CliStreamMode::Push => Self::Push,
+            CliStreamMode::Poll => Self::Poll,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliExecMode {
+    Oneshot,
+    Stream,
+}
+
+impl From<CliExecMode> for ExecMode {
+    fn from(mode: CliExecMode) -> Self {
+        match mode {
+            CliExecMode::Oneshot => Self::Oneshot,
+            CliExecMode::Stream => Self::Stream,
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum EventsCommand {
+    /// List available event types on a server.
+    List { server: String },
+    /// Poll once for new events from a server.
+    Poll {
+        server: String,
+        event: String,
+        #[arg(long, conflicts_with_all = ["args_file", "stdin"])]
+        args: Option<String>,
+        #[arg(long, conflicts_with_all = ["args", "stdin"])]
+        args_file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["args", "args_file"])]
+        stdin: bool,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        max_age_ms: Option<u64>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        max_events: Option<u64>,
+    },
+    /// Subscribe to events in the foreground (NDJSON stdout or callback command).
+    Stream {
+        server: String,
+        event: String,
+        #[arg(long, conflicts_with_all = ["args_file", "stdin"])]
+        args: Option<String>,
+        #[arg(long, conflicts_with_all = ["args", "stdin"])]
+        args_file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["args", "args_file"])]
+        stdin: bool,
+        #[arg(long, value_enum, default_value_t = CliStreamMode::Auto)]
+        mode: CliStreamMode,
+        #[arg(long, conflicts_with = "cursor_file")]
+        cursor: Option<String>,
+        #[arg(long, conflicts_with = "cursor")]
+        cursor_file: Option<PathBuf>,
+        #[arg(long)]
+        max_age_ms: Option<u64>,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        heartbeat_ms: Option<u64>,
+        #[arg(long)]
+        once: bool,
+        #[arg(long, value_enum, default_value_t = CliExecMode::Oneshot)]
+        exec_mode: CliExecMode,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        exec_timeout: Option<u64>,
+        #[arg(last = true)]
+        callback: Vec<String>,
     },
 }
 
@@ -457,7 +562,9 @@ async fn remote(
         Operation::Server { server }
         | Operation::Tools { server }
         | Operation::Call { server, .. }
-        | Operation::Reset { server, .. } => server,
+        | Operation::Reset { server, .. }
+        | Operation::EventsList { server }
+        | Operation::EventsPoll { server, .. } => server,
         _ => unreachable!(),
     };
     let config = loaded
@@ -465,6 +572,7 @@ async fn remote(
         .servers
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
+    cli.validate_request_timeout()?;
     let budget = Duration::from_secs(cli.timeout_secs());
     let started = Instant::now();
     if cli.oneshot {
@@ -497,6 +605,34 @@ async fn remote(
                         connection
                             .call_with_dispatch_leased(tool, arguments, remaining, uncertain)
                             .await
+                    }
+                    Operation::EventsList { .. } => {
+                        connection.list_events(remaining).await.map(|events| {
+                            let (events, lease) = events.into_parts();
+                            let mut value = Map::new();
+                            value.insert("events".into(), Value::Array(events));
+                            (Value::Object(value), lease)
+                        })
+                    }
+                    Operation::EventsPoll {
+                        event,
+                        arguments,
+                        cursor,
+                        max_age_ms,
+                        max_events,
+                        ..
+                    } => {
+                        let params = PollEventsParams {
+                            name: event.clone(),
+                            arguments: arguments.clone(),
+                            cursor: cursor.clone(),
+                            max_age_ms: *max_age_ms,
+                            max_events: *max_events,
+                        };
+                        connection
+                            .poll_events(params, remaining)
+                            .await
+                            .map(|value| value.into_parts())
                     }
                     _ => unreachable!(),
                 }
@@ -1069,6 +1205,72 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 _ => unreachable!(),
             }
         }
+        Command::Events { command } => match command {
+            EventsCommand::List { server } => {
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(
+                        Operation::EventsList {
+                            server: server.clone(),
+                        },
+                        ByteBudget::global().empty_lease(),
+                    ),
+                    uncertain,
+                )
+                .await?;
+                Ok(remote.into_output(|value| Ok(Output::json(value))))
+            }
+            EventsCommand::Poll {
+                server,
+                event,
+                args,
+                args_file,
+                stdin,
+                cursor,
+                max_age_ms,
+                max_events,
+            } => {
+                if event.is_empty() || event.len() > 512 || event.chars().any(char::is_control) {
+                    return Err(usage("invalid_event", "invalid event name"));
+                }
+                cli.validate_request_timeout()?;
+                let (input_lease, parsed_args) = if args.is_some() || args_file.is_some() || *stdin
+                {
+                    let leased = arguments(
+                        args,
+                        args_file,
+                        *stdin,
+                        Duration::from_secs(cli.timeout_secs()),
+                        ByteBudget::global(),
+                    )
+                    .await?;
+                    let (map, lease) = leased.into_parts();
+                    (lease, Some(map))
+                } else {
+                    (ByteBudget::global().empty_lease(), None)
+                };
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(
+                        Operation::EventsPoll {
+                            server: server.clone(),
+                            event: event.clone(),
+                            arguments: parsed_args,
+                            cursor: cursor.clone(),
+                            max_age_ms: *max_age_ms,
+                            max_events: *max_events,
+                        },
+                        input_lease,
+                    ),
+                    uncertain,
+                )
+                .await?;
+                Ok(remote.into_output(|value| Ok(Output::json(value))))
+            }
+            EventsCommand::Stream { .. } => unreachable!("handled by run_events_stream"),
+        },
         Command::Daemon { .. } => unreachable!(),
     }
 }
@@ -1098,6 +1300,15 @@ fn retain_cli_input(
     let bytes = match &cli.command {
         Command::Call {
             args: Some(args), ..
+        }
+        | Command::Events {
+            command:
+                EventsCommand::Poll {
+                    args: Some(args), ..
+                }
+                | EventsCommand::Stream {
+                    args: Some(args), ..
+                },
         } => {
             if args.len() > ipc::ARGUMENT_LIMIT {
                 return Err(Failure::new(
@@ -1120,6 +1331,134 @@ fn retain_cli_input(
     Ok(Leased::new(cli, lease))
 }
 
+async fn run_events_stream(
+    cli: &Cli,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<Output> {
+    let Command::Events {
+        command:
+            EventsCommand::Stream {
+                server,
+                event,
+                args,
+                args_file,
+                stdin,
+                mode,
+                cursor,
+                cursor_file,
+                max_age_ms,
+                heartbeat_ms,
+                once,
+                exec_mode,
+                exec_timeout,
+                callback,
+            },
+    } = &cli.command
+    else {
+        unreachable!();
+    };
+    if event.is_empty() || event.len() > 512 || event.chars().any(char::is_control) {
+        return Err(usage("invalid_event", "invalid event name"));
+    }
+    let loaded = load(cli)?;
+    let server_config = loaded
+        .config
+        .servers
+        .get(server)
+        .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
+    let parsed_args = if args.is_some() || args_file.is_some() || *stdin {
+        let leased = arguments(
+            args,
+            args_file,
+            *stdin,
+            Duration::from_secs(30),
+            ByteBudget::global(),
+        )
+        .await?;
+        let (map, lease) = leased.into_parts();
+        drop(lease);
+        Some(map)
+    } else {
+        None
+    };
+    let stream_cfg = StreamConfig {
+        server: server.clone(),
+        event: event.clone(),
+        arguments: parsed_args,
+        mode: (*mode).into(),
+        initial_cursor: cursor.clone(),
+        cursor_file: cursor_file.as_ref().map(CursorStore::new),
+        max_age_ms: *max_age_ms,
+        heartbeat_ms: *heartbeat_ms,
+        once: *once,
+        timeout: cli.timeout.map(Duration::from_millis),
+        callback_argv: (!callback.is_empty()).then(|| callback.clone()),
+        exec_mode: (*exec_mode).into(),
+        exec_timeout: exec_timeout
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_EXEC_TIMEOUT),
+    };
+
+    if cli.oneshot {
+        let connect_budget = stream_cfg
+            .timeout
+            .map(|d| d.min(Duration::from_secs(30)))
+            .unwrap_or(Duration::from_secs(30));
+        let connection = McpConnection::connect(server_config, connect_budget)
+            .await
+            .map_err(|error| daemon::mcp_error(error, false))?;
+        let mut transport = DirectTransport::new(connection);
+        let outcome = events_stream::run_stream(
+            &mut transport,
+            &stream_cfg,
+            StreamTimings::default(),
+            cancel,
+            None,
+        )
+        .await;
+        let connection = transport.into_connection();
+        return match outcome {
+            Ok(()) => Ok(Output {
+                value: None,
+                text: None,
+                code: 0,
+                diagnostic: None,
+                connection: Some(connection),
+                inflight: None,
+                lease: None,
+            }),
+            Err(error) => Ok(Output::failure(error).with_connection(Some(connection))),
+        };
+    }
+
+    let paths = Paths::new(loaded.path.clone(), &cli.session)?;
+    let ensure_budget = stream_cfg
+        .timeout
+        .map(|d| d.min(runtime::START_WAIT))
+        .unwrap_or(runtime::START_WAIT);
+    timeout(ensure_budget, runtime::ensure(&paths, &loaded, false))
+        .await
+        .map_err(|_| Failure::new(5, "timeout", "deadline elapsed while starting the daemon"))??;
+    let mut transport = DaemonTransport::new(paths, loaded, server.clone());
+    events_stream::run_stream(
+        &mut transport,
+        &stream_cfg,
+        StreamTimings::default(),
+        cancel,
+        None,
+    )
+    .await?;
+    Ok(Output {
+        value: None,
+        text: None,
+        code: 0,
+        diagnostic: None,
+        connection: None,
+        inflight: None,
+        lease: None,
+    })
+}
+
 async fn entry(cli: Cli) -> i32 {
     let cli = match retain_cli_input(cli, ByteBudget::global()) {
         Ok(cli) => cli,
@@ -1134,11 +1473,52 @@ async fn entry(cli: Cli) -> i32 {
             command: DaemonCommand::Run
         }
     );
+    let is_event_stream = matches!(
+        cli.command,
+        Command::Events {
+            command: EventsCommand::Stream { .. }
+        }
+    );
     let uncertain = AtomicBool::new(false);
     let signal = mcpcli::platform::interrupted();
     tokio::pin!(signal);
     let result = if foreground {
         run(&cli, &uncertain).await
+    } else if is_event_stream {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let stream_fut = run_events_stream(&cli, cancel.clone());
+        tokio::pin!(stream_fut);
+        let mut interrupted_code: Option<i32> = None;
+        let res = loop {
+            tokio::select! {
+                biased;
+                res = &mut stream_fut => break res,
+                sig = &mut signal, if interrupted_code.is_none() => {
+                    match sig {
+                        Ok(code) => {
+                            interrupted_code = Some(code);
+                            cancel.cancel();
+                        }
+                        Err(error) => {
+                            cancel.cancel();
+                            let _ = stream_fut.await;
+                            break Err(error.into());
+                        }
+                    }
+                }
+            }
+        };
+        match (res, interrupted_code) {
+            (Err(mut err), Some(code)) => {
+                if let Some(failure) = err.downcast_mut::<Failure>()
+                    && failure.kind == "cancelled"
+                {
+                    failure.code = code;
+                }
+                Err(err)
+            }
+            (other, _) => other,
+        }
     } else {
         tokio::select! {
             biased;
@@ -1743,5 +2123,115 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn events_cli_commands_parse_all_flags_and_reject_conflicts() {
+        let list = Cli::try_parse_from(["mcpcli", "events", "list", "github"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Command::Events {
+                command: EventsCommand::List { ref server }
+            } if server == "github"
+        ));
+
+        let poll = Cli::try_parse_from([
+            "mcpcli",
+            "events",
+            "poll",
+            "github",
+            "pr.merged",
+            "--args",
+            r#"{"repo":"org/app"}"#,
+            "--cursor",
+            "1:5",
+            "--max-age-ms",
+            "60000",
+            "--max-events",
+            "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            poll.command,
+            Command::Events {
+                command: EventsCommand::Poll {
+                    ref server,
+                    ref event,
+                    args: Some(_),
+                    cursor: Some(_),
+                    max_age_ms: Some(60_000),
+                    max_events: Some(10),
+                    ..
+                }
+            } if server == "github" && event == "pr.merged"
+        ));
+
+        let stream = Cli::try_parse_from([
+            "mcpcli",
+            "--oneshot",
+            "events",
+            "stream",
+            "github",
+            "pr.merged",
+            "--args",
+            r#"{"repo":"org/app"}"#,
+            "--mode",
+            "poll",
+            "--cursor-file",
+            "/tmp/pr.cursor",
+            "--max-age-ms",
+            "120000",
+            "--heartbeat-ms",
+            "15000",
+            "--once",
+            "--timeout",
+            "300000",
+            "--exec-mode",
+            "stream",
+            "--exec-timeout",
+            "5000",
+            "--",
+            "fastexec",
+            "daemon",
+            "emit",
+            "--stream",
+        ])
+        .unwrap();
+        assert!(stream.oneshot);
+        assert_eq!(stream.timeout, Some(300_000));
+        assert!(matches!(
+            stream.command,
+            Command::Events {
+                command: EventsCommand::Stream {
+                    ref server,
+                    ref event,
+                    mode: CliStreamMode::Poll,
+                    cursor_file: Some(_),
+                    max_age_ms: Some(120_000),
+                    heartbeat_ms: Some(15_000),
+                    once: true,
+                    exec_mode: CliExecMode::Stream,
+                    exec_timeout: Some(5_000),
+                    ref callback,
+                    ..
+                }
+            } if server == "github" && event == "pr.merged" && callback == &["fastexec", "daemon", "emit", "--stream"]
+        ));
+
+        // --cursor and --cursor-file must conflict.
+        assert!(
+            Cli::try_parse_from([
+                "mcpcli",
+                "events",
+                "stream",
+                "github",
+                "pr.merged",
+                "--cursor",
+                "1:1",
+                "--cursor-file",
+                "/tmp/c",
+            ])
+            .is_err()
+        );
     }
 }

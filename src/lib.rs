@@ -12,6 +12,7 @@ pub mod config;
 pub mod daemon;
 pub mod discovery;
 pub mod events_exec;
+pub mod events_stream;
 pub mod ipc;
 pub mod json;
 pub mod mcp;

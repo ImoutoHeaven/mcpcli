@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 pub const REQUEST_LIMIT: usize = 4 << 20;
 pub const RESPONSE_LIMIT: usize = 512 << 20;
 pub const ARGUMENT_LIMIT: usize = 1 << 20;
@@ -57,6 +57,33 @@ pub enum Operation {
         server: String,
         force: bool,
     },
+    EventsList {
+        server: String,
+    },
+    EventsPoll {
+        server: String,
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<Map<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_age_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_events: Option<u64>,
+    },
+    EventsStream {
+        server: String,
+        event: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        arguments: Option<Map<String, Value>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cursor: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_age_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heartbeat_ms: Option<u64>,
+    },
 }
 impl Operation {
     pub fn management(&self) -> bool {
@@ -64,6 +91,9 @@ impl Operation {
     }
     pub fn is_call(&self) -> bool {
         matches!(self, Self::Call { .. })
+    }
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, Self::EventsStream { .. })
     }
 }
 
@@ -114,6 +144,30 @@ pub struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Failure>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamFrame {
+    pub protocol: u32,
+    pub namespace: String,
+    pub build: String,
+    pub epoch: String,
+    pub kind: StreamFrameKind,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "frame", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StreamFrameKind {
+    Notification {
+        method: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        params: Option<Value>,
+    },
+    Error {
+        error: Failure,
+    },
+    End,
 }
 
 struct LimitedVecWriter {
@@ -549,5 +603,86 @@ mod tests {
         let err = encode_frame_leased(&OncePayload(&calls, "hello"), 64, &tiny_budget).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::OutOfMemory);
         assert_eq!(tiny_budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn ipc_v4_stream_frames_round_trip_and_operation_classification() {
+        assert_eq!(PROTOCOL, 4);
+        assert!(
+            Operation::EventsStream {
+                server: "s".into(),
+                event: "e".into(),
+                arguments: None,
+                cursor: None,
+                max_age_ms: None,
+                heartbeat_ms: Some(10_000),
+            }
+            .is_streaming()
+        );
+        assert!(!Operation::EventsList { server: "s".into() }.is_streaming());
+        assert!(
+            !Operation::EventsPoll {
+                server: "s".into(),
+                event: "e".into(),
+                arguments: None,
+                cursor: None,
+                max_age_ms: None,
+                max_events: Some(5),
+            }
+            .is_streaming()
+        );
+
+        let (mut tx, mut rx) = tokio::io::duplex(4096);
+        let frames = [
+            StreamFrame {
+                protocol: PROTOCOL,
+                namespace: "ns".into(),
+                build: "b".into(),
+                epoch: "e1".into(),
+                kind: StreamFrameKind::Notification {
+                    method: "notifications/events/active".into(),
+                    params: Some(serde_json::json!({"cursor": "1:1", "heartbeatMs": 30000})),
+                },
+            },
+            StreamFrame {
+                protocol: PROTOCOL,
+                namespace: "ns".into(),
+                build: "b".into(),
+                epoch: "e1".into(),
+                kind: StreamFrameKind::Error {
+                    error: Failure::new(4, "stream_terminated", "done"),
+                },
+            },
+            StreamFrame {
+                protocol: PROTOCOL,
+                namespace: "ns".into(),
+                build: "b".into(),
+                epoch: "e1".into(),
+                kind: StreamFrameKind::End,
+            },
+        ];
+        for frame in &frames {
+            write_frame(&mut tx, frame, 4096).await.unwrap();
+        }
+        drop(tx);
+
+        let f0: StreamFrame = read_frame(&mut rx, 4096).await.unwrap().unwrap();
+        assert!(matches!(
+            f0.kind,
+            StreamFrameKind::Notification { ref method, .. } if method == "notifications/events/active"
+        ));
+        let f1: StreamFrame = read_frame(&mut rx, 4096).await.unwrap().unwrap();
+        assert!(matches!(
+            f1.kind,
+            StreamFrameKind::Error { ref error } if error.kind == "stream_terminated"
+        ));
+        let f2: StreamFrame = read_frame(&mut rx, 4096).await.unwrap().unwrap();
+        assert!(matches!(f2.kind, StreamFrameKind::End));
+        assert!(
+            read_frame::<_, StreamFrame>(&mut rx, 4096)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

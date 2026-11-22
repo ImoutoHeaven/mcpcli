@@ -1,7 +1,10 @@
 use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 use crate::config::LoadedConfig;
-use crate::ipc::{self, Failure, Operation, Request, Response};
-use crate::mcp::{FailureKind, MAX_CONNECT, McpConnection, McpFailure, McpLimits};
+use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
+use crate::mcp::{
+    FailureKind, MAX_CONNECT, McpConnection, McpEventsClient, McpFailure, McpLimits,
+    PollEventsParams, StreamEventsParams,
+};
 use crate::media::{InflightBatch, MediaStore};
 use crate::platform::{
     self,
@@ -23,9 +26,10 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS: usize = 64;
 const MAX_CONTROL_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
+const MAX_EVENT_STREAMS: usize = 32;
 const FRAME_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -51,12 +55,24 @@ impl Default for DaemonOptions {
     }
 }
 
-#[derive(Default)]
 struct ServerState {
     connection: Option<McpConnection>,
     lost: bool,
     calls: u64,
+    streams_cancel: CancellationToken,
 }
+
+impl Default for ServerState {
+    fn default() -> Self {
+        Self {
+            connection: None,
+            lost: false,
+            calls: 0,
+            streams_cancel: CancellationToken::new(),
+        }
+    }
+}
+
 struct App {
     paths: Paths,
     config: LoadedConfig,
@@ -64,6 +80,7 @@ struct App {
     options: DaemonOptions,
     servers: BTreeMap<String, Arc<Mutex<ServerState>>>,
     work: Semaphore,
+    event_streams: Semaphore,
     shutdown: CancellationToken,
 }
 
@@ -170,7 +187,112 @@ impl App {
                 ));
             }
         }
+        if let Operation::EventsPoll {
+            event, arguments, ..
+        }
+        | Operation::EventsStream {
+            event, arguments, ..
+        } = &request.operation
+        {
+            if event.is_empty() || event.len() > 512 || event.chars().any(char::is_control) {
+                return Err(Failure::new(2, "invalid_event", "invalid event name"));
+            }
+            if let Some(arguments) = arguments {
+                let size = crate::json::serialized_len(arguments)
+                    .map_err(|_| Failure::new(2, "invalid_arguments", "cannot encode arguments"))?;
+                if size > ipc::ARGUMENT_LIMIT {
+                    return Err(Failure::new(
+                        2,
+                        "invalid_arguments",
+                        "arguments exceed the 1 MiB limit",
+                    ));
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn stream_frame(&self, kind: StreamFrameKind) -> StreamFrame {
+        StreamFrame {
+            protocol: ipc::PROTOCOL,
+            namespace: self.paths.namespace.clone(),
+            build: self.paths.build.clone(),
+            epoch: self.state.epoch.clone(),
+            kind,
+        }
+    }
+
+    async fn ensure_events_client(
+        &self,
+        server: &str,
+        deadline: Instant,
+    ) -> std::result::Result<(McpEventsClient, CancellationToken), Failure> {
+        let state = self.servers.get(server).ok_or_else(|| {
+            Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
+        })?;
+        let mut state = state.lock().await;
+        if Instant::now() >= deadline {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "request deadline exceeded while queued",
+            ));
+        }
+        if state.lost
+            || state
+                .connection
+                .as_ref()
+                .is_some_and(McpConnection::is_closed)
+        {
+            state.lost = true;
+            state.streams_cancel.cancel();
+            return Err(Failure::new(
+                6,
+                "session_lost",
+                format!(
+                    "server {server:?} disconnected; state may be lost. Run reset {server} before opening a new connection"
+                ),
+            ));
+        }
+        if state.connection.is_none() {
+            let budget = deadline
+                .saturating_duration_since(Instant::now())
+                .min(MAX_CONNECT);
+            if budget.is_zero() {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "request deadline exceeded before connecting",
+                ));
+            }
+            let config = &self.config.config.servers[server];
+            state.connection = Some(
+                McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone())
+                    .await
+                    .map_err(|e| mcp_error(e, false))?,
+            );
+        }
+        let client = state
+            .connection
+            .as_ref()
+            .expect("connection was established")
+            .events_client();
+        let cancel = state.streams_cancel.child_token();
+        Ok((client, cancel))
+    }
+
+    async fn mark_server_lost_if_closed(&self, server: &str) {
+        if let Some(server_state) = self.servers.get(server) {
+            let mut state = server_state.lock().await;
+            if state
+                .connection
+                .as_ref()
+                .is_some_and(McpConnection::is_closed)
+            {
+                state.lost = true;
+                state.streams_cancel.cancel();
+            }
+        }
     }
     async fn execute(
         &self,
@@ -179,13 +301,79 @@ impl App {
         dispatched: &AtomicBool,
     ) -> ExecutionOutcome {
         let empty = || self.options.budget.empty_lease();
-        let server = match operation {
+        match operation {
             Operation::Status => return Ok((self.status(), empty(), None)),
             Operation::Stop => return Ok((json!({"stopping":true}), empty(), None)),
+            Operation::EventsList { server } => {
+                let _work = self
+                    .work
+                    .acquire()
+                    .await
+                    .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
+                let (client, _) = self.ensure_events_client(server, deadline).await?;
+                let budget = deadline.saturating_duration_since(Instant::now());
+                if budget.is_zero() {
+                    return Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded before dispatch",
+                    ));
+                }
+                let result = client.list_events(budget).await;
+                if client.is_closed() {
+                    self.mark_server_lost_if_closed(server).await;
+                }
+                let events = result.map_err(|e| mcp_error(e, false))?;
+                let (events, lease) = events.into_parts();
+                let mut value = serde_json::Map::new();
+                value.insert("events".into(), Value::Array(events));
+                return Ok((Value::Object(value), lease, None));
+            }
+            Operation::EventsPoll {
+                server,
+                event,
+                arguments,
+                cursor,
+                max_age_ms,
+                max_events,
+            } => {
+                let _work = self
+                    .work
+                    .acquire()
+                    .await
+                    .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
+                let (client, _) = self.ensure_events_client(server, deadline).await?;
+                let budget = deadline.saturating_duration_since(Instant::now());
+                if budget.is_zero() {
+                    return Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded before dispatch",
+                    ));
+                }
+                let params = PollEventsParams {
+                    name: event.clone(),
+                    arguments: arguments.clone(),
+                    cursor: cursor.clone(),
+                    max_age_ms: *max_age_ms,
+                    max_events: *max_events,
+                };
+                let result = client.poll_events(params, budget).await;
+                if client.is_closed() {
+                    self.mark_server_lost_if_closed(server).await;
+                }
+                let polled = result.map_err(|e| mcp_error(e, false))?;
+                let (value, lease) = polled.into_parts();
+                return Ok((value, lease, None));
+            }
+            _ => {}
+        }
+        let server = match operation {
             Operation::Server { server }
             | Operation::Tools { server }
             | Operation::Call { server, .. }
             | Operation::Reset { server, .. } => server,
+            _ => unreachable!(),
         };
         let state = self.servers.get(server).ok_or_else(|| {
             Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
@@ -205,6 +393,8 @@ impl App {
         }
         if let Operation::Reset { force, .. } = operation {
             state.lost = true;
+            state.streams_cancel.cancel();
+            state.streams_cancel = CancellationToken::new();
             let mut warning = None;
             if let Some(connection) = state.connection.as_mut()
                 && let Err(error) = connection.close().await
@@ -246,6 +436,7 @@ impl App {
                 .is_some_and(McpConnection::is_closed)
         {
             state.lost = true;
+            state.streams_cancel.cancel();
             return Err(Failure::new(
                 6,
                 "session_lost",
@@ -457,6 +648,227 @@ async fn send(
     }
 }
 
+async fn write_stream_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    app: &App,
+    kind: StreamFrameKind,
+) -> io::Result<()> {
+    let frame_msg = app.stream_frame(kind);
+    let (frame, lease) =
+        ipc::encode_frame_leased(&frame_msg, app.options.response_limit, &app.options.budget)?;
+    drop(frame_msg);
+    let frame = Leased::new(frame, lease);
+    let started = AtomicBool::new(false);
+    // Streaming IPC never enforces the 1-hour total deadline; only per-frame idle timeout applies.
+    ipc::write_raw_idle(writer, &frame, app.options.idle_timeout, None, &started).await
+}
+
+async fn handle_events_stream(
+    mut stream: Conn,
+    app: Arc<App>,
+    request: Leased<Request>,
+    control: bool,
+) {
+    if control {
+        let _ = write_stream_frame(
+            &mut stream,
+            &app,
+            StreamFrameKind::Error {
+                error: Failure::new(
+                    2,
+                    "control_only",
+                    "control endpoint only accepts status and stop",
+                ),
+            },
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = app.validate(&request) {
+        let _ = write_stream_frame(&mut stream, &app, StreamFrameKind::Error { error }).await;
+        return;
+    }
+    let Ok(_stream_permit) = app.event_streams.try_acquire() else {
+        let _ = write_stream_frame(
+            &mut stream,
+            &app,
+            StreamFrameKind::Error {
+                error: Failure::new(
+                    4,
+                    "stream_limit",
+                    "too many concurrent event streams on daemon",
+                ),
+            },
+        )
+        .await;
+        return;
+    };
+    let Operation::EventsStream {
+        server,
+        event,
+        arguments,
+        cursor,
+        max_age_ms,
+        heartbeat_ms,
+    } = &request.operation
+    else {
+        unreachable!();
+    };
+    let handshake_ms = request.timeout_ms.clamp(1, 30_000);
+    let handshake_deadline = Instant::now() + Duration::from_millis(handshake_ms);
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let mut extra = [0u8; 1];
+
+    let connect_result = tokio::select! {
+        biased;
+        _ = app.shutdown.cancelled() => Err(Failure::new(4, "stopping", "daemon is stopping")),
+        _ = reader.read(&mut extra) => return,
+        res = app.ensure_events_client(server, handshake_deadline) => res,
+    };
+    let (client, server_cancel) = match connect_result {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = write_stream_frame(&mut writer, &app, StreamFrameKind::Error { error }).await;
+            return;
+        }
+    };
+
+    let open_budget = handshake_deadline.saturating_duration_since(Instant::now());
+    if open_budget.is_zero() {
+        let _ = write_stream_frame(
+            &mut writer,
+            &app,
+            StreamFrameKind::Error {
+                error: Failure::new(5, "timeout", "event stream handshake timed out"),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let params = StreamEventsParams {
+        name: event.clone(),
+        arguments: arguments.clone(),
+        cursor: cursor.clone(),
+        max_age_ms: *max_age_ms,
+        heartbeat_ms: *heartbeat_ms,
+    };
+    let open_result = tokio::select! {
+        biased;
+        _ = app.shutdown.cancelled() => Err(Failure::new(4, "stopping", "daemon is stopping")),
+        _ = server_cancel.cancelled() => Err(Failure::new(
+            6,
+            "session_lost",
+            format!("server {server:?} was reset or disconnected"),
+        )),
+        _ = reader.read(&mut extra) => return,
+        res = client.open_event_stream(params, open_budget) => {
+            if client.is_closed() {
+                app.mark_server_lost_if_closed(server).await;
+            }
+            res.map_err(|e| mcp_error(e, false))
+        }
+    };
+
+    let (stream_handle, mut rx) = match open_result {
+        Ok(pair) => pair,
+        Err(error) => {
+            let _ = write_stream_frame(&mut writer, &app, StreamFrameKind::Error { error }).await;
+            return;
+        }
+    };
+
+    // Release request memory lease once the upstream stream is active.
+    let server = server.clone();
+    drop(request);
+
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = app.shutdown.cancelled() => {
+                let _ = stream_handle.cancel().await;
+                let _ = write_stream_frame(
+                    &mut writer,
+                    &app,
+                    StreamFrameKind::Error {
+                        error: Failure::new(4, "stopping", "daemon is stopping"),
+                    },
+                )
+                .await;
+                return;
+            }
+            _ = server_cancel.cancelled() => {
+                let _ = stream_handle.cancel().await;
+                let _ = write_stream_frame(
+                    &mut writer,
+                    &app,
+                    StreamFrameKind::Error {
+                        error: Failure::new(
+                            6,
+                            "session_lost",
+                            format!("server {server:?} was reset or disconnected"),
+                        ),
+                    },
+                )
+                .await;
+                return;
+            }
+            _ = reader.read(&mut extra) => {
+                // Foreground CLI disconnected (EOF) or sent unexpected input: cancel upstream immediately.
+                let _ = stream_handle.cancel().await;
+                return;
+            }
+            notif = rx.recv() => notif,
+        };
+
+        let Some(leased) = next else {
+            if client.is_closed() {
+                app.mark_server_lost_if_closed(&server).await;
+                let _ = write_stream_frame(
+                    &mut writer,
+                    &app,
+                    StreamFrameKind::Error {
+                        error: Failure::new(
+                            6,
+                            "session_lost",
+                            format!("server {server:?} disconnected"),
+                        ),
+                    },
+                )
+                .await;
+            } else {
+                let _ = write_stream_frame(&mut writer, &app, StreamFrameKind::End).await;
+            }
+            return;
+        };
+
+        let (notif, notif_lease) = leased.into_parts();
+        let is_terminated = notif.method == "notifications/events/terminated";
+        let kind = StreamFrameKind::Notification {
+            method: notif.method,
+            params: notif.params,
+        };
+        drop(notif_lease);
+
+        let write_ok = tokio::select! {
+            biased;
+            _ = reader.read(&mut extra) => {
+                let _ = stream_handle.cancel().await;
+                return;
+            }
+            res = write_stream_frame(&mut writer, &app, kind) => res.is_ok(),
+        };
+        if !write_ok {
+            let _ = stream_handle.cancel().await;
+            return;
+        }
+        if is_terminated {
+            let _ = write_stream_frame(&mut writer, &app, StreamFrameKind::End).await;
+            return;
+        }
+    }
+}
+
 async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
     if platform::validate_client(&stream).is_err() {
         return;
@@ -474,6 +886,10 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
         Ok(Ok(Some((request, lease)))) => Leased::new(request, lease),
         _ => return,
     };
+    if request.operation.is_streaming() {
+        handle_events_stream(stream, app, request, control).await;
+        return;
+    }
     if control && !request.operation.management() {
         send(
             &mut stream,
@@ -598,6 +1014,7 @@ pub async fn run_with_options(
         options,
         servers,
         work: Semaphore::new(MAX_IN_FLIGHT),
+        event_streams: Semaphore::new(MAX_EVENT_STREAMS),
         shutdown: CancellationToken::new(),
     });
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -652,6 +1069,7 @@ pub async fn run_with_options(
     let cleanup =
         futures_util::future::join_all(app.servers.iter().map(|(name, server)| async move {
             let mut state = server.lock().await;
+            state.streams_cancel.cancel();
             if let Some(connection) = state.connection.as_mut() {
                 connection
                     .close()
@@ -672,4 +1090,330 @@ pub async fn run_with_options(
         anyhow::bail!("daemon cleanup failed: {}", state.cleanup_errors.join("; "));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn start_mock_events_http_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = socket.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let mut content_len = 0usize;
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_len];
+                    if reader.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+                        return;
+                    };
+                    let id = req.get("id").cloned().unwrap_or(json!(1));
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    match method {
+                        "server/discover" => {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "resultType": "complete",
+                                    "supportedVersions": ["2026-07-28"],
+                                    "capabilities": {
+                                        "extensions": {
+                                            "io.modelcontextprotocol/events": { "listChanged": false }
+                                        }
+                                    },
+                                    "ttlMs": 60000,
+                                    "cacheScope": "public",
+                                    "_meta": {
+                                        "io.modelcontextprotocol/serverInfo": {
+                                            "name": "mock-events",
+                                            "version": "1.0"
+                                        }
+                                    }
+                                }
+                            });
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let _ = write_half.write_all(&payload).await;
+                        }
+                        "events/list" => {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "resultType": "complete",
+                                    "events": [{
+                                        "name": "task.exited",
+                                        "deliveryModes": ["push", "poll"]
+                                    }]
+                                }
+                            });
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let _ = write_half.write_all(&payload).await;
+                        }
+                        "events/poll" => {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "resultType": "complete",
+                                    "events": [{"eventId": "p1", "name": "task.exited", "data": {"ok": true}}],
+                                    "cursor": "1:1",
+                                    "truncated": false,
+                                    "hasMore": false,
+                                    "nextPollMs": 1000
+                                }
+                            });
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let _ = write_half.write_all(&payload).await;
+                        }
+                        "events/stream" => {
+                            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let active = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/events/active",
+                                "params": {
+                                    "cursor": "1:10",
+                                    "truncated": false,
+                                    "heartbeatMs": 5000,
+                                    "_meta": { "io.modelcontextprotocol/subscriptionId": id }
+                                }
+                            });
+                            let ev = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/events/event",
+                                "params": {
+                                    "eventId": "ev-11",
+                                    "name": "task.exited",
+                                    "data": { "code": 0 },
+                                    "cursor": "1:11",
+                                    "_meta": { "io.modelcontextprotocol/subscriptionId": id }
+                                }
+                            });
+                            let term = json!({
+                                "jsonrpc": "2.0",
+                                "method": "notifications/events/terminated",
+                                "params": {
+                                    "error": { "code": -32024, "message": "done" },
+                                    "_meta": { "io.modelcontextprotocol/subscriptionId": id }
+                                }
+                            });
+                            for frame in [active, ev, term] {
+                                let sse =
+                                    format!("data: {}\n\n", serde_json::to_string(&frame).unwrap());
+                                let _ = write_half.write_all(sse.as_bytes()).await;
+                                let _ = write_half.flush().await;
+                                tokio::time::sleep(Duration::from_millis(20)).await;
+                            }
+                        }
+                        _ => {
+                            let header = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_v4_forwards_events_list_poll_and_stream_without_blocking_server() {
+        let (url, server_task) = start_mock_events_http_server().await;
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string(&json!({
+                "servers": {
+                    "mock": {
+                        "transport": "http",
+                        "url": url
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&cfg_path).unwrap();
+        let root = base_path.join("runtime");
+        let paths = Paths::with_root(loaded.path.clone(), "evtest", &root).unwrap();
+
+        let daemon_paths = paths.clone();
+        let daemon_loaded = loaded.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_with_options(daemon_paths, daemon_loaded, DaemonOptions::default()).await
+        });
+
+        for _ in 0..80 {
+            if paths.running().unwrap_or(false)
+                && runtime::exchange(
+                    &paths,
+                    &paths
+                        .request("", Operation::Status, Duration::from_millis(200))
+                        .unwrap(),
+                )
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // 1. EventsList
+        let (list_resp, _) = runtime::exchange(
+            &paths,
+            &paths
+                .request(
+                    &loaded.digest,
+                    Operation::EventsList {
+                        server: "mock".into(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(list_resp.protocol, ipc::PROTOCOL);
+        assert_eq!(
+            list_resp.result.unwrap()["events"][0]["name"],
+            "task.exited"
+        );
+
+        // 2. EventsPoll
+        let (poll_resp, _) = runtime::exchange(
+            &paths,
+            &paths
+                .request(
+                    &loaded.digest,
+                    Operation::EventsPoll {
+                        server: "mock".into(),
+                        event: "task.exited".into(),
+                        arguments: None,
+                        cursor: None,
+                        max_age_ms: None,
+                        max_events: Some(5),
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll_resp.result.unwrap()["events"][0]["eventId"], "p1");
+
+        // 3. EventsStream + concurrent EventsList while stream is open
+        let mut stream = runtime::open_event_stream(
+            &paths,
+            &paths
+                .request(
+                    &loaded.digest,
+                    Operation::EventsStream {
+                        server: "mock".into(),
+                        event: "task.exited".into(),
+                        arguments: None,
+                        cursor: None,
+                        max_age_ms: None,
+                        heartbeat_ms: Some(5000),
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let (first_frame, _) = stream.next_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            first_frame,
+            StreamFrameKind::Notification { ref method, .. } if method == "notifications/events/active"
+        ));
+
+        // Concurrent EventsList succeeds immediately while EventsStream is active.
+        let (concurrent_list, _) = runtime::exchange(
+            &paths,
+            &paths
+                .request(
+                    &loaded.digest,
+                    Operation::EventsList {
+                        server: "mock".into(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            concurrent_list.result.unwrap()["events"][0]["name"],
+            "task.exited"
+        );
+
+        let (second_frame, _) = stream.next_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            second_frame,
+            StreamFrameKind::Notification { ref method, .. } if method == "notifications/events/event"
+        ));
+
+        let (third_frame, _) = stream.next_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            third_frame,
+            StreamFrameKind::Notification { ref method, .. } if method == "notifications/events/terminated"
+        ));
+
+        let (end_frame, _) = stream.next_frame().await.unwrap().unwrap();
+        assert!(matches!(end_frame, StreamFrameKind::End));
+
+        let _ = runtime::stop(&paths).await;
+        let _ = daemon_task.await;
+        server_task.abort();
+    }
 }

@@ -366,3 +366,94 @@ pub(super) fn same_file(first: &File, second: &File) -> io::Result<bool> {
     let second = second.metadata()?;
     Ok(first.dev() == second.dev() && first.ino() == second.ino())
 }
+
+/// Put the child in its own process group and kill it if this parent exits.
+pub fn configure_child_process_group(command: &mut tokio::process::Command) {
+    command.process_group(0);
+    #[cfg(target_os = "linux")]
+    {
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: only async-signal-safe libc calls run between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(target_os = "freebsd")]
+    {
+        let parent = std::process::id() as libc::pid_t;
+        // SAFETY: procctl/getppid/_exit do not allocate or acquire Rust locks.
+        unsafe {
+            command.pre_exec(move || {
+                let signal: libc::c_int = libc::SIGKILL;
+                if libc::procctl(
+                    libc::P_PID,
+                    0,
+                    libc::PROC_PDEATHSIG_CTL,
+                    (&signal as *const libc::c_int).cast_mut().cast(),
+                ) == -1
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(127);
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+pub fn signal_process_group(group: i32, signal: i32) {
+    // SAFETY: caller owns the unreaped child's process group leader PID.
+    unsafe {
+        libc::kill(-group, signal);
+    }
+}
+
+/// Check whether the process group leader has exited without reaping it (keeps PGID pinned).
+pub fn child_exited_unreaped(group: &mut Option<i32>) -> io::Result<bool> {
+    let Some(pid) = *group else {
+        return Ok(true);
+    };
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    // SAFETY: WNOWAIT inspects exit status without reaping, keeping PGID pinned.
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ECHILD) {
+            // Another reaper has taken ownership; this numeric PGID is no longer ours.
+            *group = None;
+        }
+        return Err(error);
+    }
+    Ok(unsafe { info.si_pid() } == pid)
+}
+
+pub async fn wait_child_unreaped(
+    group: &mut Option<i32>,
+    wait: std::time::Duration,
+) -> io::Result<bool> {
+    tokio::time::timeout(wait, async {
+        while !child_exited_unreaped(group)? {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(true)
+    })
+    .await
+    .unwrap_or(Ok(false))
+}

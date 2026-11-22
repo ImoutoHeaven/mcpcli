@@ -21,7 +21,7 @@ use windows_sys::Win32::{
     },
 };
 
-pub(super) struct Job(OwnedHandle);
+pub(crate) struct Job(OwnedHandle);
 
 impl Job {
     fn create_kill_on_close() -> io::Result<Self> {
@@ -49,7 +49,7 @@ impl Job {
         Ok(job)
     }
 
-    pub(super) fn adopt(child: &Child) -> io::Result<Self> {
+    pub(crate) fn adopt(child: &Child) -> io::Result<Self> {
         let job = Self::create_kill_on_close()?;
         let process = child
             .raw_handle()
@@ -68,8 +68,7 @@ impl Job {
 
     /// Bind an already-running short-lived child without CREATE_SUSPENDED.
     /// Returns Ok(None) if the child exited before assignment (ERROR_ACCESS_DENIED).
-    #[allow(dead_code)]
-    pub(super) fn assign_running(child: &Child) -> io::Result<Option<Self>> {
+    pub(crate) fn assign_running(child: &Child) -> io::Result<Option<Self>> {
         let Some(process) = child.raw_handle() else {
             return Ok(None);
         };
@@ -87,7 +86,7 @@ impl Job {
         Ok(Some(job))
     }
 
-    pub(super) fn terminate(&self) -> io::Result<()> {
+    pub(crate) fn terminate(&self) -> io::Result<()> {
         // SAFETY: this owned handle has JOB_OBJECT_TERMINATE access.
         if unsafe { TerminateJobObject(self.0.as_raw_handle(), 1) } == 0 {
             return Err(io::Error::last_os_error());
@@ -95,7 +94,7 @@ impl Job {
         Ok(())
     }
 
-    pub(super) fn is_empty(&self) -> io::Result<bool> {
+    pub(crate) fn is_empty(&self) -> io::Result<bool> {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
         // SAFETY: the information class matches the live output buffer.
         if unsafe {

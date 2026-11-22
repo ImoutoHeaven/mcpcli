@@ -22,8 +22,7 @@ use tokio::{
 };
 
 #[cfg(windows)]
-#[path = "mcp/windows_job.rs"]
-mod windows_job;
+use crate::mcp::windows_job;
 
 pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -271,48 +270,7 @@ impl ProcessTree {
             .kill_on_drop(false);
 
         #[cfg(unix)]
-        command.process_group(0);
-
-        #[cfg(target_os = "linux")]
-        {
-            let parent = std::process::id() as libc::pid_t;
-            // SAFETY: only async-signal-safe libc calls run between fork and exec.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent {
-                        libc::_exit(127);
-                    }
-                    Ok(())
-                });
-            }
-        }
-
-        #[cfg(target_os = "freebsd")]
-        {
-            let parent = std::process::id() as libc::pid_t;
-            // SAFETY: procctl/getppid/_exit are async-signal-safe.
-            unsafe {
-                command.pre_exec(move || {
-                    let signal: libc::c_int = libc::SIGKILL;
-                    if libc::procctl(
-                        libc::P_PID,
-                        0,
-                        libc::PROC_PDEATHSIG_CTL,
-                        (&signal as *const libc::c_int).cast_mut().cast(),
-                    ) == -1
-                    {
-                        return Err(io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent {
-                        libc::_exit(127);
-                    }
-                    Ok(())
-                });
-            }
-        }
+        platform::configure_child_process_group(&mut command);
 
         #[cfg(windows)]
         {
@@ -395,51 +353,23 @@ impl ProcessTree {
     #[cfg(unix)]
     fn signal_group(&self, signal: i32) {
         if let Some(group) = self.group {
-            // SAFETY: group is the unreaped child's process group leader PID.
-            unsafe {
-                libc::kill(-group, signal);
-            }
+            platform::signal_process_group(group, signal);
         }
     }
 
     #[cfg(unix)]
     fn exited_unreaped(&mut self) -> io::Result<bool> {
-        let Some(pid) = self.group else {
-            return Ok(true);
-        };
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        // SAFETY: WNOWAIT inspects exit status without reaping, keeping PGID pinned.
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ECHILD) {
-                self.group = None;
-                return Ok(true);
-            }
-            return Err(error);
+        match platform::child_exited_unreaped(&mut self.group) {
+            Err(error) if error.raw_os_error() == Some(libc::ECHILD) => Ok(true),
+            other => other,
         }
-        Ok(unsafe { info.si_pid() } == pid)
     }
 
     #[cfg(unix)]
     async fn wait_unreaped(&mut self, wait: Duration) -> bool {
-        timeout(wait, async {
-            loop {
-                match self.exited_unreaped() {
-                    Ok(true) | Err(_) => return true,
-                    Ok(false) => tokio::time::sleep(Duration::from_millis(10)).await,
-                }
-            }
-        })
-        .await
-        .unwrap_or(false)
+        platform::wait_child_unreaped(&mut self.group, wait)
+            .await
+            .unwrap_or(true)
     }
 
     /// Kill the process tree after timeout: SIGTERM + grace + SIGKILL on Unix, TerminateJobObject on Windows.

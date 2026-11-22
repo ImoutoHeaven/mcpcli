@@ -866,7 +866,12 @@ mod tests {
         let ev = stream.next().await.unwrap().unwrap();
         assert_eq!(ev.id, None);
         assert_eq!(ev.event.as_deref(), Some("message"));
-        assert!(ev.data.as_deref().unwrap().contains("notifications/events/heartbeat"));
+        assert!(
+            ev.data
+                .as_deref()
+                .unwrap()
+                .contains("notifications/events/heartbeat")
+        );
         drop(ev);
         assert!(stream.next().await.is_none());
         assert!(!term.is_terminated());

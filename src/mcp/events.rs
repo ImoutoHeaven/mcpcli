@@ -148,7 +148,10 @@ impl EventRouter {
         });
     }
 
-    pub(super) fn take_receiver(&self, id: &RequestId) -> mpsc::Receiver<Leased<EventNotification>> {
+    pub(super) fn take_receiver(
+        &self,
+        id: &RequestId,
+    ) -> mpsc::Receiver<Leased<EventNotification>> {
         let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(slot) = slots.get_mut(id)
             && let Some(receiver) = slot.pending_receiver.take()
@@ -386,13 +389,41 @@ where
         &mut self,
         mut item: ClientJsonRpcMessage,
     ) -> impl Future<Output = std::result::Result<(), Self::Error>> + Send + 'static {
-        strip_legacy_events_extension(&mut item);
-        if let ClientJsonRpcMessage::Request(ref request) = item
-            && request.request.method() == "events/stream"
-        {
-            self.router.pre_register(request.id.clone());
+        struct UnregisterGuard {
+            router: EventRouter,
+            id: Option<RequestId>,
         }
-        self.inner.send(item)
+        impl Drop for UnregisterGuard {
+            fn drop(&mut self) {
+                if let Some(id) = self.id.take() {
+                    self.router.unregister(&id);
+                }
+            }
+        }
+        strip_legacy_events_extension(&mut item);
+        let mut guard = match &item {
+            ClientJsonRpcMessage::Request(request)
+                if request.request.method() == "events/stream" =>
+            {
+                let id = request.id.clone();
+                self.router.pre_register(id.clone());
+                Some(UnregisterGuard {
+                    router: self.router.clone(),
+                    id: Some(id),
+                })
+            }
+            _ => None,
+        };
+        let fut = self.inner.send(item);
+        async move {
+            let result = fut.await;
+            if result.is_ok()
+                && let Some(guard) = guard.as_mut()
+            {
+                guard.id = None;
+            }
+            result
+        }
     }
 
     async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
@@ -432,10 +463,7 @@ pub(super) fn strip_legacy_events_extension(message: &mut ClientJsonRpcMessage) 
 
 pub(super) fn check_events_capability(info: Option<&ServerPeerInfo>) -> Result<()> {
     let Some(info) = info else {
-        return Err(failure(
-            FailureKind::Protocol,
-            "MCP server info is missing",
-        ));
+        return Err(failure(FailureKind::Protocol, "MCP server info is missing"));
     };
     if info.protocol_version < ProtocolVersion::V_2026_07_28 {
         return Err(failure(
@@ -605,7 +633,9 @@ fn subschema_has_off_chain_annotation(value: &Value, on_chain: bool) -> bool {
 }
 
 /// Validates SEP-2243 `x-mcp-header` annotations in an event `inputSchema`.
-pub(super) fn validate_param_header_annotations(input_schema: &Map<String, Value>) -> Result<(), String> {
+pub(super) fn validate_param_header_annotations(
+    input_schema: &Map<String, Value>,
+) -> Result<(), String> {
     if input_schema.contains_key("x-mcp-header") {
         return Err("x-mcp-header must annotate a property, not the schema root".into());
     }
@@ -632,7 +662,7 @@ pub(super) fn validate_param_header_annotations(input_schema: &Map<String, Value
             ));
         }
         match annotation.schema.get("type").and_then(Value::as_str) {
-            Some("string" | "integer" | "boolean") => {}
+            Some("string" | "integer" | "number" | "boolean") => {}
             other => {
                 return Err(format!(
                     "property `{prop}`: x-mcp-header requires primitive type, got {other:?}"
@@ -711,7 +741,10 @@ pub(super) fn event_request_headers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::{ClientCapabilities, ExtensionCapabilities, InitializeRequestParams, Implementation, ServerCapabilities};
+    use rmcp::model::{
+        ClientCapabilities, ExtensionCapabilities, Implementation, InitializeRequestParams,
+        ServerCapabilities,
+    };
     use serde_json::json;
     use std::collections::VecDeque;
 
@@ -818,14 +851,8 @@ mod tests {
     #[test]
     fn mcp_name_and_param_header_encoding_and_validation() {
         assert_eq!(encode_header_value("task.exited"), "task.exited");
-        assert_eq!(
-            encode_header_value(" leading"),
-            "=?base64?IGxlYWRpbmc=?="
-        );
-        assert_eq!(
-            encode_header_value("事件"),
-            "=?base64?5LqL5Lu2?="
-        );
+        assert_eq!(encode_header_value(" leading"), "=?base64?IGxlYWRpbmc=?=");
+        assert_eq!(encode_header_value("事件"), "=?base64?5LqL5Lu2?=");
         assert_eq!(
             encode_header_value("=?base64?abc?="),
             "=?base64?PT9iYXNlNjQ/YWJjPz0=?="
@@ -839,6 +866,7 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "count": { "type": "integer", "x-mcp-header": "Count" },
+                        "ratio": { "type": "number", "x-mcp-header": "Ratio" },
                         "active": { "type": "boolean", "x-mcp-header": "Active" }
                     }
                 }
@@ -862,7 +890,10 @@ mod tests {
             }}),
         ] {
             let map = bad.as_object().unwrap().clone();
-            assert!(validate_param_header_annotations(&map).is_err(), "expected invalid: {bad}");
+            assert!(
+                validate_param_header_annotations(&map).is_err(),
+                "expected invalid: {bad}"
+            );
         }
 
         let cache: EventSchemaCache = Arc::new(RwLock::new(HashMap::from([(
@@ -873,17 +904,34 @@ mod tests {
             "name": "pr.merged",
             "arguments": {
                 "repo": "org/app",
-                "nested": { "count": 42, "active": true }
+                "nested": { "count": 42, "ratio": 0.75, "active": true }
             }
         });
-        let headers: HashMap<String, String> = event_request_headers("events/stream", Some(&params), &cache)
-            .into_iter()
-            .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap().to_owned()))
-            .collect();
-        assert_eq!(headers.get("mcp-name").map(String::as_str), Some("pr.merged"));
-        assert_eq!(headers.get("mcp-param-repo").map(String::as_str), Some("org/app"));
-        assert_eq!(headers.get("mcp-param-count").map(String::as_str), Some("42"));
-        assert_eq!(headers.get("mcp-param-active").map(String::as_str), Some("true"));
+        let headers: HashMap<String, String> =
+            event_request_headers("events/stream", Some(&params), &cache)
+                .into_iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap().to_owned()))
+                .collect();
+        assert_eq!(
+            headers.get("mcp-name").map(String::as_str),
+            Some("pr.merged")
+        );
+        assert_eq!(
+            headers.get("mcp-param-repo").map(String::as_str),
+            Some("org/app")
+        );
+        assert_eq!(
+            headers.get("mcp-param-count").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            headers.get("mcp-param-ratio").map(String::as_str),
+            Some("0.75")
+        );
+        assert_eq!(
+            headers.get("mcp-param-active").map(String::as_str),
+            Some("true")
+        );
     }
 
     #[tokio::test]
@@ -930,7 +978,8 @@ mod tests {
             sent: Arc::new(Mutex::new(Vec::new())),
             incoming: VecDeque::from([notif_num, notif_str, normal_resp]),
         };
-        let mut transport = EventNotificationTransport::new(mock, router.clone(), termination.clone());
+        let mut transport =
+            EventNotificationTransport::new(mock, router.clone(), termination.clone());
 
         // receive() consumes both event notifications and returns the non-event response.
         let received = transport.receive().await.unwrap();

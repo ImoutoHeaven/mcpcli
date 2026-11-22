@@ -1,7 +1,7 @@
 //! Private runtime files and short-lived clients of the persistent daemon.
 use crate::budget::{ByteBudget, ByteLease, format_bytes};
 use crate::config::{LoadedConfig, digest, valid_name};
-use crate::ipc::{self, Failure, Operation, Request, Response};
+use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
 use crate::platform;
 pub use crate::platform::{private_dir, secure_file};
 use anyhow::{Context, Result, bail};
@@ -450,6 +450,143 @@ pub async fn exchange_tracked_with_options(
         .into());
     }
     Ok((response, response_lease))
+}
+
+pub struct DaemonEventStream {
+    stream: platform::local::Client,
+    namespace: String,
+    build: String,
+    idle_timeout: Duration,
+    budget: Arc<ByteBudget>,
+}
+
+impl DaemonEventStream {
+    pub async fn next_frame(&mut self) -> Result<Option<(StreamFrameKind, ByteLease)>> {
+        let Some(len) = ipc::read_frame_header(&mut self.stream, ipc::RESPONSE_LIMIT)
+            .await
+            .map_err(|_| {
+                Failure::new(
+                    4,
+                    "daemon_transport",
+                    "daemon event stream disconnected unexpectedly",
+                )
+            })?
+        else {
+            return Ok(None);
+        };
+        let (frame, lease): (StreamFrame, ByteLease) =
+            ipc::read_frame_body_idle(&mut self.stream, len, self.idle_timeout, None, &self.budget)
+                .await
+                .map_err(|error| -> anyhow::Error {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        Failure::new(5, "timeout", "daemon event stream frame read stalled").into()
+                    } else if error.kind() == io::ErrorKind::OutOfMemory {
+                        Failure::new(
+                            1,
+                            "memory_limit_exceeded",
+                            format!(
+                                "daemon event frame exceeded the {} active memory limit",
+                                format_bytes(self.budget.limit())
+                            ),
+                        )
+                        .into()
+                    } else {
+                        Failure::new(
+                            4,
+                            "daemon_transport",
+                            "daemon event stream communication failed",
+                        )
+                        .into()
+                    }
+                })?;
+        if frame.protocol != ipc::PROTOCOL {
+            return Err(Failure::new(
+                6,
+                "daemon_mismatch",
+                "daemon protocol does not match; run daemon restart",
+            )
+            .into());
+        }
+        if frame.namespace != self.namespace {
+            return Err(
+                Failure::new(4, "daemon_transport", "daemon IPC identity does not match").into(),
+            );
+        }
+        if frame.build != self.build {
+            return Err(Failure::new(
+                6,
+                "daemon_mismatch",
+                "daemon binary changed; run daemon restart",
+            )
+            .into());
+        }
+        Ok(Some((frame.kind, lease)))
+    }
+}
+
+pub async fn open_event_stream(paths: &Paths, request: &Request) -> Result<DaemonEventStream> {
+    open_event_stream_with_options(
+        paths,
+        request,
+        ipc::TRANSFER_IDLE_TIMEOUT,
+        ByteBudget::global(),
+    )
+    .await
+}
+
+pub async fn open_event_stream_with_options(
+    paths: &Paths,
+    request: &Request,
+    idle_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+) -> Result<DaemonEventStream> {
+    let connect_budget = Duration::from_millis(request.timeout_ms.clamp(1, 30_000));
+    let connect_deadline = Instant::now() + connect_budget;
+    let ignored = AtomicBool::new(false);
+    let stream = timeout_at(connect_deadline, async {
+        platform::validate_endpoint(&paths.socket)?;
+        let mut stream = platform::local::connect(paths.socket.as_os_str())
+            .await
+            .context("cannot connect to daemon")?;
+        platform::validate_server(&stream)?;
+        let (req_frame, req_lease) = ipc::encode_frame_leased(request, ipc::REQUEST_LIMIT, budget)
+            .map_err(|error| -> anyhow::Error {
+                if error.kind() == io::ErrorKind::OutOfMemory {
+                    Failure::new(
+                        1,
+                        "memory_limit_exceeded",
+                        format!(
+                            "IPC request exceeded the {} active memory limit",
+                            format_bytes(budget.limit())
+                        ),
+                    )
+                    .into()
+                } else {
+                    error.into()
+                }
+            })?;
+        ipc::write_raw_idle(
+            &mut stream,
+            &req_frame,
+            idle_timeout,
+            Some(connect_deadline),
+            &ignored,
+        )
+        .await?;
+        drop(req_frame);
+        drop(req_lease);
+        Ok::<_, anyhow::Error>(stream)
+    })
+    .await
+    .map_err(|_| Failure::new(5, "timeout", "timed out opening daemon event stream"))??;
+
+    Ok(DaemonEventStream {
+        stream,
+        namespace: paths.namespace.clone(),
+        build: paths.build.clone(),
+        idle_timeout,
+        budget: budget.clone(),
+    })
 }
 
 pub async fn ensure(paths: &Paths, loaded: &LoadedConfig, explicit: bool) -> Result<()> {

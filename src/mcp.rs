@@ -61,7 +61,7 @@ pub use events::{
 use events::{EventNotificationTransport, EventRouter, EventSchemaCache};
 use ingress::{Ingress, IngressError, ObserveOutcome};
 #[cfg(windows)]
-mod windows_job;
+pub(crate) mod windows_job;
 
 pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
@@ -976,6 +976,144 @@ impl McpConnection {
         }
     }
 
+    pub fn events_client(&self) -> McpEventsClient {
+        McpEventsClient {
+            peer: self.peer.clone(),
+            service_cancel: Arc::new(std::sync::Mutex::new(
+                self.service
+                    .as_ref()
+                    .map(RunningService::cancellation_token),
+            )),
+            ingress: self.ingress.clone(),
+            event_router: self.event_router.clone(),
+            event_schemas: self.event_schemas.clone(),
+            termination: self.termination.clone(),
+            limits: self.limits.clone(),
+        }
+    }
+
+    pub fn supports_events(&self) -> bool {
+        self.events_client().supports_events()
+    }
+
+    pub fn check_events_support(&self) -> Result<()> {
+        self.events_client().check_events_support()
+    }
+
+    pub async fn list_events(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
+        self.events_client().list_events(budget).await
+    }
+
+    pub async fn poll_events(
+        &self,
+        params: PollEventsParams,
+        budget: Duration,
+    ) -> Result<Leased<Value>> {
+        self.events_client().poll_events(params, budget).await
+    }
+
+    pub async fn open_event_stream(
+        &self,
+        params: StreamEventsParams,
+        budget: Duration,
+    ) -> Result<(EventStreamHandle, EventStreamReceiver)> {
+        self.events_client().open_event_stream(params, budget).await
+    }
+
+    pub async fn close(&mut self) -> Result<()> {
+        if self.closing.is_none()
+            && let Some(mut service) = self.service.take()
+        {
+            // Keep this future in self: cancelling a caller must not drop the
+            // SDK's private JoinHandle after close() takes it from the service.
+            self.closing = Some(Box::pin(async move { service.close().await }));
+        }
+        if let Some(closing) = self.closing.as_mut() {
+            let joined = timeout(Duration::from_secs(8), closing)
+                .await
+                .map_err(|_| {
+                    failure(
+                        FailureKind::Timeout,
+                        "MCP cleanup is still in progress; local closure is not confirmed",
+                    )
+                })?;
+            self.closing = None;
+            if !matches!(joined, Ok(QuitReason::Cancelled | QuitReason::Closed)) {
+                record_cleanup_failure(
+                    &self.cleanup,
+                    FailureKind::Transport,
+                    "MCP service task failed during cleanup; local closure is not confirmed",
+                    false,
+                );
+            }
+        }
+        let error = self
+            .cleanup
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|record| record.failure.clone());
+        match error {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+struct UntrackOnDrop {
+    ingress: Ingress,
+    id: Option<rmcp::model::RequestId>,
+}
+
+impl UntrackOnDrop {
+    fn new(ingress: Ingress, id: rmcp::model::RequestId) -> Self {
+        Self {
+            ingress,
+            id: Some(id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for UntrackOnDrop {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.ingress.untrack(&id);
+        }
+    }
+}
+
+/// Cloneable handle for MCP Events operations that can run without holding `Mutex<ServerState>`.
+#[derive(Clone)]
+pub struct McpEventsClient {
+    peer: Peer<RoleClient>,
+    service_cancel: Arc<std::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>>>,
+    ingress: Ingress,
+    event_router: EventRouter,
+    event_schemas: EventSchemaCache,
+    termination: Arc<TransportTermination>,
+    limits: McpLimits,
+}
+
+impl McpEventsClient {
+    fn abort_service(&self) {
+        if let Some(cancel) = self
+            .service_cancel
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            cancel.cancel();
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.termination.is_terminated() || self.peer.is_transport_closed()
+    }
+
     pub fn supports_events(&self) -> bool {
         self.check_events_support().is_ok()
     }
@@ -1006,15 +1144,24 @@ impl McpConnection {
                 });
                 let request =
                     ClientRequest::CustomRequest(CustomRequest::new("events/list", params));
-                let send_fut = self.peer.send_request(request);
+                let mut handle = self
+                    .peer
+                    .send_cancellable_request(request, PeerRequestOptions::no_options())
+                    .await
+                    .map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?;
+                let mut guard = UntrackOnDrop::new(self.ingress.clone(), handle.id.clone());
                 let result = tokio::select! {
                     biased;
-                    res = send_fut => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
+                    rpc = &mut handle.rx => match rpc {
+                        Ok(res) => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
+                        Err(_) => return Err(self.termination.failure(false)),
+                    },
                     () = self.termination.cancelled() => {
                         self.abort_service();
                         return Err(self.termination.failure(false));
                     }
                 };
+                guard.disarm();
                 let ServerResult::CustomResult(CustomResult(mut page)) = result else {
                     return Err(failure(
                         FailureKind::Protocol,
@@ -1033,7 +1180,6 @@ impl McpConnection {
                 for event in page_events {
                     if let Some(schema) = event.get("inputSchema").and_then(Value::as_object) {
                         if events::validate_param_header_annotations(schema).is_err() {
-                            // Omit events with invalid x-mcp-header annotations.
                             continue;
                         }
                         if let Some(name) = event.get("name").and_then(Value::as_str) {
@@ -1097,15 +1243,24 @@ impl McpConnection {
                 Some(params.to_json()),
             ));
             let res = timeout(remaining, async {
-                let send_fut = self.peer.send_request(request);
-                tokio::select! {
+                let mut handle = self
+                    .peer
+                    .send_cancellable_request(request, PeerRequestOptions::no_options())
+                    .await?;
+                let mut guard = UntrackOnDrop::new(self.ingress.clone(), handle.id.clone());
+                let res = tokio::select! {
                     biased;
-                    res = send_fut => res,
+                    rpc = &mut handle.rx => match rpc {
+                        Ok(res) => res,
+                        Err(_) => Err(ServiceError::TransportClosed),
+                    },
                     () = self.termination.cancelled() => {
                         self.abort_service();
                         Err(ServiceError::TransportClosed)
                     }
-                }
+                };
+                guard.disarm();
+                res
             })
             .await
             .map_err(|_| failure(FailureKind::Timeout, "Event poll timed out"))?;
@@ -1153,7 +1308,25 @@ impl McpConnection {
     ) -> Result<(EventStreamHandle, EventStreamReceiver)> {
         enum EitherStreamStart {
             Notification(Option<Leased<EventNotification>>),
-            Rpc(std::result::Result<std::result::Result<ServerResult, ServiceError>, tokio::sync::oneshot::error::RecvError>),
+            Rpc(
+                std::result::Result<
+                    std::result::Result<ServerResult, ServiceError>,
+                    tokio::sync::oneshot::error::RecvError,
+                >,
+            ),
+        }
+        struct StreamSetupGuard {
+            router: EventRouter,
+            ingress: Ingress,
+            id: Option<rmcp::model::RequestId>,
+        }
+        impl Drop for StreamSetupGuard {
+            fn drop(&mut self) {
+                if let Some(id) = self.id.take() {
+                    self.router.unregister(&id);
+                    self.ingress.untrack(&id);
+                }
+            }
         }
         self.check_events_support()?;
         if self.termination.is_terminated() {
@@ -1180,6 +1353,11 @@ impl McpConnection {
             .map_err(|_| failure(FailureKind::Timeout, "Event stream open timed out"))?
             .map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?;
             let id = handle.id.clone();
+            let mut setup_guard = StreamSetupGuard {
+                router: self.event_router.clone(),
+                ingress: self.ingress.clone(),
+                id: Some(id.clone()),
+            };
             let mut rx = self.event_router.take_receiver(&id);
             let wait_budget = budget.saturating_sub(started.elapsed());
             let first_outcome = timeout(wait_budget, async {
@@ -1197,8 +1375,7 @@ impl McpConnection {
 
             match first_outcome {
                 Err(_) => {
-                    self.event_router.unregister(&id);
-                    self.ingress.untrack(&id);
+                    drop(setup_guard);
                     let _ = handle.cancel(Some("handshake timeout".into())).await;
                     return Err(failure(
                         FailureKind::Timeout,
@@ -1206,11 +1383,11 @@ impl McpConnection {
                     ));
                 }
                 Ok(Err(err)) => {
-                    self.event_router.unregister(&id);
-                    self.ingress.untrack(&id);
+                    drop(setup_guard);
                     return Err(err);
                 }
                 Ok(Ok(EitherStreamStart::Notification(first))) => {
+                    setup_guard.id = None;
                     let stream_handle = EventStreamHandle::new(
                         handle,
                         self.event_router.clone(),
@@ -1218,80 +1395,41 @@ impl McpConnection {
                     );
                     return Ok((stream_handle, EventStreamReceiver::new(first, rx)));
                 }
-                Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => {
-                    self.event_router.unregister(&id);
-                    self.ingress.untrack(&id);
-                    match rpc_res {
-                        Ok(Err(ServiceError::McpError(ref err)))
-                            if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
-                        {
-                            let refresh_budget = budget.saturating_sub(started.elapsed());
-                            let _ = self.list_events(refresh_budget).await?;
-                            continue;
-                        }
-                        Ok(Err(err)) => {
-                            return Err(service_failure(
-                                err,
-                                false,
-                                &self.ingress,
-                                &self.termination,
-                            ));
-                        }
-                        Ok(Ok(_)) => {
-                            let stream_handle = EventStreamHandle::new(
-                                handle,
-                                self.event_router.clone(),
-                                self.ingress.clone(),
-                            );
-                            return Ok((stream_handle, EventStreamReceiver::new(None, rx)));
-                        }
-                        Err(_) => {
-                            return Err(self.termination.failure(false));
-                        }
+                Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => match rpc_res {
+                    Ok(Err(ServiceError::McpError(ref err)))
+                        if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
+                    {
+                        drop(setup_guard);
+                        let refresh_budget = budget.saturating_sub(started.elapsed());
+                        let _ = self.list_events(refresh_budget).await?;
+                        continue;
                     }
-                }
+                    Ok(Err(err)) => {
+                        drop(setup_guard);
+                        return Err(service_failure(
+                            err,
+                            false,
+                            &self.ingress,
+                            &self.termination,
+                        ));
+                    }
+                    Ok(Ok(_)) => {
+                        setup_guard.id = None;
+                        let stream_handle = EventStreamHandle::new(
+                            handle,
+                            self.event_router.clone(),
+                            self.ingress.clone(),
+                        );
+                        return Ok((stream_handle, EventStreamReceiver::new(None, rx)));
+                    }
+                    Err(_) => {
+                        drop(setup_guard);
+                        return Err(self.termination.failure(false));
+                    }
+                },
             }
         }
         unreachable!("open_event_stream retry loop always returns")
-    }
-
-    pub async fn close(&mut self) -> Result<()> {
-        if self.closing.is_none()
-            && let Some(mut service) = self.service.take()
-        {
-            // Keep this future in self: cancelling a caller must not drop the
-            // SDK's private JoinHandle after close() takes it from the service.
-            self.closing = Some(Box::pin(async move { service.close().await }));
-        }
-        if let Some(closing) = self.closing.as_mut() {
-            let joined = timeout(Duration::from_secs(8), closing)
-                .await
-                .map_err(|_| {
-                    failure(
-                        FailureKind::Timeout,
-                        "MCP cleanup is still in progress; local closure is not confirmed",
-                    )
-                })?;
-            self.closing = None;
-            if !matches!(joined, Ok(QuitReason::Cancelled | QuitReason::Closed)) {
-                record_cleanup_failure(
-                    &self.cleanup,
-                    FailureKind::Transport,
-                    "MCP service task failed during cleanup; local closure is not confirmed",
-                    false,
-                );
-            }
-        }
-        let error = self
-            .cleanup
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .as_ref()
-            .map(|record| record.failure.clone());
-        match error {
-            Some(error) => Err(error.into()),
-            None => Ok(()),
-        }
     }
 }
 
@@ -1522,46 +1660,7 @@ impl ChildTransport<ChildStdout, ChildStdin> {
             .stderr(Stdio::null())
             .kill_on_drop(false);
         #[cfg(unix)]
-        command.process_group(0);
-        #[cfg(target_os = "linux")]
-        {
-            let parent = std::process::id() as libc::pid_t;
-            // SAFETY: only async-signal-safe libc calls run between fork and exec.
-            unsafe {
-                command.pre_exec(move || {
-                    if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent {
-                        libc::_exit(127);
-                    }
-                    Ok(())
-                });
-            }
-        }
-        #[cfg(target_os = "freebsd")]
-        {
-            let parent = std::process::id() as libc::pid_t;
-            // SAFETY: procctl/getppid/_exit do not allocate or acquire Rust locks.
-            unsafe {
-                command.pre_exec(move || {
-                    let signal: libc::c_int = libc::SIGKILL;
-                    if libc::procctl(
-                        libc::P_PID,
-                        0,
-                        libc::PROC_PDEATHSIG_CTL,
-                        (&signal as *const libc::c_int).cast_mut().cast(),
-                    ) == -1
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    if libc::getppid() != parent {
-                        libc::_exit(127);
-                    }
-                    Ok(())
-                });
-            }
-        }
+        crate::platform::configure_child_process_group(&mut command);
         #[cfg(windows)]
         command
             .creation_flags(
@@ -1647,48 +1746,18 @@ impl<R, W> ChildTransport<R, W> {
     #[cfg(unix)]
     fn signal_group(&self, signal: i32) {
         if let Some(group) = self.group {
-            // This owns a trusted server's process group, not an escape-proof sandbox.
-            unsafe {
-                libc::kill(-group, signal);
-            }
+            crate::platform::signal_process_group(group, signal);
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, test))]
     fn exited_unreaped(&mut self) -> std::io::Result<bool> {
-        let Some(pid) = self.group else {
-            return Ok(true);
-        };
-        let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
-        };
-        if result == -1 {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ECHILD) {
-                // Another reaper has taken ownership; this numeric PGID is no longer ours.
-                self.group = None;
-            }
-            return Err(error);
-        }
-        Ok(unsafe { info.si_pid() } == pid)
+        crate::platform::child_exited_unreaped(&mut self.group)
     }
 
     #[cfg(unix)]
     async fn wait_unreaped(&mut self) -> std::io::Result<bool> {
-        timeout(Duration::from_secs(1), async {
-            while !self.exited_unreaped()? {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-            Ok(true)
-        })
-        .await
-        .unwrap_or(Ok(false))
+        crate::platform::wait_child_unreaped(&mut self.group, Duration::from_secs(1)).await
     }
 }
 
@@ -2074,6 +2143,17 @@ impl BoundedHttp {
             return Err(HttpError::TransportChannelClosed);
         }
         self.ingress.track(&message);
+        let mut passthrough_guard = match &message {
+            ClientJsonRpcMessage::Request(request)
+                if matches!(
+                    request.request.method(),
+                    "events/list" | "events/poll" | "events/stream"
+                ) =>
+            {
+                Some(UntrackOnDrop::new(self.ingress.clone(), request.id.clone()))
+            }
+            _ => None,
+        };
         let had_session = session_id.is_some();
         let notification = !matches!(&message, ClientJsonRpcMessage::Request(_));
         let is_events_stream = matches!(
@@ -2166,6 +2246,9 @@ impl BoundedHttp {
             .unwrap_or("")
             .to_owned();
         if status.is_success() && has_media_type(&content_type, "text/event-stream") {
+            if let Some(guard) = passthrough_guard.as_mut() {
+                guard.disarm();
+            }
             return Ok(StreamableHttpPostResponse::Sse(
                 sse::bounded_stream(
                     response,
