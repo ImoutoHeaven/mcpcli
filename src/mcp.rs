@@ -1099,6 +1099,58 @@ pub struct McpEventsClient {
 }
 
 impl McpEventsClient {
+    fn service_failure(&self, error: ServiceError) -> anyhow::Error {
+        let ServiceError::McpError(error) = error else {
+            return service_failure(error, false, &self.ingress, &self.termination);
+        };
+        let Ok(bytes) = crate::json::serialized_len(&error) else {
+            return failure(
+                FailureKind::Protocol,
+                "MCP event error could not be represented",
+            );
+        };
+        let Some(lease) = self.limits.budget.try_acquire(bytes) else {
+            return failure(
+                FailureKind::Transport,
+                "MCP event error exceeds the active memory limit",
+            );
+        };
+        let message = format!("MCP error {}: {}", error.code.0, error.message);
+        let Ok(value) = serde_json::to_value(error) else {
+            return failure(
+                FailureKind::Protocol,
+                "MCP event error could not be represented",
+            );
+        };
+        McpFailure {
+            kind: FailureKind::Protocol,
+            message,
+            outcome_unknown: false,
+            rpc_error: Some(Arc::new(value)),
+            lease: Some(Arc::new(lease)),
+        }
+        .into()
+    }
+
+    fn event_request(
+        &self,
+        method: &'static str,
+        params: &impl serde::Serialize,
+    ) -> Result<Leased<ClientRequest>> {
+        let bytes = crate::json::serialized_len(params)?.saturating_add(method.len());
+        let lease = self.limits.budget.try_acquire(bytes).ok_or_else(|| {
+            failure(
+                FailureKind::Transport,
+                "MCP event request exceeds the active memory limit",
+            )
+        })?;
+        let request = ClientRequest::CustomRequest(CustomRequest::new(
+            method,
+            Some(serde_json::to_value(params)?),
+        ));
+        Ok(Leased::new(request, lease))
+    }
+
     fn abort_service(&self) {
         if let Some(cancel) = self
             .service_cancel
@@ -1130,11 +1182,14 @@ impl McpEventsClient {
         }
         self.termination.clear_transient();
         let listing = async {
-            let mut events = Vec::new();
             let mut lease = self.limits.budget.empty_lease();
+            let mut events = Vec::new();
+            let mut schema_lease = self.limits.budget.empty_lease();
             let mut schemas = HashMap::new();
+            let mut pagination_lease = self.limits.budget.empty_lease();
             let mut cursors = HashSet::new();
             let mut cursor: Option<String> = None;
+            let mut cursor_bytes = 0;
 
             for _ in 0..MAX_EVENT_PAGES {
                 let params = cursor.take().map(|c| {
@@ -1148,12 +1203,14 @@ impl McpEventsClient {
                     .peer
                     .send_cancellable_request(request, PeerRequestOptions::no_options())
                     .await
-                    .map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?;
+                    .map_err(|e| self.service_failure(e))?;
+                pagination_lease.shrink_by(cursor_bytes);
+                let mut page_lease = self.limits.budget.empty_lease();
                 let mut guard = UntrackOnDrop::new(self.ingress.clone(), handle.id.clone());
                 let result = tokio::select! {
                     biased;
                     rpc = &mut handle.rx => match rpc {
-                        Ok(res) => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
+                        Ok(res) => res.map_err(|e| self.service_failure(e))?,
                         Err(_) => return Err(self.termination.failure(false)),
                     },
                     () = self.termination.cancelled() => {
@@ -1168,10 +1225,26 @@ impl McpEventsClient {
                         "MCP server returned an unexpected events/list response",
                     ));
                 };
-                let next_cursor = page
-                    .get("nextCursor")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let page_bytes = crate::json::serialized_len(&page)?;
+                if !page_lease.try_grow(page_bytes) {
+                    return Err(failure(
+                        FailureKind::Transport,
+                        "Event catalog exceeds the active memory limit",
+                    ));
+                }
+                let next_cursor = match page.get("nextCursor").and_then(Value::as_str) {
+                    Some(next) => {
+                        cursor_bytes = crate::json::serialized_len(&next)?;
+                        if !pagination_lease.try_grow(cursor_bytes.saturating_mul(2)) {
+                            return Err(failure(
+                                FailureKind::Transport,
+                                "Event catalog cursors exceed the active memory limit",
+                            ));
+                        }
+                        Some(next.to_owned())
+                    }
+                    None => None,
+                };
                 let page_events = page
                     .get_mut("events")
                     .and_then(Value::as_array_mut)
@@ -1183,22 +1256,29 @@ impl McpEventsClient {
                             continue;
                         }
                         if let Some(name) = event.get("name").and_then(Value::as_str) {
+                            let schema_bytes =
+                                crate::json::serialized_len(schema)?.saturating_add(name.len());
+                            if !schema_lease.try_grow(schema_bytes) {
+                                return Err(failure(
+                                    FailureKind::Transport,
+                                    "Event schema cache exceeds the active memory limit",
+                                ));
+                            }
                             schemas.insert(name.to_owned(), schema.clone());
                         }
                     }
                     let item_bytes = crate::json::serialized_len(&event)?;
-                    if !lease.try_grow(item_bytes) {
-                        return Err(failure(
-                            FailureKind::Transport,
-                            "Event catalog exceeds the active memory limit",
-                        ));
-                    }
+                    lease.merge(
+                        page_lease
+                            .split(item_bytes)
+                            .expect("event belongs to catalog page"),
+                    );
                     events.push(event);
                 }
                 match next_cursor {
                     None => {
                         if let Ok(mut guard) = self.event_schemas.write() {
-                            *guard = schemas;
+                            *guard = Some(Leased::new(schemas, schema_lease));
                         }
                         return Ok(Leased::new(events, lease));
                     }
@@ -1238,15 +1318,13 @@ impl McpEventsClient {
             if remaining.is_zero() {
                 return Err(failure(FailureKind::Timeout, "Event poll timed out"));
             }
-            let request = ClientRequest::CustomRequest(CustomRequest::new(
-                "events/poll",
-                Some(params.to_json()),
-            ));
+            let (request, request_lease) = self.event_request("events/poll", &params)?.into_parts();
             let res = timeout(remaining, async {
                 let mut handle = self
                     .peer
                     .send_cancellable_request(request, PeerRequestOptions::no_options())
                     .await?;
+                drop(request_lease);
                 let mut guard = UntrackOnDrop::new(self.ingress.clone(), handle.id.clone());
                 let res = tokio::select! {
                     biased;
@@ -1289,12 +1367,7 @@ impl McpEventsClient {
                     continue;
                 }
                 Err(error) => {
-                    return Err(service_failure(
-                        error,
-                        false,
-                        &self.ingress,
-                        &self.termination,
-                    ));
+                    return Err(self.service_failure(error));
                 }
             }
         }
@@ -1307,7 +1380,7 @@ impl McpEventsClient {
         budget: Duration,
     ) -> Result<(EventStreamHandle, EventStreamReceiver)> {
         enum EitherStreamStart {
-            Notification(Option<Leased<EventNotification>>),
+            Notification(Leased<EventNotification>),
             Rpc(
                 Box<
                     std::result::Result<
@@ -1316,19 +1389,6 @@ impl McpEventsClient {
                     >,
                 >,
             ),
-        }
-        struct StreamSetupGuard {
-            router: EventRouter,
-            ingress: Ingress,
-            id: Option<rmcp::model::RequestId>,
-        }
-        impl Drop for StreamSetupGuard {
-            fn drop(&mut self) {
-                if let Some(id) = self.id.take() {
-                    self.router.unregister(&id);
-                    self.ingress.untrack(&id);
-                }
-            }
         }
         self.check_events_support()?;
         if self.termination.is_terminated() {
@@ -1342,10 +1402,8 @@ impl McpEventsClient {
             if remaining.is_zero() {
                 return Err(failure(FailureKind::Timeout, "Event stream open timed out"));
             }
-            let request = ClientRequest::CustomRequest(CustomRequest::new(
-                "events/stream",
-                Some(params.to_json()),
-            ));
+            let (request, request_lease) =
+                self.event_request("events/stream", &params)?.into_parts();
             let mut handle = timeout(
                 remaining,
                 self.peer
@@ -1353,20 +1411,21 @@ impl McpEventsClient {
             )
             .await
             .map_err(|_| failure(FailureKind::Timeout, "Event stream open timed out"))?
-            .map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?;
+            .map_err(|e| self.service_failure(e))?;
+            drop(request_lease);
             let id = handle.id.clone();
-            let mut setup_guard = StreamSetupGuard {
-                router: self.event_router.clone(),
-                ingress: self.ingress.clone(),
-                id: Some(id.clone()),
-            };
+            let (_, empty_response) = tokio::sync::oneshot::channel();
+            let mut response = std::mem::replace(&mut handle.rx, empty_response);
             let mut rx = self.event_router.take_receiver(&id);
+            // Own cancellation before awaiting the first notification or RPC response.
+            let stream_handle =
+                EventStreamHandle::new(handle, self.event_router.clone(), self.ingress.clone());
             let wait_budget = budget.saturating_sub(started.elapsed());
             let first_outcome = timeout(wait_budget, async {
                 tokio::select! {
                     biased;
-                    notif = rx.recv() => Ok(EitherStreamStart::Notification(notif)),
-                    rpc = &mut handle.rx => Ok(EitherStreamStart::Rpc(Box::new(rpc))),
+                    Some(notif) = rx.recv() => Ok(EitherStreamStart::Notification(notif)),
+                    rpc = &mut response => Ok(EitherStreamStart::Rpc(Box::new(rpc))),
                     () = self.termination.cancelled() => {
                         self.abort_service();
                         Err(self.termination.failure(false))
@@ -1377,57 +1436,30 @@ impl McpEventsClient {
 
             match first_outcome {
                 Err(_) => {
-                    drop(setup_guard);
-                    let _ = handle.cancel(Some("handshake timeout".into())).await;
+                    stream_handle.cancel().await?;
                     return Err(failure(
                         FailureKind::Timeout,
                         "Timed out waiting for event stream start",
                     ));
                 }
-                Ok(Err(err)) => {
-                    drop(setup_guard);
-                    return Err(err);
-                }
+                Ok(Err(err)) => return Err(err),
                 Ok(Ok(EitherStreamStart::Notification(first))) => {
-                    setup_guard.id = None;
-                    let stream_handle = EventStreamHandle::new(
-                        handle,
-                        self.event_router.clone(),
-                        self.ingress.clone(),
-                    );
-                    return Ok((stream_handle, EventStreamReceiver::new(first, rx)));
+                    return Ok((stream_handle, EventStreamReceiver::new(Some(first), rx)));
                 }
                 Ok(Ok(EitherStreamStart::Rpc(rpc_res))) => match *rpc_res {
                     Ok(Err(ServiceError::McpError(ref err)))
                         if attempt == 0 && err.code == ErrorCode::HEADER_MISMATCH =>
                     {
-                        drop(setup_guard);
+                        drop(stream_handle);
                         let refresh_budget = budget.saturating_sub(started.elapsed());
                         let _ = self.list_events(refresh_budget).await?;
                         continue;
                     }
-                    Ok(Err(err)) => {
-                        drop(setup_guard);
-                        return Err(service_failure(
-                            err,
-                            false,
-                            &self.ingress,
-                            &self.termination,
-                        ));
-                    }
+                    Ok(Err(err)) => return Err(self.service_failure(err)),
                     Ok(Ok(_)) => {
-                        setup_guard.id = None;
-                        let stream_handle = EventStreamHandle::new(
-                            handle,
-                            self.event_router.clone(),
-                            self.ingress.clone(),
-                        );
                         return Ok((stream_handle, EventStreamReceiver::new(None, rx)));
                     }
-                    Err(_) => {
-                        drop(setup_guard);
-                        return Err(self.termination.failure(false));
-                    }
+                    Err(_) => return Err(self.termination.failure(false)),
                 },
             }
         }
@@ -3222,7 +3254,7 @@ mod http_tests {
                                                     "inputSchema": {
                                                         "type": "object",
                                                         "properties": {
-                                                            "x": { "type": "object", "x-mcp-header": "InvalidObj" }
+                                                            "x": { "type": "number", "x-mcp-header": "InvalidNumber" }
                                                         }
                                                     }
                                                 }
@@ -3527,5 +3559,357 @@ mod rpc_fidelity_tests {
         ));
         assert!(ingress.take().is_none());
         assert_eq!(budget.used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod event_lifecycle_tests {
+    use super::*;
+    use rmcp::model::{RequestId, ServerCapabilities, ServerPeerInfo};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    struct Wire {
+        sent: mpsc::Sender<ClientJsonRpcMessage>,
+        incoming: mpsc::Receiver<ServerJsonRpcMessage>,
+        ingress: Ingress,
+    }
+
+    impl Transport<RoleClient> for Wire {
+        type Error = std::io::Error;
+
+        fn send(
+            &mut self,
+            message: ClientJsonRpcMessage,
+        ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+            self.ingress.track(&message);
+            let sent = self.sent.clone();
+            async move { sent.send(message).await.map_err(std::io::Error::other) }
+        }
+
+        async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+            let message = self.incoming.recv().await?;
+            match &message {
+                ServerJsonRpcMessage::Response(response) => self.ingress.untrack(&response.id),
+                ServerJsonRpcMessage::Error(error) => {
+                    if let Some(id) = &error.id {
+                        self.ingress.untrack(id);
+                    }
+                }
+                _ => {}
+            }
+            Some(message)
+        }
+
+        async fn close(&mut self) -> std::io::Result<()> {
+            self.incoming.close();
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        client: McpEventsClient,
+        service: RunningService<RoleClient, Handler>,
+        sent: mpsc::Receiver<ClientJsonRpcMessage>,
+        incoming: mpsc::Sender<ServerJsonRpcMessage>,
+    }
+
+    impl Fixture {
+        fn new(budget: Arc<ByteBudget>) -> Self {
+            let (sent_tx, sent) = mpsc::channel(16);
+            let (incoming, incoming_rx) = mpsc::channel(16);
+            let ingress = Ingress::default();
+            let router = EventRouter::new(budget.clone());
+            let termination = Arc::new(TransportTermination::default());
+            let mut extensions = ExtensionCapabilities::new();
+            extensions.insert(EVENTS_EXTENSION_ID.into(), Map::new());
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.extensions = Some(extensions);
+            let mut info = ServerPeerInfo::from(rmcp::model::InitializeResult::new(capabilities));
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            let service = rmcp::service::serve_directly(
+                Handler {
+                    tools_changed: Arc::new(AtomicBool::new(false)),
+                },
+                EventNotificationTransport::new(
+                    Wire {
+                        sent: sent_tx,
+                        incoming: incoming_rx,
+                        ingress: ingress.clone(),
+                    },
+                    router.clone(),
+                    termination.clone(),
+                ),
+                Some(info),
+            );
+            let client = McpEventsClient {
+                peer: service.peer().clone(),
+                service_cancel: Arc::new(Mutex::new(None)),
+                ingress,
+                event_router: router,
+                event_schemas: EventSchemaCache::default(),
+                termination,
+                limits: McpLimits {
+                    budget,
+                    ..McpLimits::default()
+                },
+            };
+            Self {
+                client,
+                service,
+                sent,
+                incoming,
+            }
+        }
+
+        async fn request(&mut self, method: &str) -> RequestId {
+            let message = timeout(Duration::from_secs(2), self.sent.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ClientJsonRpcMessage::Request(request) = message else {
+                panic!("expected request: {message:?}")
+            };
+            assert_eq!(request.request.method(), method);
+            request.id
+        }
+
+        async fn respond(&self, message: Value) {
+            self.incoming
+                .send(serde_json::from_value(message).unwrap())
+                .await
+                .unwrap();
+        }
+    }
+
+    fn stream_params() -> StreamEventsParams {
+        StreamEventsParams {
+            name: "sample.changed".into(),
+            arguments: None,
+            cursor: None,
+            max_age_ms: None,
+            heartbeat_ms: Some(30_000),
+        }
+    }
+
+    fn poll_params() -> PollEventsParams {
+        PollEventsParams {
+            name: "sample.changed".into(),
+            arguments: None,
+            cursor: None,
+            max_age_ms: None,
+            max_events: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_handshake_cancels_the_upstream_request() {
+        let budget = ByteBudget::new(4096);
+        let mut fixture = Fixture::new(budget.clone());
+        let client = fixture.client.clone();
+        let mut opening =
+            Box::pin(client.open_event_stream(stream_params(), Duration::from_secs(5)));
+        let id = tokio::select! {
+            biased;
+            _ = &mut opening => panic!("stream started without a server response"),
+            id = fixture.request("events/stream") => id,
+        };
+        drop(opening);
+        let cancelled = timeout(Duration::from_secs(2), fixture.sent.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let encoded = serde_json::to_value(cancelled).unwrap();
+        assert_eq!(encoded["method"], "notifications/cancelled");
+        assert_eq!(
+            encoded["params"]["requestId"],
+            serde_json::to_value(&id).unwrap()
+        );
+        let late_response =
+            serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":{}})).unwrap();
+        assert!(matches!(
+            fixture
+                .client
+                .ingress
+                .observe_bytes(&late_response, 4096, &budget, false)
+                .unwrap(),
+            ObserveOutcome::NotMatched
+        ));
+        assert_eq!(budget.used(), 0);
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_stream_response_drains_queued_notifications_and_closes_only_that_stream() {
+        let budget = ByteBudget::new(4096);
+        let mut fixture = Fixture::new(budget.clone());
+        let client = fixture.client.clone();
+        let opening = tokio::spawn(async move {
+            client
+                .open_event_stream(stream_params(), Duration::from_secs(5))
+                .await
+        });
+        let id = fixture.request("events/stream").await;
+        for (method, fields) in [
+            ("active", json!({"heartbeatMs":30000,"cursor":null})),
+            (
+                "event",
+                json!({"eventId":"one","cursor":"1","data":{"value":1}}),
+            ),
+            (
+                "event",
+                json!({"eventId":"two","cursor":"2","data":{"value":2}}),
+            ),
+        ] {
+            let mut params = fields.as_object().unwrap().clone();
+            params.insert(
+                "_meta".into(),
+                json!({"io.modelcontextprotocol/subscriptionId":id}),
+            );
+            fixture.respond(json!({"jsonrpc":"2.0","method":format!("notifications/events/{method}"),"params":params})).await;
+        }
+        fixture
+            .respond(json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete"}}))
+            .await;
+        let (handle, mut receiver) = opening.await.unwrap().unwrap();
+        for method in ["active", "event", "event"] {
+            let notification = timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                notification.method,
+                format!("notifications/events/{method}")
+            );
+        }
+        assert!(
+            timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(handle.is_cancelled().await);
+        assert!(!fixture.client.is_closed());
+        drop(handle);
+        drop(receiver);
+        assert_eq!(budget.used(), 0);
+
+        let client = fixture.client.clone();
+        let poll = tokio::spawn(async move {
+            client
+                .poll_events(poll_params(), Duration::from_secs(5))
+                .await
+        });
+        let id = fixture.request("events/poll").await;
+        fixture.respond(json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","events":[],"cursor":null}})).await;
+        drop(poll.await.unwrap().unwrap());
+        assert!(fixture.sent.try_recv().is_err());
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_rpc_errors_preserve_code_data_and_tool_capture() {
+        let budget = ByteBudget::new(16 * 1024);
+        let mut fixture = Fixture::new(budget.clone());
+        let ingress = fixture.client.ingress.clone();
+        let _capture = ingress.capture().unwrap();
+        let tool_request =
+            serde_json::from_value(json!({"jsonrpc":"2.0","id":900,"method":"tools/list"}))
+                .unwrap();
+        ingress.track(&tool_request);
+        let tool_error =
+            br#"{"jsonrpc":"2.0","id":900,"error":{"code":-32603,"message":"tool error"}}"#;
+        let _ = ingress
+            .observe_bytes(tool_error, 4096, &budget, false)
+            .unwrap();
+        let captured_bytes = budget.used();
+        for (method, code) in [
+            ("events/list", -32602),
+            ("events/poll", -32023),
+            ("events/stream", -32026),
+        ] {
+            let client = fixture.client.clone();
+            let operation = tokio::spawn(async move {
+                match method {
+                    "events/list" => client.list_events(Duration::from_secs(5)).await.map(|_| ()),
+                    "events/poll" => client
+                        .poll_events(poll_params(), Duration::from_secs(5))
+                        .await
+                        .map(|_| ()),
+                    _ => client
+                        .open_event_stream(stream_params(), Duration::from_secs(5))
+                        .await
+                        .map(|_| ()),
+                }
+            });
+            let id = fixture.request(method).await;
+            let expected = json!({"code":code,"message":"subscription unavailable","data":{"modes":["poll"],"detail":null}});
+            fixture
+                .respond(json!({"jsonrpc":"2.0","id":id,"error":expected}))
+                .await;
+            let error = operation.await.unwrap().unwrap_err();
+            let failure = error.downcast_ref::<McpFailure>().unwrap();
+            assert_eq!(failure.rpc_error.as_deref(), Some(&expected));
+            assert_eq!(
+                budget.used(),
+                captured_bytes + crate::json::serialized_len(&expected).unwrap()
+            );
+            let retained = failure.clone();
+            drop(error);
+            assert!(budget.used() > captured_bytes);
+            drop(retained);
+            assert_eq!(budget.used(), captured_bytes);
+        }
+        let (_, captured, lease) = ingress
+            .take()
+            .expect("Events must leave the ordinary capture untouched");
+        assert_eq!(captured.unwrap()["error"]["message"], "tool error");
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_schema_cache_keeps_its_own_lease_after_catalog_is_dropped() {
+        let budget = ByteBudget::new(4096);
+        let mut fixture = Fixture::new(budget.clone());
+        let client = fixture.client.clone();
+        let listing = tokio::spawn(async move { client.list_events(Duration::from_secs(5)).await });
+        let id = fixture.request("events/list").await;
+        let schema = json!({"type":"object","properties":{"label":{"type":"string","x-mcp-header":"Label"}}});
+        fixture.respond(json!({"jsonrpc":"2.0","id":id,"result":{"resultType":"complete","events":[{"name":"sample.changed","inputSchema":schema}]}})).await;
+        let catalog = listing.await.unwrap().unwrap();
+        let held_with_catalog = budget.used();
+        drop(catalog);
+        assert_eq!(
+            budget.used(),
+            crate::json::serialized_len(&schema).unwrap() + "sample.changed".len()
+        );
+        assert!(budget.used() < held_with_catalog);
+        fixture.client.event_schemas.write().unwrap().take();
+        assert_eq!(budget.used(), 0);
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_request_budget_precedes_the_json_copy() {
+        let budget = ByteBudget::new(32);
+        let mut fixture = Fixture::new(budget.clone());
+        let mut params = stream_params();
+        params.arguments = Some(
+            json!({"label":"ordinary value"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        assert!(
+            fixture
+                .client
+                .event_request("events/stream", &params)
+                .is_err()
+        );
+        assert_eq!(budget.used(), 0);
+        assert!(fixture.sent.try_recv().is_err());
+        fixture.service.close().await.unwrap();
     }
 }

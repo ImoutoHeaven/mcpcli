@@ -9,8 +9,8 @@ use http::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient,
     model::{
-        ClientJsonRpcMessage, ClientRequest, CustomNotification, GetMeta, ProtocolVersion,
-        RequestId, ServerJsonRpcMessage, ServerNotification, ServerPeerInfo,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, CustomNotification, GetMeta,
+        ProtocolVersion, RequestId, ServerJsonRpcMessage, ServerNotification, ServerPeerInfo,
     },
     service::RequestHandle,
     transport::Transport,
@@ -31,64 +31,34 @@ const BASE64_HEADER_SUFFIX: &str = "?=";
 const HEADER_MCP_NAME: &str = "Mcp-Name";
 const HEADER_MCP_PARAM_PREFIX: &str = "Mcp-Param-";
 
-pub(super) type EventSchemaCache = Arc<RwLock<HashMap<String, Map<String, Value>>>>;
+pub(super) type EventSchemaCache = Arc<RwLock<Option<Leased<HashMap<String, Map<String, Value>>>>>>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PollEventsParams {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_events: Option<u64>,
 }
 
-impl PollEventsParams {
-    pub(super) fn to_json(&self) -> Value {
-        let mut map = Map::new();
-        map.insert("name".into(), Value::String(self.name.clone()));
-        if let Some(arguments) = &self.arguments {
-            map.insert("arguments".into(), Value::Object(arguments.clone()));
-        }
-        if let Some(cursor) = &self.cursor {
-            map.insert("cursor".into(), Value::String(cursor.clone()));
-        }
-        if let Some(max_age_ms) = self.max_age_ms {
-            map.insert("maxAgeMs".into(), Value::Number(max_age_ms.into()));
-        }
-        if let Some(max_events) = self.max_events {
-            map.insert("maxEvents".into(), Value::Number(max_events.into()));
-        }
-        Value::Object(map)
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StreamEventsParams {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Map<String, Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_age_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub heartbeat_ms: Option<u64>,
-}
-
-impl StreamEventsParams {
-    pub(super) fn to_json(&self) -> Value {
-        let mut map = Map::new();
-        map.insert("name".into(), Value::String(self.name.clone()));
-        if let Some(arguments) = &self.arguments {
-            map.insert("arguments".into(), Value::Object(arguments.clone()));
-        }
-        if let Some(cursor) = &self.cursor {
-            map.insert("cursor".into(), Value::String(cursor.clone()));
-        }
-        if let Some(max_age_ms) = self.max_age_ms {
-            map.insert("maxAgeMs".into(), Value::Number(max_age_ms.into()));
-        }
-        if let Some(heartbeat_ms) = self.heartbeat_ms {
-            map.insert("heartbeatMs".into(), Value::Number(heartbeat_ms.into()));
-        }
-        Value::Object(map)
-    }
 }
 
 #[derive(Debug)]
@@ -98,13 +68,22 @@ pub struct EventNotification {
     pub subscription_id: RequestId,
 }
 
-type SharedRequestHandle = Arc<tokio::sync::Mutex<Option<RequestHandle<RoleClient>>>>;
+type SharedRequestHandle = Arc<Mutex<Option<RequestHandle<RoleClient>>>>;
 
 struct SubscriptionSlot {
-    sender: mpsc::Sender<Leased<EventNotification>>,
+    sender: Option<mpsc::Sender<Leased<EventNotification>>>,
     pending_receiver: Option<mpsc::Receiver<Leased<EventNotification>>>,
     request_handle: Option<SharedRequestHandle>,
     terminated: bool,
+}
+
+impl SubscriptionSlot {
+    fn complete(&mut self) {
+        self.sender.take();
+        if let Some(handle) = self.request_handle.take() {
+            handle.lock().unwrap_or_else(|p| p.into_inner()).take();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -140,7 +119,7 @@ impl EventRouter {
         slots.entry(id).or_insert_with(|| {
             let (sender, receiver) = mpsc::channel(self.channel_capacity);
             SubscriptionSlot {
-                sender,
+                sender: Some(sender),
                 pending_receiver: Some(receiver),
                 request_handle: None,
                 terminated: false,
@@ -162,7 +141,7 @@ impl EventRouter {
         slots.insert(
             id.clone(),
             SubscriptionSlot {
-                sender,
+                sender: Some(sender),
                 pending_receiver: None,
                 request_handle: None,
                 terminated: false,
@@ -175,7 +154,10 @@ impl EventRouter {
         let cancel_now = {
             let mut slots = self.slots.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(slot) = slots.get_mut(id) {
-                if slot.terminated {
+                if slot.sender.is_none() {
+                    handle.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    false
+                } else if slot.terminated {
                     true
                 } else {
                     slot.request_handle = Some(handle.clone());
@@ -187,6 +169,28 @@ impl EventRouter {
         };
         if cancel_now {
             spawn_cancel_handle(handle, Some("stream terminated".into()));
+        }
+    }
+
+    fn complete(&self, id: &RequestId) {
+        if let Some(slot) = self
+            .slots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(id)
+        {
+            slot.complete();
+        }
+    }
+
+    fn complete_all(&self) {
+        for slot in self
+            .slots
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values_mut()
+        {
+            slot.complete();
         }
     }
 
@@ -245,13 +249,16 @@ impl EventRouter {
             let Some(slot) = slots.get_mut(&subscription_id) else {
                 return;
             };
+            let Some(sender) = slot.sender.clone() else {
+                return;
+            };
             let handle = if is_terminated {
                 slot.terminated = true;
                 slot.request_handle.take()
             } else {
                 None
             };
-            (slot.sender.clone(), handle)
+            (sender, handle)
         };
         if let Err(error) = sender.try_send(leased) {
             drop(error);
@@ -267,7 +274,7 @@ impl EventRouter {
 fn spawn_cancel_handle(handle: SharedRequestHandle, reason: Option<String>) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         rt.spawn(async move {
-            let taken = handle.lock().await.take();
+            let taken = handle.lock().unwrap_or_else(|p| p.into_inner()).take();
             if let Some(request_handle) = taken {
                 let _ = request_handle.cancel(reason).await;
             }
@@ -289,7 +296,8 @@ impl EventStreamHandle {
         ingress: Ingress,
     ) -> Self {
         let id = handle.id.clone();
-        let shared = Arc::new(tokio::sync::Mutex::new(Some(handle)));
+        router.pre_register(id.clone());
+        let shared = Arc::new(Mutex::new(Some(handle)));
         router.attach_handle(&id, shared.clone());
         Self {
             id,
@@ -304,13 +312,16 @@ impl EventStreamHandle {
     }
 
     pub async fn is_cancelled(&self) -> bool {
-        self.handle.lock().await.is_none()
+        self.handle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none()
     }
 
     pub async fn cancel(&self) -> Result<()> {
         self.router.unregister(&self.id);
         self.ingress.untrack(&self.id);
-        let taken = self.handle.lock().await.take();
+        let taken = self.handle.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(handle) = taken {
             let _ = handle.cancel(Some("client cancelled".into())).await;
         }
@@ -401,6 +412,12 @@ where
             }
         }
         strip_legacy_events_extension(&mut item);
+        if let ClientJsonRpcMessage::Notification(notification) = &item
+            && let ClientNotification::CancelledNotification(cancelled) = &notification.notification
+            && let Some(id) = &cancelled.params.request_id
+        {
+            self.router.unregister(id);
+        }
         let mut guard = match &item {
             ClientJsonRpcMessage::Request(request)
                 if request.request.method() == "events/stream" =>
@@ -428,7 +445,19 @@ where
 
     async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
         loop {
-            let message = self.inner.receive().await?;
+            let Some(message) = self.inner.receive().await else {
+                self.router.complete_all();
+                return None;
+            };
+            match &message {
+                ServerJsonRpcMessage::Response(response) => self.router.complete(&response.id),
+                ServerJsonRpcMessage::Error(error) => {
+                    if let Some(id) = &error.id {
+                        self.router.complete(id);
+                    }
+                }
+                _ => {}
+            }
             if let ServerJsonRpcMessage::Notification(mut notif) = message {
                 if let ServerNotification::CustomNotification(custom) = notif.notification {
                     if custom.method.starts_with("notifications/events/") {
@@ -444,6 +473,7 @@ where
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
+        self.router.complete_all();
         self.inner.close().await
     }
 }
@@ -662,7 +692,7 @@ pub(super) fn validate_param_header_annotations(
             ));
         }
         match annotation.schema.get("type").and_then(Value::as_str) {
-            Some("string" | "integer" | "number" | "boolean") => {}
+            Some("string" | "integer" | "boolean") => {}
             other => {
                 return Err(format!(
                     "property `{prop}`: x-mcp-header requires primitive type, got {other:?}"
@@ -714,7 +744,7 @@ pub(super) fn event_request_headers(
 
     if let Some(arguments) = params.get("arguments")
         && let Ok(guard) = schemas.read()
-        && let Some(schema) = guard.get(name)
+        && let Some(schema) = guard.as_ref().and_then(|schemas| schemas.get(name))
     {
         for annotation in property_annotations(schema) {
             let Value::String(header) = annotation.header else {
@@ -866,7 +896,6 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "count": { "type": "integer", "x-mcp-header": "Count" },
-                        "ratio": { "type": "number", "x-mcp-header": "Ratio" },
                         "active": { "type": "boolean", "x-mcp-header": "Active" }
                     }
                 }
@@ -878,6 +907,7 @@ mod tests {
         // Invalid annotations: root, duplicate (case-insensitive), non-primitive, bad token, off-chain
         for bad in [
             json!({ "type": "object", "x-mcp-header": "Root" }),
+            json!({ "type": "object", "properties": { "ratio": { "type": "number", "x-mcp-header": "Ratio" } } }),
             json!({ "type": "object", "properties": { "a": { "type": "string", "x-mcp-header": "" } } }),
             json!({ "type": "object", "properties": { "a": { "type": "string", "x-mcp-header": "Bad Header" } } }),
             json!({ "type": "object", "properties": { "a": { "type": "object", "x-mcp-header": "Obj" } } }),
@@ -896,15 +926,16 @@ mod tests {
             );
         }
 
-        let cache: EventSchemaCache = Arc::new(RwLock::new(HashMap::from([(
-            "pr.merged".to_owned(),
-            valid_schema,
-        )])));
+        let schemas = HashMap::from([("pr.merged".to_owned(), valid_schema)]);
+        let cache: EventSchemaCache = Arc::new(RwLock::new(Some(Leased::new(
+            schemas,
+            ByteBudget::new(4096).empty_lease(),
+        ))));
         let params = json!({
             "name": "pr.merged",
             "arguments": {
                 "repo": "org/app",
-                "nested": { "count": 42, "ratio": 0.75, "active": true }
+                "nested": { "count": 42, "active": true }
             }
         });
         let headers: HashMap<String, String> =
@@ -923,10 +954,6 @@ mod tests {
         assert_eq!(
             headers.get("mcp-param-count").map(String::as_str),
             Some("42")
-        );
-        assert_eq!(
-            headers.get("mcp-param-ratio").map(String::as_str),
-            Some("0.75")
         );
         assert_eq!(
             headers.get("mcp-param-active").map(String::as_str),
@@ -1010,5 +1037,57 @@ mod tests {
         router.route(big, &termination);
         assert!(termination.is_terminated());
         assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_streams_keep_pending_notifications_until_receiver_drains() {
+        for ending in ["result", "error", "eof"] {
+            let budget = ByteBudget::new(4096);
+            let router = EventRouter::new(budget.clone());
+            let id = RequestId::Number(3);
+            router.pre_register(id.clone());
+            let active = serde_json::from_value(json!({
+                "jsonrpc":"2.0", "method":"notifications/events/active",
+                "params":{"cursor":null,"_meta":{"io.modelcontextprotocol/subscriptionId":3}}
+            }))
+            .unwrap();
+            let event = serde_json::from_value(json!({
+                "jsonrpc":"2.0", "method":"notifications/events/event",
+                "params":{"eventId":"one","data":{"value":1},"_meta":{"io.modelcontextprotocol/subscriptionId":3}}
+            })).unwrap();
+            let mut incoming = VecDeque::from([active, event]);
+            if ending != "eof" {
+                let final_message = if ending == "result" {
+                    json!({"jsonrpc":"2.0","id":3,"result":{"resultType":"complete"}})
+                } else {
+                    json!({"jsonrpc":"2.0","id":3,"error":{"code":-32026,"message":"unsupported"}})
+                };
+                incoming.push_back(serde_json::from_value(final_message).unwrap());
+            }
+            let mut transport = EventNotificationTransport::new(
+                MockTransport {
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                    incoming,
+                },
+                router.clone(),
+                Arc::new(TransportTermination::default()),
+            );
+            assert_eq!(transport.receive().await.is_some(), ending != "eof");
+            let mut receiver = router.take_receiver(&id);
+            for method in ["active", "event"] {
+                let notification = receiver.recv().await.unwrap();
+                assert_eq!(
+                    notification.method,
+                    format!("notifications/events/{method}")
+                );
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(budget.used(), 0);
+        }
     }
 }
