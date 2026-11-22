@@ -510,10 +510,13 @@ fn write_stdout_line(line: &str) -> io::Result<()> {
     };
     #[cfg(windows)]
     {
-        use std::{io::IsTerminal, os::windows::io::AsRawHandle};
-        use windows_sys::Win32::System::Console::WriteConsoleW;
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::{GetConsoleMode, WriteConsoleW};
 
-        if stdout.is_terminal() {
+        let mut mode = 0;
+        // Named-pipe terminals need byte writes; only a console accepts WriteConsoleW.
+        // SAFETY: stdout owns the handle and mode is valid writable storage.
+        if unsafe { GetConsoleMode(stdout.as_raw_handle(), &mut mode) } != 0 {
             let mut chars = line.chars().peekable();
             let mut buffer = [0u16; 1024];
             while chars.peek().is_some() {
