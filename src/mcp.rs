@@ -1109,24 +1109,41 @@ impl McpEventsClient {
                 "MCP event error could not be represented",
             );
         };
-        let Some(lease) = self.limits.budget.try_acquire(bytes) else {
+        let Some(mut lease) = self.limits.budget.try_acquire(bytes) else {
             return failure(
                 FailureKind::Transport,
                 "MCP event error exceeds the active memory limit",
             );
         };
-        let message = format!("MCP error {}: {}", error.code.0, error.message);
-        let Ok(value) = serde_json::to_value(error) else {
+        let code = error.code.0;
+        let code_bytes = code.unsigned_abs().checked_ilog10().unwrap_or(0) as usize
+            + 1
+            + usize::from(code.is_negative());
+        let message_bytes = error
+            .message
+            .len()
+            .saturating_add(code_bytes + "MCP error : ".len());
+        let mut message = String::new();
+        if !lease.reserve_string(&mut message, message_bytes, self.limits.budget.limit()) {
             return failure(
-                FailureKind::Protocol,
-                "MCP event error could not be represented",
+                FailureKind::Transport,
+                "MCP event error exceeds the active memory limit",
             );
-        };
+        }
+        use std::fmt::Write as _;
+        write!(&mut message, "MCP error {code}: {}", error.message)
+            .expect("formatting into a String cannot fail");
+        let mut value = Map::new();
+        value.insert("code".into(), Value::Number(code.into()));
+        value.insert("message".into(), Value::String(error.message.into_owned()));
+        if let Some(data) = error.data {
+            value.insert("data".into(), data);
+        }
         McpFailure {
             kind: FailureKind::Protocol,
             message,
             outcome_unknown: false,
-            rpc_error: Some(Arc::new(value)),
+            rpc_error: Some(Arc::new(Value::Object(value))),
             lease: Some(Arc::new(lease)),
         }
         .into()
@@ -3852,7 +3869,9 @@ mod event_lifecycle_tests {
             assert_eq!(failure.rpc_error.as_deref(), Some(&expected));
             assert_eq!(
                 budget.used(),
-                captured_bytes + crate::json::serialized_len(&expected).unwrap()
+                captured_bytes
+                    + crate::json::serialized_len(&expected).unwrap()
+                    + failure.message.capacity()
             );
             let retained = failure.clone();
             drop(error);
@@ -3865,6 +3884,68 @@ mod event_lifecycle_tests {
             .expect("Events must leave the ordinary capture untouched");
         assert_eq!(captured.unwrap()["error"]["message"], "tool error");
         drop(lease);
+        assert_eq!(budget.used(), 0);
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_error_moves_data_and_accounts_for_retained_diagnostic() {
+        let budget = ByteBudget::new(4096);
+        let mut fixture = Fixture::new(budget.clone());
+        let rpc_message = "m".repeat(512);
+        let message_ptr = rpc_message.as_ptr();
+        let data = json!({"items":[{"details":{"note":"ordinary nested value","attempts":[1,2]}}]});
+        let data_ptr = data["items"][0]["details"]["note"]
+            .as_str()
+            .unwrap()
+            .as_ptr();
+        let rpc = ErrorData::new(ErrorCode(-32026), rpc_message, Some(data));
+        let rpc_bytes = crate::json::serialized_len(&rpc).unwrap();
+        let error = fixture.client.service_failure(ServiceError::McpError(rpc));
+        let failure = error.downcast_ref::<McpFailure>().unwrap();
+        let value = failure.rpc_error.as_ref().unwrap();
+        assert_eq!(value["code"], -32026);
+        assert_eq!(value["message"].as_str().unwrap().as_ptr(), message_ptr);
+        assert_eq!(
+            value["data"]["items"][0]["details"]["note"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            data_ptr
+        );
+        assert_eq!(
+            failure.message,
+            format!("MCP error -32026: {}", "m".repeat(512))
+        );
+        let charged = rpc_bytes + failure.message.capacity();
+        assert_eq!(budget.used(), charged);
+        let retained = failure.clone();
+        assert!(Arc::ptr_eq(retained.rpc_error.as_ref().unwrap(), value));
+        drop(error);
+        assert_eq!(budget.used(), charged);
+        let ipc_failure = crate::daemon::mcp_error(retained.into(), false);
+        assert_eq!(budget.used(), charged);
+        drop(ipc_failure);
+        assert_eq!(budget.used(), 0);
+        fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn event_error_rejects_insufficient_diagnostic_budget_without_retaining_json() {
+        let rpc = ErrorData::new(
+            ErrorCode(-32026),
+            "m".repeat(512),
+            Some(json!({"items":[{"details":{"note":"ordinary value"}}]})),
+        );
+        let rpc_bytes = crate::json::serialized_len(&rpc).unwrap();
+        let diagnostic_bytes = "MCP error -32026: ".len() + rpc.message.len();
+        let budget = ByteBudget::new(rpc_bytes + diagnostic_bytes - 1);
+        let mut fixture = Fixture::new(budget.clone());
+        let error = fixture.client.service_failure(ServiceError::McpError(rpc));
+        let failure = error.downcast_ref::<McpFailure>().unwrap();
+        assert_eq!(failure.kind, FailureKind::Transport);
+        assert!(failure.rpc_error.is_none());
+        assert!(failure.lease.is_none());
         assert_eq!(budget.used(), 0);
         fixture.service.close().await.unwrap();
     }
