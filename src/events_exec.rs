@@ -80,7 +80,8 @@ impl CursorStore {
             Err(err) => return Err(err),
         };
         let mut buf = Vec::new();
-        file.take((MAX_CURSOR_BYTES + 1) as u64).read_to_end(&mut buf)?;
+        file.take((MAX_CURSOR_BYTES + 1) as u64)
+            .read_to_end(&mut buf)?;
         if buf.len() > MAX_CURSOR_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -134,29 +135,12 @@ pub enum ExecMode {
 pub enum ExecError {
     InvalidConfig(String),
     Spawn(io::Error),
-    Io {
-        source: io::Error,
-        stderr: String,
-    },
-    NonZeroExit {
-        code: Option<i32>,
-        stderr: String,
-    },
-    Timeout {
-        timeout: Duration,
-        stderr: String,
-    },
-    StreamClosed {
-        stderr: String,
-    },
-    InvalidAck {
-        line: String,
-        stderr: String,
-    },
-    Rejected {
-        message: String,
-        stderr: String,
-    },
+    Io { source: io::Error, stderr: String },
+    NonZeroExit { code: Option<i32>, stderr: String },
+    Timeout { timeout: Duration, stderr: String },
+    StreamClosed { stderr: String },
+    InvalidAck { line: String, stderr: String },
+    Rejected { message: String, stderr: String },
 }
 
 impl ExecError {
@@ -239,7 +223,10 @@ impl BoundedStderr {
                             guard.clear();
                             guard.extend(&chunk[n - MAX_STDERR_BYTES..n]);
                         } else {
-                            let overflow = guard.len().saturating_add(n).saturating_sub(MAX_STDERR_BYTES);
+                            let overflow = guard
+                                .len()
+                                .saturating_add(n)
+                                .saturating_sub(MAX_STDERR_BYTES);
                             if overflow > 0 {
                                 guard.drain(..overflow);
                             }
@@ -487,7 +474,9 @@ impl ProcessTree {
         }
         if !self.wait_unreaped(grace).await {
             self.signal_group(libc::SIGTERM);
-            let _ = self.wait_unreaped(grace).await;
+            let _ = self
+                .wait_unreaped(Duration::from_millis(500).min(grace))
+                .await;
         }
         self.signal_group(libc::SIGKILL);
         if let Some(child) = self.child.as_mut() {
@@ -504,24 +493,28 @@ impl ProcessTree {
             && timeout(grace, child.wait()).await.is_ok()
         {
             self.child = None;
-            self.job = None;
-            return;
         }
-        if let Some(job) = &self.job {
-            let _ = job.terminate();
-        }
-        let _ = timeout(Duration::from_secs(3), async {
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
+        let need_job_terminate = self
+            .job
+            .as_ref()
+            .is_some_and(|job| !job.is_empty().unwrap_or(true));
+        if self.child.is_some() || need_job_terminate {
             if let Some(job) = &self.job {
-                while !job.is_empty().unwrap_or(true) {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                let _ = job.terminate();
             }
-        })
-        .await;
+            let _ = timeout(Duration::from_secs(3), async {
+                if let Some(child) = self.child.as_mut() {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
+                if let Some(job) = &self.job {
+                    while !job.is_empty().unwrap_or(true) {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            })
+            .await;
+        }
         self.child = None;
         self.job = None;
     }
@@ -593,6 +586,12 @@ impl StreamWorker {
     }
 }
 
+impl Drop for StreamWorker {
+    fn drop(&mut self) {
+        self.stderr_task.abort();
+    }
+}
+
 #[derive(Deserialize)]
 struct StreamAck {
     ok: bool,
@@ -619,10 +618,12 @@ fn format_ndjson_line(event_json: &str) -> Result<String, ExecError> {
         line.push('\n');
         return Ok(line);
     }
-    let value: serde_json::Value = serde_json::from_str(trimmed)
-        .map_err(|err| ExecError::InvalidConfig(format!("invalid event JSON for stream mode: {err}")))?;
-    let mut line = serde_json::to_string(&value)
-        .map_err(|err| ExecError::InvalidConfig(format!("failed to serialize event JSON: {err}")))?;
+    let value: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        ExecError::InvalidConfig(format!("invalid event JSON for stream mode: {err}"))
+    })?;
+    let mut line = serde_json::to_string(&value).map_err(|err| {
+        ExecError::InvalidConfig(format!("failed to serialize event JSON: {err}"))
+    })?;
     line.push('\n');
     Ok(line)
 }
@@ -721,7 +722,8 @@ impl CallbackExecutor {
     }
 
     async fn deliver_oneshot(&self, event_json: &str) -> Result<(), ExecError> {
-        let mut tree = ProcessTree::spawn(&self.argv, ExecMode::Oneshot).map_err(ExecError::Spawn)?;
+        let mut tree =
+            ProcessTree::spawn(&self.argv, ExecMode::Oneshot).map_err(ExecError::Spawn)?;
         let mut stdin = tree.take_stdin().expect("piped stdin");
         let stderr = tree.take_stderr().expect("piped stderr");
         let (stderr_store, mut stderr_task) = BoundedStderr::spawn(stderr);
@@ -792,46 +794,67 @@ impl CallbackExecutor {
         }
 
         let worker = self.worker.as_mut().expect("worker spawned");
+        let (stdin, stdout) = (&mut worker.stdin, &mut worker.stdout);
         let exchange = timeout(self.exec_timeout, async {
-            let stdin = worker
-                .stdin
-                .as_mut()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"))?;
-            stdin.write_all(line.as_bytes()).await?;
-            stdin.flush().await?;
-            read_bounded_line(&mut worker.stdout).await
+            let write_fut = async {
+                let stdin = stdin
+                    .as_mut()
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "stdin closed"))?;
+                stdin.write_all(line.as_bytes()).await?;
+                stdin.flush().await
+            };
+            let read_fut = read_bounded_line(stdout);
+            tokio::join!(write_fut, read_fut)
         })
         .await;
 
         match exchange {
-            Ok(Ok(Some(ack_line))) => match serde_json::from_str::<StreamAck>(&ack_line) {
-                Ok(ack) if ack.ok => Ok(()),
-                Ok(ack) => {
+            Ok((write_res, read_res)) => {
+                let write_broken_pipe = write_res.as_ref().is_err_and(is_broken_pipe);
+                if let Err(source) = write_res
+                    && !(write_broken_pipe && matches!(read_res, Ok(Some(_))))
+                {
                     let worker = self.worker.take().expect("worker present");
                     let stderr = worker.shutdown(self.shutdown_grace).await;
-                    Err(ExecError::Rejected {
-                        message: ack.error.unwrap_or_else(|| "ok=false".to_owned()),
-                        stderr,
-                    })
+                    return Err(ExecError::Io { source, stderr });
                 }
-                Err(_) => {
-                    let worker = self.worker.take().expect("worker present");
-                    let stderr = worker.shutdown(self.shutdown_grace).await;
-                    Err(ExecError::InvalidAck {
-                        line: ack_line,
-                        stderr,
-                    })
+                match read_res {
+                    Ok(Some(ack_line)) => match serde_json::from_str::<StreamAck>(&ack_line) {
+                        Ok(ack) if ack.ok => {
+                            if write_broken_pipe {
+                                let worker = self.worker.take().expect("worker present");
+                                let _ = worker.shutdown(self.shutdown_grace).await;
+                            }
+                            Ok(())
+                        }
+                        Ok(ack) => {
+                            let worker = self.worker.take().expect("worker present");
+                            let stderr = worker.shutdown(self.shutdown_grace).await;
+                            Err(ExecError::Rejected {
+                                message: ack.error.unwrap_or_else(|| "ok=false".to_owned()),
+                                stderr,
+                            })
+                        }
+                        Err(_) => {
+                            let worker = self.worker.take().expect("worker present");
+                            let stderr = worker.shutdown(self.shutdown_grace).await;
+                            Err(ExecError::InvalidAck {
+                                line: ack_line,
+                                stderr,
+                            })
+                        }
+                    },
+                    Ok(None) => {
+                        let worker = self.worker.take().expect("worker present");
+                        let stderr = worker.shutdown(self.shutdown_grace).await;
+                        Err(ExecError::StreamClosed { stderr })
+                    }
+                    Err(source) => {
+                        let worker = self.worker.take().expect("worker present");
+                        let stderr = worker.shutdown(self.shutdown_grace).await;
+                        Err(ExecError::Io { source, stderr })
+                    }
                 }
-            },
-            Ok(Ok(None)) => {
-                let worker = self.worker.take().expect("worker present");
-                let stderr = worker.shutdown(self.shutdown_grace).await;
-                Err(ExecError::StreamClosed { stderr })
-            }
-            Ok(Err(source)) => {
-                let worker = self.worker.take().expect("worker present");
-                let stderr = worker.shutdown(self.shutdown_grace).await;
-                Err(ExecError::Io { source, stderr })
             }
             Err(_) => {
                 let worker = self.worker.take().expect("worker present");
@@ -919,8 +942,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("event.json");
         let script = format!("cat > '{}'", out.display());
-        let mut exec = CallbackExecutor::new(sh(&script), ExecMode::Oneshot, Duration::from_secs(5))
-            .unwrap();
+        let mut exec =
+            CallbackExecutor::new(sh(&script), ExecMode::Oneshot, Duration::from_secs(5)).unwrap();
 
         let payload = r#"{"eventId":"evt-1","data":{"ok":true}}"#;
         exec.deliver(payload).await.unwrap();
@@ -932,8 +955,8 @@ mod tests {
     #[tokio::test]
     async fn oneshot_non_zero_exit_captures_exit_code_and_bounded_stderr() {
         let script = "cat >/dev/null; printf 'fatal error\\n' >&2; exit 7";
-        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Oneshot, Duration::from_secs(5))
-            .unwrap();
+        let mut exec =
+            CallbackExecutor::new(sh(script), ExecMode::Oneshot, Duration::from_secs(5)).unwrap();
 
         let err = exec.deliver(r#"{"id":1}"#).await.unwrap_err();
         match err {
@@ -950,8 +973,8 @@ mod tests {
     async fn oneshot_catches_broken_pipe_and_reaps_real_exit_code() {
         // Exit immediately without reading stdin while writing >128 KiB payload to force EPIPE.
         let script = "printf 'early exit\\n' >&2; exit 42";
-        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Oneshot, Duration::from_secs(5))
-            .unwrap();
+        let mut exec =
+            CallbackExecutor::new(sh(script), ExecMode::Oneshot, Duration::from_secs(5)).unwrap();
 
         let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(256 * 1024));
         let err = exec.deliver(&big).await.unwrap_err();
@@ -974,13 +997,10 @@ mod tests {
             "trap '' TERM; sleep 60 & echo $! > '{}'; wait",
             pid_file.display()
         );
-        let mut exec = CallbackExecutor::new(
-            sh(&script),
-            ExecMode::Oneshot,
-            Duration::from_millis(250),
-        )
-        .unwrap()
-        .with_shutdown_grace(Duration::from_millis(150));
+        let mut exec =
+            CallbackExecutor::new(sh(&script), ExecMode::Oneshot, Duration::from_millis(250))
+                .unwrap()
+                .with_shutdown_grace(Duration::from_millis(150));
 
         let err = exec.deliver(r#"{"id":1}"#).await.unwrap_err();
         assert!(matches!(err, ExecError::Timeout { .. }), "got {err:?}");
@@ -999,7 +1019,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(!alive, "grandchild pid {grandchild_pid} survived timeout kill");
+        assert!(
+            !alive,
+            "grandchild pid {grandchild_pid} survived timeout kill"
+        );
     }
 
     #[cfg(unix)]
@@ -1013,8 +1036,8 @@ while IFS= read -r line; do
   esac
 done
 "#;
-        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
-            .unwrap();
+        let mut exec =
+            CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5)).unwrap();
 
         exec.deliver(r#"{"n":1}"#).await.unwrap();
         let first_pid = exec.worker_pid().expect("worker running");
@@ -1095,8 +1118,8 @@ while IFS= read -r _line; do
   printf '{"ok":true}\n'
 done
 "#;
-        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(10))
-            .unwrap();
+        let mut exec =
+            CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(10)).unwrap();
 
         exec.deliver(r#"{"heavy":true}"#).await.unwrap();
         let captured_len = exec.worker.as_ref().unwrap().stderr.snapshot().len();
@@ -1117,13 +1140,10 @@ done
             "trap '' TERM; sleep 60 & echo $! > '{}'; IFS= read -r _line; wait",
             pid_file.display()
         );
-        let mut exec = CallbackExecutor::new(
-            sh(&script),
-            ExecMode::Stream,
-            Duration::from_millis(250),
-        )
-        .unwrap()
-        .with_shutdown_grace(Duration::from_millis(150));
+        let mut exec =
+            CallbackExecutor::new(sh(&script), ExecMode::Stream, Duration::from_millis(250))
+                .unwrap()
+                .with_shutdown_grace(Duration::from_millis(150));
 
         let err = exec.deliver(r#"{"hang":true}"#).await.unwrap_err();
         assert!(matches!(err, ExecError::Timeout { .. }), "got {err:?}");
@@ -1146,5 +1166,122 @@ done
             !alive,
             "stream grandchild pid {grandchild_pid} survived timeout kill"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_prefers_ack_over_broken_pipe_during_concurrent_exchange() {
+        // Reject and exit before reading a 256 KiB line so stdin hits EPIPE while stdout yields ack.
+        let script = r#"printf '{"ok":false,"error":"too large"}\n'; exit 0"#;
+        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(200));
+
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(256 * 1024));
+        let err = exec.deliver(&big).await.unwrap_err();
+        match err {
+            ExecError::Rejected { message, .. } => assert_eq!(message, "too large"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(exec.worker_pid(), None);
+    }
+
+    #[cfg(windows)]
+    fn ps(script: &str) -> Vec<String> {
+        vec![
+            "powershell.exe".to_owned(),
+            "-NoProfile".to_owned(),
+            "-NonInteractive".to_owned(),
+            "-Command".to_owned(),
+            script.to_owned(),
+        ]
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_oneshot_succeeds_and_delivers_json_over_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("event.json");
+        let script = format!(
+            "[System.IO.File]::WriteAllText('{}', [Console]::In.ReadToEnd())",
+            out.display()
+        );
+        let mut exec =
+            CallbackExecutor::new(ps(&script), ExecMode::Oneshot, Duration::from_secs(15)).unwrap();
+
+        let payload = r#"{"eventId":"win-1","data":{"ok":true}}"#;
+        exec.deliver(payload).await.unwrap();
+        let saved = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(saved.trim(), payload);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_oneshot_non_zero_exit_captures_exit_code_and_stderr() {
+        let script =
+            "[void][Console]::In.ReadToEnd(); [Console]::Error.WriteLine('win fatal'); exit 7";
+        let mut exec =
+            CallbackExecutor::new(ps(script), ExecMode::Oneshot, Duration::from_secs(15)).unwrap();
+
+        let err = exec.deliver(r#"{"id":1}"#).await.unwrap_err();
+        match err {
+            ExecError::NonZeroExit { code, stderr } => {
+                assert_eq!(code, Some(7));
+                assert!(stderr.contains("win fatal"), "stderr={stderr:?}");
+            }
+            other => panic!("expected NonZeroExit, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_oneshot_timeout_reaps_job() {
+        let script = "Start-Sleep -Seconds 60";
+        let mut exec =
+            CallbackExecutor::new(ps(script), ExecMode::Oneshot, Duration::from_millis(500))
+                .unwrap()
+                .with_shutdown_grace(Duration::from_millis(200));
+
+        let err = exec.deliver(r#"{"id":1}"#).await.unwrap_err();
+        assert!(matches!(err, ExecError::Timeout { .. }), "got {err:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_stream_handles_lf_and_crlf_acks_and_reuses_worker() {
+        let script = r#"
+while (($line = [Console]::In.ReadLine()) -ne $null) {
+  if ($line -like '*crlf*') {
+    [Console]::Out.Write("{`"ok`":true}`r`n")
+  } else {
+    [Console]::Out.Write("{`"ok`":true}`n")
+  }
+  [Console]::Out.Flush()
+}
+"#;
+        let mut exec =
+            CallbackExecutor::new(ps(script), ExecMode::Stream, Duration::from_secs(15)).unwrap();
+
+        exec.deliver(r#"{"n":1}"#).await.unwrap();
+        let first_pid = exec.worker_pid().expect("worker running");
+        exec.deliver(r#"{"n":2,"mode":"crlf"}"#).await.unwrap();
+        assert_eq!(exec.worker_pid(), Some(first_pid));
+
+        exec.shutdown().await;
+        assert_eq!(exec.worker_pid(), None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_stream_ack_timeout_reaps_job() {
+        let script = "[void][Console]::In.ReadLine(); Start-Sleep -Seconds 60";
+        let mut exec =
+            CallbackExecutor::new(ps(script), ExecMode::Stream, Duration::from_millis(500))
+                .unwrap()
+                .with_shutdown_grace(Duration::from_millis(200));
+
+        let err = exec.deliver(r#"{"hang":true}"#).await.unwrap_err();
+        assert!(matches!(err, ExecError::Timeout { .. }), "got {err:?}");
+        assert_eq!(exec.worker_pid(), None);
     }
 }

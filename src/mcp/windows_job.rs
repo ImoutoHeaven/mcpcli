@@ -77,7 +77,8 @@ impl Job {
         // SAFETY: the child process handle and newly created job handle are live.
         if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), process) } == 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
+            if err.raw_os_error()
+                == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32)
             {
                 return Ok(None);
             }
