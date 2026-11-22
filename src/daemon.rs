@@ -21,12 +21,12 @@ use std::sync::{
 };
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
-const MAX_CONNECTIONS: usize = 64;
+const MAX_CONNECTIONS: usize = 32;
 const MAX_CONTROL_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
 const MAX_EVENT_STREAMS: usize = 32;
@@ -668,6 +668,7 @@ async fn handle_events_stream(
     app: Arc<App>,
     request: Leased<Request>,
     control: bool,
+    conn_permit: OwnedSemaphorePermit,
 ) {
     if control {
         let _ = write_stream_frame(
@@ -703,6 +704,7 @@ async fn handle_events_stream(
         .await;
         return;
     };
+    drop(conn_permit);
     let Operation::EventsStream {
         server,
         event,
@@ -869,7 +871,7 @@ async fn handle_events_stream(
     }
 }
 
-async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
+async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: OwnedSemaphorePermit) {
     if platform::validate_client(&stream).is_err() {
         return;
     }
@@ -887,9 +889,10 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool) {
         _ => return,
     };
     if request.operation.is_streaming() {
-        handle_events_stream(stream, app, request, control).await;
+        handle_events_stream(stream, app, request, control, conn_permit).await;
         return;
     }
+    let _conn_permit = conn_permit;
     if control && !request.operation.management() {
         send(
             &mut stream,
@@ -1035,8 +1038,7 @@ pub async fn run_with_options(
                     let stream = accepted?;
                     let app = app.clone();
                     tasks.spawn(async move {
-                        let _permit = permit;
-                        handle(stream, app, false).await;
+                        handle(stream, app, false, permit).await;
                     });
                 }
             }
@@ -1048,8 +1050,7 @@ pub async fn run_with_options(
                     let stream = accepted?;
                     let app = app.clone();
                     tasks.spawn(async move {
-                        let _permit = permit;
-                        handle(stream, app, true).await;
+                        handle(stream, app, true, permit).await;
                     });
                 }
             }
