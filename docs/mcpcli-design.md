@@ -372,10 +372,13 @@ checks locally before dispatching `events/*` requests.
   `--once`, and `--timeout` (millisecond run budget).
 
 On Streamable HTTP, `events/poll` and `events/stream` attach `Mcp-Name` for the
-target event (raw visible ASCII `0x21..=0x7E`, or `=?base64?<URLSAFE_NO_PAD>?=`
-otherwise) and map scalar filter `arguments` (`string`, `integer`, or
-`boolean`) whose `inputSchema.properties.<key>` declares a valid
-`"x-mcp-header": "<Suffix>"` onto `Mcp-Param-<Suffix>`. During HTTP
+target event and map scalar filter `arguments` (`string`, `integer`, or
+`boolean`) along `inputSchema` `properties` paths that declare a valid
+`"x-mcp-header": "<Suffix>"` onto `Mcp-Param-<Suffix>`. Both `Mcp-Name` and
+`Mcp-Param-*` pass values through verbatim when every character is printable
+ASCII (`0x20..=0x7E`), neither the first nor last byte is `' '` or `'\t'`, and
+the value does not begin with `=?base64?`; all other values encode as
+`=?base64?<standard-base64>?=` using standard `=`-padded Base64. During HTTP
 `events/list`, event definitions with invalid `x-mcp-header` schemas are
 omitted with a `stderr` warning. If HTTP `events/poll` or `events/stream`
 receives `-32602` while header annotations were uncached or stale, the client
