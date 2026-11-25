@@ -98,6 +98,8 @@ pub enum FailureKind {
     Timeout,
     Protocol,
     Transport,
+    AuthRequired,
+    InsufficientScope,
 }
 
 #[derive(Clone, Debug)]
@@ -106,6 +108,7 @@ pub struct McpFailure {
     pub message: String,
     pub outcome_unknown: bool,
     pub rpc_error: Option<Arc<Value>>,
+    pub auth: Option<crate::auth::AuthChallengeInfo>,
     pub(crate) lease: Option<Arc<ByteLease>>,
 }
 
@@ -130,6 +133,7 @@ fn failure_with_outcome(
         message: message.into(),
         outcome_unknown,
         rpc_error: None,
+        auth: None,
         lease: None,
     }
     .into()
@@ -150,6 +154,7 @@ impl TransportTermination {
                 message,
                 outcome_unknown: false,
                 rpc_error: None,
+                auth: None,
                 lease: None,
             });
         }
@@ -158,18 +163,23 @@ impl TransportTermination {
     }
 
     pub(super) fn set_transient(&self, kind: FailureKind, message: String) {
+        self.set_transient_failure(McpFailure {
+            kind,
+            message,
+            outcome_unknown: false,
+            rpc_error: None,
+            auth: None,
+            lease: None,
+        });
+    }
+
+    pub(super) fn set_transient_failure(&self, failure: McpFailure) {
         if self.cancelled.is_cancelled() {
             return;
         }
         let mut guard = self.reason.lock().unwrap_or_else(|p| p.into_inner());
         if guard.is_none() {
-            *guard = Some(McpFailure {
-                kind,
-                message,
-                outcome_unknown: false,
-                rpc_error: None,
-                lease: None,
-            });
+            *guard = Some(failure);
         }
     }
 
@@ -243,6 +253,7 @@ fn record_cleanup_failure(
                     message: message.into(),
                     outcome_unknown: false,
                     rpc_error: None,
+                    auth: None,
                     lease: None,
                 },
                 local_confirmed,
@@ -254,6 +265,7 @@ fn record_cleanup_failure(
                 message: message.into(),
                 outcome_unknown: false,
                 rpc_error: None,
+                auth: None,
                 lease: None,
             };
             existing.local_confirmed = false;
@@ -321,6 +333,7 @@ fn rpc_failure(code: i32, diagnostic: String, calling: bool, ingress: &Ingress) 
         message: format!("{message}{suffix}"),
         outcome_unknown: calling,
         rpc_error,
+        auth: None,
         lease,
     }
     .into()
@@ -550,6 +563,19 @@ impl McpConnection {
                                 "Cannot create HTTP client; check the system CA certificates",
                             )
                         })?;
+                    let has_static_auth = parsed_headers.contains_key(&http::header::AUTHORIZATION);
+                    let auth_manager = if has_static_auth {
+                        None
+                    } else {
+                        Some(
+                            crate::auth::HttpAuthManager::for_server_url(url).map_err(|e| {
+                                failure(
+                                    FailureKind::Protocol,
+                                    format!("Invalid HTTP server URL: {e}"),
+                                )
+                            })?,
+                        )
+                    };
                     let transport_config =
                         StreamableHttpClientTransportConfig::with_uri(url.clone())
                             .custom_headers(parsed_headers)
@@ -558,6 +584,7 @@ impl McpConnection {
                     let transport = StreamableHttpClientTransport::with_client(
                         BoundedHttp {
                             client,
+                            auth_manager,
                             cleanup: cleanup.clone(),
                             ingress: ingress.clone(),
                             event_schemas: event_schemas.clone(),
@@ -989,6 +1016,7 @@ impl McpConnection {
             event_schemas: self.event_schemas.clone(),
             termination: self.termination.clone(),
             limits: self.limits.clone(),
+            http: self.http,
         }
     }
 
@@ -1096,6 +1124,7 @@ pub struct McpEventsClient {
     event_schemas: EventSchemaCache,
     termination: Arc<TransportTermination>,
     limits: McpLimits,
+    http: bool,
 }
 
 impl McpEventsClient {
@@ -1144,6 +1173,7 @@ impl McpEventsClient {
             message,
             outcome_unknown: false,
             rpc_error: Some(Arc::new(Value::Object(value))),
+            auth: None,
             lease: Some(Arc::new(lease)),
         }
         .into()
@@ -1268,8 +1298,19 @@ impl McpEventsClient {
                     .map(std::mem::take)
                     .unwrap_or_default();
                 for event in page_events {
-                    if let Some(schema) = event.get("inputSchema").and_then(Value::as_object) {
-                        if events::validate_param_header_annotations(schema).is_err() {
+                    if self.http
+                        && let Some(schema) = event.get("inputSchema").and_then(Value::as_object)
+                    {
+                        let event_name = event
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<unnamed>");
+                        if let Err(reason) = events::validate_param_header_annotations(schema) {
+                            eprintln!(
+                                "mcpcli: ignoring HTTP event {:?} with invalid x-mcp-header annotation: {}",
+                                crate::discovery::safe_text(event_name),
+                                crate::discovery::safe_text(&reason)
+                            );
                             continue;
                         }
                         if let Some(name) = event.get("name").and_then(Value::as_str) {
@@ -1294,7 +1335,9 @@ impl McpEventsClient {
                 }
                 match next_cursor {
                     None => {
-                        if let Ok(mut guard) = self.event_schemas.write() {
+                        if self.http
+                            && let Ok(mut guard) = self.event_schemas.write()
+                        {
                             *guard = Some(Leased::new(schemas, schema_lease));
                         }
                         return Ok(Leased::new(events, lease));
@@ -1515,6 +1558,7 @@ fn init_failure(
                 .into(),
                 outcome_unknown: false,
                 rpc_error,
+                auth: None,
                 lease,
             }
             .into()
@@ -2108,6 +2152,7 @@ where
 #[derive(Clone)]
 struct BoundedHttp {
     client: reqwest::Client,
+    auth_manager: Option<Arc<crate::auth::HttpAuthManager>>,
     cleanup: CleanupState,
     ingress: Ingress,
     event_schemas: EventSchemaCache,
@@ -2118,6 +2163,42 @@ struct BoundedHttp {
 type HttpError = StreamableHttpError<reqwest::Error>;
 
 impl BoundedHttp {
+    fn classify_auth_failure(
+        &self,
+        status: http::StatusCode,
+        headers: &http::HeaderMap,
+        record_transient: bool,
+    ) -> HttpError {
+        let info = crate::auth::AuthChallengeInfo::from_response(status, headers);
+        let summary = info.sanitized_summary();
+        let required_scope =
+            (!info.required_scopes.is_empty()).then(|| info.required_scopes.join(" "));
+        let kind = if status == http::StatusCode::FORBIDDEN {
+            FailureKind::InsufficientScope
+        } else {
+            FailureKind::AuthRequired
+        };
+        if record_transient {
+            self.termination.set_transient_failure(McpFailure {
+                kind,
+                message: info.format_message(None),
+                outcome_unknown: false,
+                rpc_error: None,
+                auth: Some(info),
+                lease: None,
+            });
+        }
+        if status == http::StatusCode::FORBIDDEN {
+            HttpError::InsufficientScope(
+                rmcp::transport::streamable_http_client::InsufficientScopeError::new(
+                    summary,
+                    required_scope,
+                ),
+            )
+        } else {
+            HttpError::AuthRequired(AuthRequiredError::new(summary))
+        }
+    }
     async fn bounded_body(
         &self,
         mut response: reqwest::Response,
@@ -2230,22 +2311,6 @@ impl BoundedHttp {
             }
             _ => None,
         };
-        let mut request = self
-            .client
-            .post(uri.as_ref())
-            .header("accept", "application/json, text/event-stream");
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        for (name, value) in event_headers {
-            request = request.header(name, value);
-        }
-        if let Some(session) = session_id {
-            request = request.header("Mcp-Session-Id", session.as_ref());
-        }
-        if let Some(auth) = auth {
-            request = request.bearer_auth(auth);
-        }
         let body = encode_mcp_message(
             &message,
             self.max_response_bytes,
@@ -2257,26 +2322,65 @@ impl BoundedHttp {
             bytes: body,
             _message: message,
         });
-        let mut request = request
-            .body(body)
-            .build()
-            .map_err(|error| HttpError::Client(error.without_url()))?;
-        request
-            .headers_mut()
-            .entry(http::header::CONTENT_TYPE)
-            .or_insert(HeaderValue::from_static("application/json"));
-        let response = self
-            .client
-            .execute(request)
-            .await
-            .map_err(|error| HttpError::Client(error.without_url()))?;
+        let (mut dynamic_token, attempted_refresh) = match (&self.auth_manager, &auth) {
+            (Some(mgr), None) => mgr.prepare_token(&self.client).await,
+            _ => (None, false),
+        };
+        let send_post = |bearer: Option<&str>| {
+            let mut request = self
+                .client
+                .post(uri.as_ref())
+                .header("accept", "application/json, text/event-stream");
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
+            for (name, value) in &event_headers {
+                request = request.header(name, value);
+            }
+            if let Some(session) = &session_id {
+                request = request.header("Mcp-Session-Id", session.as_ref());
+            }
+            if let Some(token) = auth.as_deref().or(bearer) {
+                request = request.bearer_auth(token);
+            }
+            let built = request
+                .body(body.clone())
+                .build()
+                .map_err(|error| HttpError::Client(error.without_url()));
+            let client = self.client.clone();
+            async move {
+                let mut req = built?;
+                req.headers_mut()
+                    .entry(http::header::CONTENT_TYPE)
+                    .or_insert(HeaderValue::from_static("application/json"));
+                client
+                    .execute(req)
+                    .await
+                    .map_err(|error| HttpError::Client(error.without_url()))
+            }
+        };
+        let mut response = send_post(dynamic_token.as_deref()).await?;
+        if response.status() == http::StatusCode::UNAUTHORIZED
+            && !attempted_refresh
+            && auth.is_none()
+            && let Some(mgr) = &self.auth_manager
+            && let Some(refreshed) = mgr
+                .refresh_after_401(&self.client, dynamic_token.as_deref())
+                .await
+        {
+            dynamic_token = Some(refreshed);
+            response = send_post(dynamic_token.as_deref()).await?;
+        }
+        drop(body);
         let status = response.status();
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
-            return Err(HttpError::AuthRequired(AuthRequiredError::new(
-                String::new(),
-            )));
+            return Err(self.classify_auth_failure(status, response.headers(), true));
         }
         if status == http::StatusCode::NOT_FOUND && had_session {
+            self.termination.terminate(
+                FailureKind::Transport,
+                "MCP HTTP session expired; run reset before opening a new connection".into(),
+            );
             return Err(HttpError::SessionExpired);
         }
         if status == http::StatusCode::ACCEPTED || status == http::StatusCode::NO_CONTENT {
@@ -2515,26 +2619,47 @@ impl StreamableHttpClient for BoundedHttp {
             return Err(HttpError::ServerDoesNotSupportSse);
         }
         let had_session = session.is_some();
-        let mut request = self
-            .client
-            .get(uri.as_ref())
-            .header("accept", "text/event-stream");
-        for (name, value) in headers {
-            request = request.header(name, value);
+        let resumed = last_id.is_some();
+        let (mut dynamic_token, attempted_refresh) = match (&self.auth_manager, &auth) {
+            (Some(mgr), None) => mgr.prepare_token(&self.client).await,
+            _ => (None, false),
+        };
+        let send_get = |bearer: Option<&str>| {
+            let mut request = self
+                .client
+                .get(uri.as_ref())
+                .header("accept", "text/event-stream");
+            for (name, value) in &headers {
+                request = request.header(name, value);
+            }
+            if let Some(session) = &session {
+                request = request.header("Mcp-Session-Id", session.as_ref());
+            }
+            if let Some(last_id) = &last_id {
+                request = request.header("Last-Event-Id", last_id.as_str());
+            }
+            if let Some(token) = auth.as_deref().or(bearer) {
+                request = request.bearer_auth(token);
+            }
+            async move {
+                request
+                    .send()
+                    .await
+                    .map_err(|error| HttpError::Client(error.without_url()))
+            }
+        };
+        let mut response = send_get(dynamic_token.as_deref()).await?;
+        if response.status() == http::StatusCode::UNAUTHORIZED
+            && !attempted_refresh
+            && auth.is_none()
+            && let Some(mgr) = &self.auth_manager
+            && let Some(refreshed) = mgr
+                .refresh_after_401(&self.client, dynamic_token.as_deref())
+                .await
+        {
+            dynamic_token = Some(refreshed);
+            response = send_get(dynamic_token.as_deref()).await?;
         }
-        if let Some(session) = session {
-            request = request.header("Mcp-Session-Id", session.as_ref());
-        }
-        if let Some(last_id) = last_id {
-            request = request.header("Last-Event-Id", last_id);
-        }
-        if let Some(auth) = auth {
-            request = request.bearer_auth(auth);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| HttpError::Client(error.without_url()))?;
         let status = response.status();
         if status == http::StatusCode::METHOD_NOT_ALLOWED {
             return Err(HttpError::ServerDoesNotSupportSse);
@@ -2543,11 +2668,13 @@ impl StreamableHttpClient for BoundedHttp {
             status,
             http::StatusCode::UNAUTHORIZED | http::StatusCode::FORBIDDEN
         ) {
-            return Err(HttpError::AuthRequired(AuthRequiredError::new(
-                String::new(),
-            )));
+            return Err(self.classify_auth_failure(status, response.headers(), resumed));
         }
         if status == http::StatusCode::NOT_FOUND && had_session {
+            self.termination.terminate(
+                FailureKind::Transport,
+                "MCP HTTP session expired; run reset before opening a new connection".into(),
+            );
             return Err(HttpError::SessionExpired);
         }
         if !status.is_success() {
@@ -2581,13 +2708,17 @@ impl StreamableHttpClient for BoundedHttp {
         auth: Option<String>,
         headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), HttpError> {
+        let dynamic_token = match (&self.auth_manager, &auth) {
+            (Some(mgr), None) => mgr.prepare_token(&self.client).await.0,
+            _ => None,
+        };
         let mut request = self.client.delete(uri.as_ref());
         for (name, value) in headers {
             request = request.header(name, value);
         }
         request = request.header("Mcp-Session-Id", session.as_ref());
-        if let Some(auth) = auth {
-            request = request.bearer_auth(auth);
+        if let Some(token) = auth.or(dynamic_token) {
+            request = request.bearer_auth(token);
         }
         match timeout(Duration::from_secs(2), request.send()).await {
             Ok(Ok(response)) => {
@@ -3089,6 +3220,7 @@ mod http_tests {
         let client = reqwest::Client::new();
         let http = BoundedHttp {
             client: client.clone(),
+            auth_manager: None,
             cleanup: CleanupState::default(),
             ingress: Ingress::default(),
             event_schemas: EventSchemaCache::default(),
@@ -3171,7 +3303,11 @@ mod http_tests {
             !msg.contains("65536") && !msg.contains("exceeds the"),
             "stale discover transient leaked into initialize failure: {msg}"
         );
-        assert!(msg.contains("initialization failed"), "unexpected: {msg}");
+        assert_eq!(
+            err.downcast_ref::<McpFailure>().unwrap().kind,
+            FailureKind::AuthRequired
+        );
+        assert!(msg.contains("401"), "unexpected: {msg}");
         srv.abort();
     }
 
@@ -3670,6 +3806,7 @@ mod event_lifecycle_tests {
                     budget,
                     ..McpLimits::default()
                 },
+                http: true,
             };
             Self {
                 client,
@@ -3970,6 +4107,51 @@ mod event_lifecycle_tests {
         fixture.client.event_schemas.write().unwrap().take();
         assert_eq!(budget.used(), 0);
         fixture.service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stdio_events_list_ignores_x_mcp_header_while_http_filters_invalid_annotations() {
+        let budget = ByteBudget::new(8192);
+        let bad_schema = json!({
+            "type": "object",
+            "properties": {
+                "ratio": { "type": "number", "x-mcp-header": "InvalidFloatHeader" }
+            }
+        });
+        for is_http in [false, true] {
+            let mut fixture = Fixture::new(budget.clone());
+            fixture.client.http = is_http;
+            let client = fixture.client.clone();
+            let listing =
+                tokio::spawn(async move { client.list_events(Duration::from_secs(5)).await });
+            let id = fixture.request("events/list").await;
+            fixture
+                .respond(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "resultType": "complete",
+                        "events": [
+                            { "name": "bad.annotated", "inputSchema": bad_schema },
+                            { "name": "ok.plain", "inputSchema": { "type": "object" } }
+                        ]
+                    }
+                }))
+                .await;
+            let listed = listing.await.unwrap().unwrap();
+            if is_http {
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0]["name"], "ok.plain");
+            } else {
+                assert_eq!(listed.len(), 2);
+                assert_eq!(listed[0]["name"], "bad.annotated");
+                assert!(fixture.client.event_schemas.read().unwrap().is_none());
+            }
+            drop(listed);
+            fixture.client.event_schemas.write().unwrap().take();
+            fixture.service.close().await.unwrap();
+        }
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]

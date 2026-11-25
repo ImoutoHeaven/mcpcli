@@ -107,6 +107,8 @@ pub struct Failure {
     pub outcome_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rpc_error: Option<Arc<Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
     #[serde(skip)]
     pub(crate) lease: Option<Arc<ByteLease>>,
 }
@@ -118,6 +120,7 @@ impl Failure {
             message: message.into(),
             outcome_unknown: false,
             rpc_error: None,
+            data: None,
             lease: None,
         }
     }

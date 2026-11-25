@@ -2,51 +2,60 @@
 
 ## 1. Product contract
 
-`mcpcli` is a native command-line client for configured MCP tools, a global
-`AGENTS.md` file, and local Agent Skills. Each invocation reads global
-instructions, lists or inspects tools, calls a tool, or reads a skill resource,
-while a local daemon keeps connections and server state alive across commands.
+`mcpcli` is a native command-line client for configured MCP tools, MCP
+`2026-07-28` Events (`io.modelcontextprotocol/events`, [SEP-3415](https://github.com/modelcontextprotocol/ext-events/blob/main/specification/beta/events/events.mdx)),
+OAuth 2.1 HTTP server authentication, a global `AGENTS.md` file, and local Agent
+Skills. Each invocation reads global instructions, manages OAuth credentials,
+lists or inspects tools, calls a tool, lists, polls, or streams events, or reads
+a skill resource, while a local daemon keeps connections and server state alive
+across commands.
 
-The client speaks stdio and Streamable HTTP through `rmcp 3.9.0`. It prefers
-protocol version `2026-07-28`, falls back to legacy `2025-11-25` lifecycle
-negotiation, and accepts older revisions negotiated by the SDK. Only tools are
-exposed and advertised. Resources, prompts, sampling, roots, interactive
-elicitation (MRTR), asynchronous Tasks, OAuth login, legacy two-endpoint
-HTTP+SSE, and outbound MCP server hosting are out of scope.
+The client speaks `stdio` and single-endpoint Streamable HTTP through
+`rmcp 3.9.0`. It prefers protocol version `2026-07-28`, falls back to
+`2025-11-25` lifecycle negotiation, and accepts older Streamable HTTP revisions
+(`2025-06-18` and `2025-03-26`) negotiated by the SDK. Over HTTP, `mcpcli`
+supports single-endpoint Streamable HTTP only and does not implement the
+deprecated `2024-11-05` two-endpoint HTTP+SSE (`/sse`) transport. Only tools
+and the `io.modelcontextprotocol/events` extension capability
+(`capabilities.extensions["io.modelcontextprotocol/events"]`) are exposed.
+MCP server resource endpoints (`resources/*`), prompts (`prompts/*`), sampling,
+roots, interactive elicitation (MRTR), asynchronous Tasks, deprecated
+`2024-11-05` two-endpoint `/sse`, and outbound MCP server hosting are out of
+scope.
 
 The dependency is the unmodified crates.io `rmcp =3.9.0` package, pinned by
-Cargo.lock. The repository has no rmcp vendor copy or Cargo patch. Local byte
-owners cover objects held by this application; they are released at the actual
+`Cargo.lock`. The repository has no `rmcp` vendor copy or Cargo patch. Local
+byte owners cover objects held by this application and release them at the
 handoff to the SDK. Guarantees that require changes to SDK model fields, queues,
 or caches are outside this implementation (see WONT FIX below).
 
 Supported targets are Alpine and Debian Linux (x86-64 and ARM64, static musl),
 FreeBSD (x86-64), macOS (Intel and Apple silicon), and Windows (x86-64 and
 ARM64). Local IPC uses Unix domain sockets or Windows named pipes. `mcpcli`
-itself requires no external language runtime, though a configured MCP server
-may require Python, Node, or another interpreter. Configured stdio commands run
-with the current user's permissions.
+requires no external language runtime, though a configured MCP server may
+require Python, Node, or another interpreter. Configured stdio commands and
+event callback commands run with the current user's permissions.
 
 ## 2. Connection ownership
 
 The daemon owns stdio children, HTTP streams, protocol negotiation,
 notifications, and request routing. A stdio server retains its child processes
-and in-memory state for the lifetime of that connection. Legacy servers use an
-initialized session (`initialize`), while `2026-07-28` servers can answer
+and in-memory state for the lifetime of that connection. Session-based servers
+use an initialized session (`initialize`), while `2026-07-28` servers can answer
 `server/discover` without connection-scoped initialization. Remote HTTP
 services can also hold application state outside MCP session IDs, and an HTTP
 session ID by itself cannot preserve a live client worker across processes.
 
-Connections open lazily on the first `server`, `tools`, `inspect`, or `call`
-command for that server and stay open until `reset`, `daemon stop`, a
+Connections open lazily on the first `server`, `tools`, `inspect`, `call`, or
+`events` command for that server and stay open until `reset`, `daemon stop`, a
 termination signal, or transport failure. `--oneshot` opens a private
 connection for one command and closes it before exit.
 
 Session identity combines the canonical configuration path with `--session NAME`
-(default `default`). Distinct session names run separate daemons and stdio
-processes. Client sessions isolate local connections; two servers pointed at
-the same remote service or shared browser profile still share that upstream
-state.
+or `MCPCLI_SESSION` (default `default`). Distinct session names run separate
+daemons and stdio processes. Client sessions isolate local connections; two
+servers pointed at the same remote service or shared browser profile still share
+that upstream state.
 
 ## 3. Command and disclosure model
 
@@ -55,38 +64,44 @@ state.
 | `catalog` | Global `AGENTS.md` (if configured), server descriptions, and skill metadata | No |
 | `agents` | Full configured global `AGENTS.md` file | No |
 | `search QUERY` | Offline case-insensitive substring match across `AGENTS.md`, servers, and skills | No |
+| `auth login SERVER` | OAuth 2.1 PKCE (`S256`) discovery, registration, and token storage for an HTTP server | No |
+| `auth status [SERVER]` | Stored OAuth credential state, scopes, and expiry without exposing raw tokens | No |
+| `auth logout SERVER` | Remove stored OAuth credentials for an HTTP server | No |
 | `server SERVER` | Lifecycle metadata, negotiated version, capabilities, and upstream instructions | If needed |
 | `tools SERVER` | Fresh, complete paginated tool definitions | If needed |
 | `inspect SERVER TOOL` | Complete definition and schemas for one tool | If needed |
 | `call [--inline-media] SERVER TOOL` | One tool call, saving binary media locally by default | If needed |
-| `skills list` | Mounted skill metadata and validation warnings | No |
-| `skills show NAME` | Full `SKILL.md` manifest and canonical skill directory | No |
-| `skills files NAME` | Relative resource file paths under that skill | No |
-| `skills read NAME PATH` | Full UTF-8 contents of one skill resource | No |
+| `events list SERVER` | Fresh paginated event definitions from `events/list` | If needed |
+| `events poll SERVER EVENT` | Single `events/poll` batch fetch with optional cursor and filter arguments | If needed |
+| `events stream SERVER EVENT` | Foreground push or poll stream emitting SEP-3415 NDJSON or invoking a callback | If needed |
+| `skills` (`skill`) `list` | Mounted skill metadata and validation warnings | No |
+| `skills` (`skill`) `show NAME` | Full `SKILL.md` manifest and canonical skill directory | No |
+| `skills` (`skill`) `files NAME` | Relative resource file paths under that skill | No |
+| `skills` (`skill`) `read NAME PATH` | Full UTF-8 contents of one skill resource | No |
 | `reset [--force] SERVER` | Close one server connection and clear its local slot | No |
-| `daemon start\|status\|stop\|restart\|run` | Manage the daemon for the selected session | No |
+| `daemon start|status|stop|restart|run` | Manage the daemon for the selected session | No |
 
 Tool schemas are fetched only for the requested server. Every `tools`,
 `inspect`, and `call` command fetches the current tool pages before acting,
-populating `2026-07-28` HTTP `x-mcp-header` (`Mcp-Param-*`) mappings and dropping tools
-withdrawn by the server or rejected by the SDK. Discovery, pagination, and tool
-dispatch share one operation deadline.
+populating `2026-07-28` HTTP `x-mcp-header` (`Mcp-Param-*`) mappings and
+dropping tools withdrawn by the server or rejected by the SDK. Discovery,
+pagination, and tool dispatch share one operation deadline.
 
-`mcpcli` stores no persistent schema cache and disables the SDK response cache.
-Live connections accept legacy `notifications/tools/list_changed` messages
-without subscribing to `2026-07-28` notification streams, and fresh listing
+`mcpcli` stores no persistent tool schema cache and disables the SDK response
+cache. Live connections accept `notifications/tools/list_changed` messages
+without subscribing to `2026-07-28` tool notification streams, and fresh listing
 never relies on notification delivery.
 
-Tool arguments are passed as one JSON object through `--args JSON`,
-`--args-file PATH`, or `--stdin` (default `{}`). Property names, including
-distinct spellings such as `fooBar` and `foo_bar`, nested objects, arrays, and
-union shapes pass straight through in JSON.
+Tool and event filter arguments are passed as one JSON object through
+`--args JSON`, `--args-file PATH`, or `--stdin` (`call` defaults to `{}`).
+Property names, including distinct spellings such as `fooBar` and `foo_bar`,
+nested objects, arrays, and union shapes pass straight through in JSON.
 
 ## 4. Configuration and environment
 
-Configuration defaults to `./mcpcli.json` and can be overridden with `--config`
-or `MCPCLI_CONFIG`. `mcpcli` reads only the selected file and never searches
-parent directories or imports settings from other tools.
+Configuration defaults to `./mcpcli.json` and can be overridden with `-c PATH`,
+`--config PATH`, or `MCPCLI_CONFIG`. `mcpcli` reads only the selected file and
+never searches parent directories or imports settings from other tools.
 
 `version` defaults to `1`. Optional `agents` names one global `AGENTS.md` file
 (or `null`). `servers` maps aliases to transport definitions, and `skills`
@@ -106,20 +121,25 @@ cannot contain keys that collide case-insensitively on Windows. Arguments go
 directly to the OS process API; npm wrappers on Windows require `.cmd` (such as
 `npx.cmd`).
 
-Environment expansion applies only when an `env` or `headers` value has the
-exact form `"${NAME}"`. Missing or non-UTF-8 variables fail loading, and
+Environment expansion applies to `env` and HTTP `headers` values containing
+`${NAME}` placeholders, supporting both whole-value references
+(`"${MCP_AUTHORIZATION}"`) and inline templates (`"Bearer ${MCP_TOKEN}"`).
+Missing or non-UTF-8 referenced variables fail configuration loading, and
 `args` values are never interpolated. HTTP URLs cannot include credentials or
 fragments. Protocol-owned headers (`Host`, `Content-Length`, `Content-Type`,
 `Accept`, `Connection`, `Transfer-Encoding`, `Upgrade`, `TE`, `Trailer`,
-`Last-Event-Id`, `Mcp-*`, and `Mcp_*`) are blocked case-insensitively at load time and
-request build time. Validation errors report field paths and JSON types while
-omitting secret values.
+`Last-Event-Id`, `Mcp-*`, and `Mcp_*`) are blocked case-insensitively at load
+time and request build time. Validation errors report field paths and JSON
+types while omitting secret values.
 
 The daemon snapshots its launch environment on startup and computes a SHA-256
-digest over the resolved configuration and expanded values. Callers whose
-computed digest differs are rejected until `daemon restart`. Server and session
-names allow 1 to 64 ASCII alphanumerics, `_`, or `-`. Configuration files are
-capped at 1 MiB, 64 servers, and 64 skill roots.
+digest over the resolved configuration and expanded values. OAuth 2.1 tokens
+managed by `mcpcli auth` live in a separate private `credentials.json` file
+outside that digest so token acquisition, rotation, and logout never invalidate
+a running daemon. Callers whose configuration digest differs are rejected until
+`daemon restart`. Server and session names allow 1 to 64 ASCII alphanumerics,
+`_`, or `-`. Configuration files are capped at 1 MiB, 64 servers, and 64 skill
+roots.
 
 ## 5. Runtime identity and local IPC
 
@@ -142,10 +162,11 @@ that allow directory replacement or junction grafting. Pinned directory handles
 keep verified paths stable during file operations.
 
 Each namespace hashes the canonical configuration path and session name. Every
-IPC request carries protocol version `3`, namespace, executable SHA-256
-(`/proc/self/exe` on Linux, native executable path elsewhere), configuration
-digest, monotonic deadline, and whether `--timeout` was set explicitly. Version
-or binary mismatches fail with exit status `6` until `daemon restart`.
+IPC request carries protocol version `4` (`ipc::PROTOCOL = 4`), namespace,
+executable SHA-256 (`/proc/self/exe` on Linux, native executable path
+elsewhere), configuration digest, timeout budget, monotonic deadline, and
+optional explicit deadline. Version, binary, or configuration mismatches fail
+with exit status `6` until `daemon restart`.
 
 `startup.lock` serializes concurrent starters and `daemon.lock` stays locked
 for the daemon's lifetime. Lock files are never unlinked, and stale Unix
@@ -153,47 +174,66 @@ sockets are unlinked only while holding `daemon.lock` after verifying socket
 ownership. Unix peers are checked against the effective UID; Windows named
 pipes block remote clients and check the peer token SID.
 
-Each IPC connection carries one length-prefixed JSON request and one response
-(4-byte little-endian byte length followed by UTF-8 JSON). Outbound frames
-serialize in a single bounded pass backed by leases from the 1 GiB process
-active byte budget, and receivers reject empty, truncated, or over-limit
-lengths before allocating body buffers.
+All IPC frames use a 4-byte little-endian byte length followed by UTF-8 JSON.
+Outbound frames serialize in a single bounded pass backed by leases from the
+1 GiB process active byte budget, and receivers reject empty, truncated, or
+over-limit lengths before allocating body buffers. Standard operations
+(`status`, `stop`, `server`, `tools`, `call`, `reset`, `events_list`, and
+`events_poll`) exchange one `Request` and one `Response`.
+
+Streaming operations (`events_stream`) read one `Request` on the data endpoint,
+acquire one of `MAX_EVENT_STREAMS = 32` concurrent stream permits, release the
+short-lived accept connection permit so active event streams cannot starve
+regular RPC traffic, and write a sequence of length-prefixed `StreamFrame`
+records (`protocol: 4`, `namespace`, `build`, `epoch`, `kind`). Each `kind`
+carries `frame: "notification"` (`method` and optional `params`),
+`frame: "error"` (`error: Failure`), or `frame: "end"`. Streaming IPC frames
+omit the 1-hour total request cap and apply the 60-second per-frame idle
+writeback clock (`TRANSFER_IDLE_TIMEOUT`), canceling the upstream subscription
+as soon as the CLI closes the socket, the server enters `session_lost`, `reset`
+runs, or the daemon stops.
 
 Separate listeners prevent data traffic from starving management commands:
 
-- Data endpoint: up to 32 concurrent connections and 8 active server operations.
-- Control endpoint: up to 8 concurrent connections, restricted to `status` and `stop`.
+- Data endpoint accepts up to 32 concurrent setup/RPC connections, 8 active
+  request/response server operations, and 32 concurrent `events_stream`
+  subscriptions.
+- Control endpoint accepts up to 8 concurrent connections and rejects any
+  operation other than `status` and `stop` with `control_only`.
 
 Connection permits are acquired before `accept` so excess callers wait in the
 OS listen queue under their original monotonic deadline. Per-server mutexes
 are acquired before the 8-slot global operation semaphore so queued calls to
 one slow server leave other servers free to run. Request reads have a 5-second
-framing timeout. After sending a request, the CLI waits for the validated
-4-byte response header under its remaining operation budget, then switches
-response body reads to a 60-second idle progress clock (capped by any remaining
-explicit `--timeout` deadline) aligned with the daemon's 60-second idle
-writeback clock.
+framing timeout. After sending a request/response RPC, the CLI waits for the
+validated 4-byte response header under its remaining operation budget, then
+switches response body reads to a 60-second idle progress clock (capped by any
+remaining explicit `--timeout` deadline) aligned with the daemon's 60-second
+idle writeback clock.
 
 ## 6. Transports, failure handling, and shutdown
 
-An operation deadline (`1` to `3600` seconds, default `60`) covers slot
-queueing, connection setup (capped at `30` seconds), fresh tool listing, and
-tool execution. Local IPC body transfer uses its own idle progress clock once a
-valid response header arrives, and connection teardown has a separate bounded
-grace window.
+`--timeout` has two command-specific contracts. Regular request/response
+commands interpret `--timeout` in seconds (`1` to `3600`, default `60`) covering
+slot queueing, connection setup (capped at `30` seconds), discovery or listing,
+and request execution. `events stream` interprets `--timeout` in milliseconds as
+the total foreground run budget (unbounded when omitted, while connection and
+subscription handshakes remain capped at `30` seconds). Local IPC body transfer
+uses its 60-second idle progress clock once a valid frame header arrives, and
+connection teardown has a separate bounded grace window.
 
 `tools/call` is never retried. `reqwest` retries, HTTP redirects, and automatic
-legacy HTTP session reinitialization are disabled so a POST cannot be replayed
-after partial execution. If discovery fails or the tool is absent, the error
-reports `outcome_unknown: false`. Once dispatch crosses into the SDK, a
-dispatch flag is set and subsequent transport or timeout failures report
+HTTP session reinitialization are disabled so a POST cannot be replayed after
+partial execution. If discovery fails or the tool is absent, the error reports
+`outcome_unknown: false`. Once dispatch crosses into the SDK, a dispatch flag
+is set and subsequent transport or timeout failures report
 `outcome_unknown: true`. Cancellation asks the server to stop work; side
 effects that already ran remain in effect.
 
 The application's stdio and HTTP adapters enforce a 512 MiB message or event
 limit and use a shared 1 GiB non-blocking byte budget for their buffers and
-decoded values. `list_tool_pages` also enforces a 16 MiB catalog limit.
-SDK-owned allocations after handoff have the limits described under WONT FIX:
+decoded values. `list_tool_pages` enforces a 16 MiB catalog limit. SDK-owned
+allocations after handoff have the limits described under WONT FIX:
 
 - `ChildTransport` reads stdio lines directly via `BufReader::fill_buf` and
   `consume`, releases the completed line buffer, and refuses writes once
@@ -209,16 +249,16 @@ SDK-owned allocations after handoff have the limits described under WONT FIX:
 - SSE `id` values have a separate 8 KiB UTF-8 byte limit before SDK handoff.
   An oversized ID terminates the connection and pending call immediately;
   GET streams do not reconnect and POST calls are not replayed. Event/data
-  limits remain 512 MiB. The SDK keeps its own reconnect-ID strings: these
-  copies are bounded metadata, not exact leases on SDK-owned allocations.
+  limits remain 512 MiB. The SDK keeps its own reconnect-ID strings as bounded
+  metadata outside application leases.
 - Invalid UTF-8 detected by the local SSE parser is a terminal parse error.
   Its cause reaches the waiting operation even after a prior event ID;
   ordinary network errors and EOF keep the SDK's existing reconnect policy.
 - `Ingress` owns each raw buffer and reserves the lossless `Value` plus JSON
-  scratch before parsing. Scratch is one reusable Vec: its allowance is twice
-  the longest escaped string or numeric token whose mantissa exceeds u64 (at
-  least 8 bytes), retained until the JSON deserializer is gone. Numeric
-  losslessness checks then compare borrowed canonical decimal views without
+  scratch before parsing. Scratch is one reusable `Vec` whose allowance is
+  twice the longest escaped string or numeric token whose mantissa exceeds
+  `u64` (at least 8 bytes), retained until the JSON deserializer finishes.
+  Numeric losslessness checks compare borrowed canonical decimal views without
   digit copies. Raw bytes are released before conversion from a borrowed
   `&Value` into the official SDK model. That synchronous conversion reserves
   one payload-sized final model and two payload-sized temporary copies for
@@ -240,7 +280,7 @@ SDK-owned allocations after handoff have the limits described under WONT FIX:
   use leased readers before parsing, reserve the decoded value and scratch,
   and move their owned object into the operation. The source owner follows
   CLI/daemon IPC writeback and oneshot dispatch without another argument-map
-  clone. The original `--args` String separately reserves its actual capacity
+  clone. The original `--args` `String` separately reserves its actual capacity
   at CLI entry and retains that charge through output.
 - The application's client service keeps the official SDK dispatch,
   cancellation, and progress behavior. Its noninteractive defaults drop each
@@ -252,45 +292,51 @@ SDK-owned allocations after handoff have the limits described under WONT FIX:
   value lease follows the result through CLI output. RPC errors share their
   exact `error` value and lease across diagnostic conversions and clones.
   The SDK receives a small error stub (long diagnostics use a 1 KiB UTF-8
-  prefix and an ellipsis); `rpc_error` preserves the original fields and full message. Text and
-  diagnostic output write borrowed spans and stream JSON, avoiding full-size
-  rendering copies. Server, tool-list and inspect text also stream borrowed
-  fields; inspect moves its selected raw tool from the owned pages. Its short
-  display name is normalized and truncated without copying the full name.
+  prefix and an ellipsis); `rpc_error` preserves the original fields and full
+  message. Text and diagnostic output write borrowed spans and stream JSON,
+  avoiding full-size rendering copies. Server, tool-list, and inspect text
+  also stream borrowed fields; inspect moves its selected raw tool from the
+  owned pages, normalizing and truncating its short display name without
+  copying the full name.
 - Oversize frames and byte-budget exhaustion store a connection-scoped
   termination error, suppress HTTP SSE GET reconnects, and wake pending
-  `tools/call` futures immediately.
+  operations immediately.
 
 ### WONT FIX: SDK-owned allocation lifetimes
 
-Exact accounting after an object crosses the official rmcp API would require
+Exact accounting after an object crosses the official `rmcp` API would require
 upstream ownership hooks. This includes SSE reparsing and queued messages,
 unpolled handler tasks, request IDs retained for cancellation and response
 sending, peer-info metadata, tool schemas and cache keys, pagination copies,
 and call-parameter clones retained after cancellation. The SDK's subscription-ID
 getter and disabled-resource-cache URI preparation also keep upstream behavior.
-The former local model fields, preparsed-SSE wrapper, and SDK queue/clone tests
-were removed with the fork. Application guards do not imply coverage of those
-allocations, and a green application test does not establish that coverage.
-These items are WONT FIX in this repository under the no-fork requirement;
-they require an upstream change before an exact ownership guarantee can be made.
+Application guards do not imply coverage of those allocations, and a green
+application test does not establish that coverage. These items are WONT FIX in
+this repository under the unmodified-upstream requirement; they require an
+upstream SDK change before an exact ownership guarantee can be made.
 
 Disconnecting a CLI client cancels its in-flight operation while keeping a
 healthy server connection open for future commands. When a server connection
-dies, subsequent calls report `session_lost` until `reset SERVER` clears it.
-`reset` marks the slot unavailable before awaiting cleanup and keeps the slot
-blocked if cleanup is interrupted or fails. If the local client worker has
-already exited and only the remote HTTP `DELETE` failed or timed out (2-second
-deadline; `2xx`, `404`, and `405` count as clean), `reset --force SERVER`
-clears that slot with a stderr warning while leaving other servers untouched.
+dies, including when an upstream session-bearing Streamable HTTP server returns
+HTTP `404 Not Found` for an expired or evicted `Mcp-Session-Id`, `BoundedHttp`
+records connection termination via `termination.terminate`, marks the
+connection closed, cancels active event streams through `mark_lost()`
+(`streams_cancel.cancel()`), and transitions the server slot into
+`session_lost` (exit status `6`). Subsequent commands for that server report
+`session_lost` until `reset SERVER` clears the slot. `reset` marks the slot
+unavailable before awaiting cleanup and keeps the slot blocked if cleanup is
+interrupted or fails. If the local client worker has already exited and only
+the remote HTTP `DELETE` failed or timed out (2-second deadline; `2xx`, `404`,
+and `405` count as clean), `reset --force SERVER` clears that slot with a
+stderr warning while leaving other servers untouched.
 
-Daemon shutdown closes listeners, cancels active calls, joins handlers, closes
-every server connection (up to 8 seconds per close future, retained across
-retries if interrupted), and atomically writes `state.json` via `state.json.tmp`
-with `clean_stop: true` only when all local and required remote cleanups
-succeed. `daemon restart` waits for the old daemon to exit before starting a
-new one. After an unexpected daemon exit, commands report lost state and
-require an explicit `start` or `restart`.
+Daemon shutdown closes listeners, cancels active calls and event streams, joins
+handlers, closes every server connection (up to 8 seconds per close future,
+retained across retries if interrupted), and atomically writes `state.json` via
+`state.json.tmp` with `clean_stop: true` only when all local and required
+remote cleanups succeed. `daemon restart` waits for the old daemon to exit
+before starting a new one. After an unexpected daemon exit, commands report
+lost state and require an explicit `start` or `restart`.
 
 On Unix, each stdio child runs in its own process group. Teardown closes
 `stdin`, waits briefly, sends `SIGTERM` and `SIGKILL` to the group while
@@ -306,19 +352,164 @@ Daemon backgrounding detaches from any parent Job; supervisors that forbid Job
 breakaway should run `daemon run` directly. Child `stderr` is redirected to
 null so noisy servers cannot fill disks or leak secrets into daemon logs.
 
-## 7. Input validation, media cache, and exit statuses
+## 7. MCP Events
 
-Tool argument JSON must be a single object within 1 MiB and 64 nesting levels,
-with unique keys at every level. Integer tokens must fit `i64` or `u64`, and
-other numbers must preserve their exact decimal value when round-tripped
-through `serde_json` (`float_roundtrip`).
+`mcpcli events` implements client operations for the MCP `2026-07-28` Events
+extension (`capabilities.extensions["io.modelcontextprotocol/events"]`,
+[SEP-3415](https://github.com/modelcontextprotocol/ext-events/blob/main/specification/beta/events/events.mdx)).
+Servers that do not advertise `io.modelcontextprotocol/events` fail capability
+checks locally before dispatching `events/*` requests.
 
-Default stdout is a single JSON value. `server SERVER` outputs
+- `events list SERVER` paginates `events/list` up to `MAX_EVENT_PAGES = 100`
+  within the active byte budget and returns `{"events":[...]}`.
+- `events poll SERVER EVENT` sends one `events/poll` request with optional
+  filter `arguments`, `--cursor`, `--max-age-ms`, and `--max-events`, returning
+  the lossless upstream result object.
+- `events stream SERVER EVENT` runs in the foreground under `--mode auto`
+  (tries `events/stream` push first, falling back to `events/poll` when push is
+  unsupported), `--mode push`, or `--mode poll`, with optional `--cursor` or
+  `--cursor-file PATH`, `--max-age-ms`, `--heartbeat-ms` (default `30000`),
+  `--once`, and `--timeout` (millisecond run budget).
+
+On Streamable HTTP, `events/poll` and `events/stream` attach `Mcp-Name` for the
+target event (raw visible ASCII `0x21..=0x7E`, or `=?base64?<URLSAFE_NO_PAD>?=`
+otherwise) and map scalar filter `arguments` (`string`, `integer`, or
+`boolean`) whose `inputSchema.properties.<key>` declares a valid
+`"x-mcp-header": "<Suffix>"` onto `Mcp-Param-<Suffix>`. During HTTP
+`events/list`, event definitions with invalid `x-mcp-header` schemas are
+omitted with a `stderr` warning. If HTTP `events/poll` or `events/stream`
+receives `-32602` while header annotations were uncached or stale, the client
+refreshes `events/list` once and retries with updated headers. On `stdio`
+transport, HTTP header annotations have no wire meaning: `events/list` ignores
+`x-mcp-header` and retains every valid event definition.
+
+`EventRouter` pre-registers subscription slots before writing `events/stream` on
+the wire so early `notifications/events/active` frames arriving ahead of the
+RPC response are buffered in order. Each notification is capped at
+`MAX_EVENT_NOTIFICATION_BYTES = 4 MiB` with per-subscription queue depth
+`EVENT_CHANNEL_CAPACITY = 128`. Receiving `notifications/events/terminated` or
+closing the stream cancels the underlying SDK `RequestHandle` immediately. The
+daemon bounds concurrent streams at `MAX_EVENT_STREAMS = 32`; foreground
+handshakes cap at `ACTIVE_HANDSHAKE_TIMEOUT = 30s`, poll intervals enforce
+`MIN_POLL_INTERVAL_MS = 1000`, and transient stream reconnects apply exponential
+backoff from `INITIAL_BACKOFF = 1s` to `MAX_BACKOFF = 60s`.
+
+`events stream` emits pure SEP-3415 `EventOccurrence` objects (`eventId`,
+`name`, `timestamp`, `data`, and optional `cursor`) as NDJSON lines on `stdout`
+or callback `stdin` from `events/poll` batches and `notifications/events/event`
+push notifications. Batch or stream truncation indicators (`truncated: true` on
+`events/poll` responses or `notifications/events/active` notifications) write
+warnings to `stderr` and never inject synthetic `truncated` fields into
+`EventOccurrence` payloads.
+
+`--cursor-file PATH` persists opaque UTF-8 cursors up to
+`MAX_CURSOR_BYTES = 64 KiB` via `CursorStore` without stripping whitespace or
+line endings. Updates write to a private sibling temporary file
+(`.{name}.tmp-{pid}-{seq}-{rand}`, mode `0600` on Unix or owner-only DACL on
+Windows), call `sync_all`, atomically replace the target via
+`replace_file_with_retry`, and sync the parent directory (unlinking the
+temporary file on failure). Cursors advance only after `stdout` flush or
+callback acknowledgment succeeds, preserving at-least-once delivery.
+
+When `-- <CMD>...` is supplied, `CallbackExecutor` runs the callback with
+per-event deadline `--exec-timeout` in milliseconds (default
+`DEFAULT_EXEC_TIMEOUT = 30s`), teardown grace `GRACEFUL_SHUTDOWN_TIMEOUT = 2s`,
+and a `MAX_STDERR_BYTES = 64 KiB` rolling `stderr` capture buffer:
+
+- `--exec-mode oneshot` (default) spawns `<CMD>...` per event inside its own
+  Unix process group or Windows kill-on-close Job object, writes one NDJSON
+  `EventOccurrence` line to `stdin`, closes `stdin`, and requires exit status
+  `0` before committing the cursor. Timeouts or I/O errors terminate and reap
+  the full process tree.
+- `--exec-mode stream` keeps a persistent worker process across events, writing
+  one NDJSON line to `stdin` concurrently with reading one bounded
+  (`MAX_ACK_LINE_BYTES = 64 KiB`) JSON acknowledgment line from `stdout`.
+  `{"ok":true}` commits the event cursor; `{"ok":false,"error":"..."}`,
+  invalid JSON, premature `stdout` EOF, or timeout shuts down and reaps the
+  worker tree before surfacing the failure.
+
+## 8. OAuth 2.1 authentication
+
+`mcpcli auth` provides a non-GUI, Unix-style OAuth 2.1 client workflow for
+Streamable HTTP MCP servers:
+
+- `mcpcli auth login SERVER [--scope SCOPE]... [--client-id ID] [--no-browser]`
+- `mcpcli auth status [SERVER]`
+- `mcpcli auth logout SERVER`
+
+`auth login` discovers Protected Resource Metadata ([RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728))
+from the server's `WWW-Authenticate` `resource_metadata` parameter or
+well-known endpoint, verifies canonical resource binding, and fetches
+Authorization Server Metadata ([RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)).
+`auth login` binds an ephemeral `127.0.0.1:0` loopback HTTP callback listener
+(`http://127.0.0.1:<port>/callback`) before client resolution: when
+`--client-id` is omitted, every login performs Dynamic Client Registration
+([RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)) as a public native CLI client
+(`token_endpoint_auth_method = "none"`, `grant_types = ["authorization_code", "refresh_token"]`,
+`response_types = ["code"]`) bound to that invocation's loopback `redirect_uri`
+rather than reusing a prior client registration tied to an older port.
+Authorization requests always use Authorization Code with PKCE `S256`
+([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)), a cryptographic `state` parameter, and
+the canonical target `resource` URI ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)).
+
+For non-loopback MCP servers, all OAuth metadata, registration, authorization,
+token, and revocation endpoints must use `https://` and must not address or
+resolve in DNS to loopback, private, link-local, or cloud metadata ranges.
+Literal `http://` loopback OAuth endpoints are allowed only when the configured
+MCP server URL itself targets loopback (`127.0.0.0/8`, `::1`,
+`::ffff:127.0.0.0/104`, or `localhost`).
+
+`auth login` prints the authorization URL to `stderr`, opens the default
+browser unless `--no-browser` is passed, and exchanges the authorization code
+after constant-time `state` (and optional `iss`) verification. With
+`--no-browser`, `auth login` skips browser launch while accepting either the
+loopback callback or a pasted redirect URL or authorization code on `stdin` for
+SSH and headless sessions.
+
+Acquired tokens, refresh tokens, expiration timestamps, granted scopes, and
+client metadata are stored in a private `credentials.json` file (`0600` on
+Unix, owner-only DACL on Windows, updated under a lock via atomic
+temporary-file rename). Credential path resolution checks `MCPCLI_CREDENTIALS`
+first, then `<MCPCLI_RUNTIME_DIR>/credentials.json` when `MCPCLI_RUNTIME_DIR`
+is set; otherwise Unix resolves `$XDG_STATE_HOME/mcpcli/credentials.json` (when
+`XDG_STATE_HOME` is an absolute path), `$HOME/.local/state/mcpcli/credentials.json`
+(when `HOME` is an absolute path), or `<runtime>/credentials.json`, and Windows
+resolves `%LOCALAPPDATA%\mcpcli\state\credentials.json`. Explicit
+`Authorization` headers configured in `mcpcli.json` take precedence over stored
+OAuth credentials. Because `credentials.json` is separate from `mcpcli.json`
+and excluded from the daemon configuration `digest`, logging in, rotating
+tokens, or logging out takes effect immediately on live daemons without
+restarting other server sessions.
+
+When a stored access token is within 30 seconds of expiry (`expires_at <= now + 30s`)
+or an upstream HTTP server returns any `401 Unauthorized` while a
+`refresh_token` is held, `BoundedHttp` runs `grant_type=refresh_token` once
+under a per-resource singleflight lock, atomically persists rotated credentials,
+and retries the request once. If the token endpoint rejects refresh with
+`invalid_grant`, `invalid_client`, or `unauthorized_client`, `mcpcli` clears
+the stored `refresh_token` on disk and withholds confirmed-expired access
+tokens from upstream requests.
+
+When an HTTP server returns `401 Unauthorized` or `403 Forbidden` that cannot
+be satisfied automatically, `BoundedHttp` parses RFC 6750 and RFC 9728
+`WWW-Authenticate: Bearer` parameters (`error`, `error_description`, `scope`,
+`resource_metadata`) and returns structured diagnostics (`kind: "auth_required"`
+on `401` and `kind: "insufficient_scope"` on `403`) naming any required scopes
+and `mcpcli auth login <SERVER>` without echoing bearer secrets.
+
+## 9. Input validation, media cache, and exit statuses
+
+Tool and event argument JSON must be a single object within 1 MiB and 64
+nesting levels, with unique keys at every level. Integer tokens must fit `i64`
+or `u64`, and other numbers must preserve their exact decimal value when
+round-tripped through `serde_json` (`float_roundtrip`).
+
+Default stdout is JSON (or NDJSON for `events stream`). `server SERVER` outputs
 `{"source":"initialize"|"server/discover","protocolVersion":...,"result":{...}}`
 from the initial handshake without re-running negotiation on later calls.
 Upstream server instructions remain distinct from the local `AGENTS.md` file.
-Server descriptions, instructions, and tool metadata are untrusted data and
-never authorize tool execution or data disclosure.
+Server descriptions, instructions, and tool or event metadata are untrusted
+data and never authorize tool execution or data disclosure.
 
 `tools SERVER` outputs `{"pages":[...]}` with raw cursors and metadata intact,
 `inspect SERVER TOOL` outputs the matching raw tool object, and `call` projects
@@ -336,54 +527,59 @@ decodes them into a private media directory using random hex stems and a fixed
 `.gif`, `.webp`, `.bmp`, `.tiff`, `.heic`, `.heif`, or `.bin` for other MIME
 types, ignoring upstream URIs), and returns `{result, savedMedia}`. All other
 upstream fields, including a remote `result.savedMedia`, remain untouched. The
-local top-level `savedMedia` array (empty when nothing was saved) contains entries
-(`contentIndex`, `kind`, `savedPath`, `mimeType`, `bytes`). `--inline-media` skips
-extraction and wrapping and prints the verified MCP result with Base64 strings
-and all remote fields untouched. Local records reserve their path, MIME, kind
-and field-name payload before construction and retain that charge with the
-result. Path construction and the rollback list reserve their overlapping
-allocations separately. MIME matching borrows its source string.
+local top-level `savedMedia` array (empty when nothing was saved) contains
+entries (`contentIndex`, `kind`, `savedPath`, `mimeType`, `bytes`).
+`--inline-media` skips extraction and wrapping and prints the verified MCP
+result with Base64 strings and all remote fields untouched. Local records
+reserve their path, MIME, kind, and field-name payload before construction and
+retain that charge with the result. Path construction and the rollback list
+reserve their overlapping allocations separately. MIME matching borrows its
+source string.
 
 Media directory resolution uses `<MCPCLI_RUNTIME_DIR>/media` when
 `MCPCLI_RUNTIME_DIR` is set; otherwise Unix tries `$XDG_CACHE_HOME/mcpcli/media`,
 `$HOME/.cache/mcpcli/media`, and `<runtime>/media`, and Windows uses
 `%LOCALAPPDATA%\mcpcli\media` (`0700` or owner-only DACL, independent of Unix
-socket path length limits). A canonical cache directory that cannot be represented
-as UTF-8 fails with a local cache error before any media file is published;
-paths in JSON are never lossy. Both the daemon and `--oneshot` acquire
-`<media_dir>/.lock` to serialize garbage collection, the 2 GiB cache cap,
-`.tmp-<pid>-<seq>-<rand>` writes (`flush` without `sync_all`), atomic renames,
-and `.inflight-<id>.lock` batch leases. Garbage collection skips active
-in-flight batches and files within 60 seconds of publication. Completing local
-IPC or `--oneshot` stdout writeback records its completion timestamp in the
-batch's existing lock file, without acquiring the directory lock. The file
-records `writing` before output starts, then a completed timestamp or an aborted
-write. GC imports completed timestamps before applying the 60-second retention
-window. Ordinary decode or capacity errors roll back that call's files;
-explicitly aborted writes do not refresh retention, and crashes before writeback starts
-remain recoverable on the next GC pass.
+socket path length limits). A canonical cache directory that cannot be
+represented as UTF-8 fails with a local cache error before any media file is
+published; paths in JSON are never lossy. Both the daemon and `--oneshot`
+acquire `<media_dir>/.lock` to serialize garbage collection, the 2 GiB cache
+cap, `.tmp-<pid>-<seq>-<rand>` writes (`flush` without `sync_all`), atomic
+renames, and `.inflight-<id>.lock` batch leases. Garbage collection skips
+active in-flight batches and files within 60 seconds of publication. Completing
+local IPC or `--oneshot` stdout writeback records its completion timestamp in
+the batch's existing lock file, without acquiring the directory lock. The file
+records `writing` before output starts, then a completed timestamp or an
+aborted write. GC imports completed timestamps before applying the 60-second
+retention window. Ordinary decode or capacity errors roll back that call's
+files; explicitly aborted writes do not refresh retention, and crashes before
+writeback starts remain recoverable on the next GC pass.
 
-After GC acquires an inactive batch's OS lock, a remaining `writing` or unreadable
-record gets one conservative 60-second protection window. GC persists that new
-timestamp before retiring the batch, so later collections can recover its space
-without blocking other calls. An aborted write keeps its original publication
-time. Because cache files survive reboots but the monotonic clock restarts, GC
-normalizes future publication and completion timestamps to the current time once;
-that also preserves a full protection window without retaining files indefinitely.
-Oneshot reports completion errors to stderr and exits nonzero. If daemon completion
-fails after the IPC response has been flushed, the daemon reports that local commit failure on its stderr;
-there is no second response frame. Only a missing index starts an empty cache
-index. Other index read errors stop GC, and both index reads and atomic writes
-use the same 4 MiB limit.
+After GC acquires an inactive batch's OS lock, a remaining `writing` or
+unreadable record gets one conservative 60-second protection window. GC
+persists that new timestamp before retiring the batch, so later collections can
+recover its space without blocking other calls. An aborted write keeps its
+original publication time. Because cache files survive reboots while the
+monotonic clock restarts, GC normalizes future publication and completion
+timestamps to the current time once; that preserves a full protection window
+without retaining files indefinitely. Oneshot reports completion errors to
+stderr and exits nonzero. If daemon completion fails after the IPC response has
+been flushed, the daemon reports that local commit failure on its stderr
+without emitting a second response frame. Only a missing index starts an empty
+cache index. Other index read errors stop GC, and both index reads and atomic
+writes use the same 4 MiB limit.
 
-`--text` prints text blocks and `Saved <kind> [<mimeType>] (<bytes> B): <path>`
-lines for saved media, notes omitted inline binary blocks on stderr when
-`--inline-media` is set, and prints `structuredContent` JSON when no text or
-saved media lines were emitted (otherwise noting its presence on stderr). Text
-output normalizes `CRLF` to `LF`, escapes bare `CR` and control characters, and
-emits nothing for empty text blocks. If `--oneshot` cleanup fails or is
-interrupted after a tool result arrives, the result is still written to stdout
-before reporting the cleanup failure on stderr.
+`--text` renders `text` blocks, inline text `resource` blocks (`type: "resource"`
+carrying `resource.text`), `resource_link` blocks (`type: "resource_link"` with
+URI and optional metadata), and `Saved <kind> [<mimeType>] (<bytes> B): <path>`
+lines for saved binary media. Inline binary blocks retained via
+`--inline-media` or unrecognized non-text blocks emit a summary notice on
+stderr, and `structuredContent` JSON prints to stdout when no content blocks
+were emitted (otherwise noting its presence on stderr). Text output normalizes
+`CRLF` to `LF`, escapes bare `CR` and control characters, and emits nothing for
+empty text blocks. If `--oneshot` cleanup fails or is interrupted after a tool
+result arrives, the result is still written to stdout before reporting the
+cleanup failure on stderr.
 
 | Exit | Meaning |
 | --- | --- |
@@ -391,7 +587,7 @@ before reporting the cleanup failure on stderr.
 | 1 | Local runtime, media cache, output, or cleanup failure |
 | 2 | CLI usage, configuration, argument validation, or unknown server/tool/skill |
 | 3 | MCP `CallToolResult` returned `isError: true` |
-| 4 | MCP protocol/transport failure or daemon communication failure |
+| 4 | MCP protocol/transport/authentication failure or daemon communication failure |
 | 5 | Operation or transfer deadline exceeded |
 | 6 | Daemon protocol/binary/config mismatch or lost session requiring recovery |
 | 130 | Interrupted by `SIGINT` or `Ctrl-C` |
@@ -402,7 +598,7 @@ stderr (with `outcome_unknown: true` when dispatch already occurred). Top-level
 `--help` appends the configured global `AGENTS.md` when valid. Check
 `outcome_unknown` alongside the exit status before retrying a failed command.
 
-## 8. Global AGENTS.md and Agent Skills
+## 10. Global AGENTS.md and Agent Skills
 
 When `agents` is configured, `catalog`, `agents`, matching `search` queries,
 and top-level `--help` return the full UTF-8 contents of that file without
@@ -436,8 +632,12 @@ trees, and non-UTF-8 or binary files are rejected.
 | CLI arguments / configuration | 1 MiB each |
 | Argument container nesting | 64 |
 | Process active byte budget | 1 GiB |
-| IPC request / response | 4 MiB / 512 MiB |
-| IPC request read / response transfer idle | 5 s / 60 s |
+| IPC protocol / frame limits | Version 4; 4 MiB request / 512 MiB response or stream frame |
+| IPC request read / frame transfer idle | 5 s / 60 s |
+| Concurrent daemon event streams | 32 (`MAX_EVENT_STREAMS`) |
+| Event notification / queue depth | 4 MiB / 128 notifications per subscription |
+| Event catalog pages | 100 (`MAX_EVENT_PAGES`) |
+| Cursor file / stream ack / callback stderr | 64 KiB each |
 | MCP stdio message | 512 MiB per line |
 | HTTP JSON response | 512 MiB |
 | HTTP POST / GET SSE | 512 MiB per event |
@@ -450,7 +650,7 @@ trees, and non-UTF-8 or binary files are rejected.
 | Skills / scanned entries | 1,024 / 4,096 |
 | Resource directory depth | 16 |
 
-## 9. Verification
+## 11. Verification
 
 `ci.yml` checks formatting, Clippy (`-D warnings`), Rust unit, protocol, and
 multimodal tests, Python unit tests, and the release CLI E2E suite across
@@ -464,13 +664,21 @@ tests fail if process inspection errors occur. A separate job runs real
 
 `release.yml` validates preflight builds on `wip/release-checkpoint` and tagged
 releases (`vX.Y.Z` matching `Cargo.toml` on `main`), builds all seven release
-archives, extracts and smoke-tests each binary (including Alpine and Debian for
-Linux musl builds), writes `SHA256SUMS`, and creates a draft GitHub Release.
+archives (including `LICENSE` and `NOTICE`), extracts and smoke-tests each
+binary (including Alpine and Debian for Linux musl builds), writes
+`SHA256SUMS`, and creates a draft GitHub Release.
 
-## 10. References
+## 12. References
 
 - [MCP 2026-07-28 transports](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports)
 - [MCP 2025-11-25 HTTP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)
+- [MCP Events extension (SEP-3415)](https://github.com/modelcontextprotocol/ext-events/blob/main/specification/beta/events/events.mdx)
+- [MCP authorization specification](https://modelcontextprotocol.io/specification/2025-11-25/basic/authorization)
+- [RFC 9728 OAuth 2.0 Protected Resource Metadata](https://datatracker.ietf.org/doc/html/rfc9728)
+- [RFC 8414 OAuth 2.0 Authorization Server Metadata](https://datatracker.ietf.org/doc/html/rfc8414)
+- [RFC 7591 OAuth 2.0 Dynamic Client Registration](https://datatracker.ietf.org/doc/html/rfc7591)
+- [RFC 7636 Proof Key for Code Exchange (PKCE)](https://datatracker.ietf.org/doc/html/rfc7636)
+- [RFC 8707 Resource Indicators for OAuth 2.0](https://datatracker.ietf.org/doc/html/rfc8707)
 - [Official Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk)
 - [Agent Skills specification](https://agentskills.io/specification)
 - [Microsoft Playwright MCP](https://github.com/microsoft/playwright-mcp)

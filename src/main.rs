@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpcli::{
-    agents,
+    agents, auth,
     budget::{ByteBudget, Leased},
-    config::{self, LoadedConfig},
+    config::{self, LoadedConfig, ServerConfig},
     daemon,
     discovery::{self, safe_text, write_safe_text, write_text_json},
     events_exec::{CursorStore, DEFAULT_EXEC_TIMEOUT, ExecMode},
@@ -161,6 +161,11 @@ enum Command {
         #[command(subcommand)]
         command: EventsCommand,
     },
+    /// Manage OAuth 2.1 credentials for HTTP MCP servers.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     /// Manage the daemon for the selected config and session.
     Daemon {
         #[command(subcommand)]
@@ -258,6 +263,24 @@ enum SkillCommand {
     Show { name: String },
     Files { name: String },
     Read { name: String, path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Authenticate with an HTTP MCP server via OAuth 2.1 PKCE.
+    Login {
+        server: String,
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        #[arg(long)]
+        client_id: Option<String>,
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Inspect stored OAuth status for one or all HTTP servers.
+    Status { server: Option<String> },
+    /// Revoke and delete stored OAuth credentials for an HTTP server.
+    Logout { server: String },
 }
 
 #[derive(Subcommand)]
@@ -583,7 +606,7 @@ async fn remote(
             let mut connection =
                 McpConnection::connect(config, budget.min(Duration::from_secs(30)))
                     .await
-                    .map_err(|error| daemon::mcp_error(error, false))?;
+                    .map_err(|error| daemon::mcp_error_for_server(error, false, Some(server)))?;
             let remaining = budget.saturating_sub(started.elapsed());
             let process_budget = ByteBudget::global();
             let result: std::result::Result<(Value, mcpcli::budget::ByteLease), anyhow::Error> =
@@ -637,7 +660,11 @@ async fn remote(
                     _ => unreachable!(),
                 }
                 .map_err(|error| {
-                    anyhow::Error::from(daemon::mcp_error(error, uncertain.load(Ordering::Acquire)))
+                    anyhow::Error::from(daemon::mcp_error_for_server(
+                        error,
+                        uncertain.load(Ordering::Acquire),
+                        Some(server),
+                    ))
                 });
             match result.map(|(value, lease)| (lease, value)) {
                 Ok((mut lease, mut value)) => {
@@ -839,6 +866,16 @@ fn write_tool_text(
     };
     enum Part<'a> {
         Text(&'a str),
+        ResourceText {
+            uri: &'a str,
+            mime: Option<&'a str>,
+            text: &'a str,
+        },
+        ResourceLink {
+            name: Option<&'a str>,
+            mime: Option<&'a str>,
+            uri: &'a str,
+        },
         Saved(&'a Value),
     }
     let mut omitted = 0;
@@ -859,6 +896,36 @@ fn write_tool_text(
                     .map(Part::Text)
             } else if let Some(saved) = saved_by_index.get(&index) {
                 Some(Part::Saved(saved))
+            } else if block["type"] == "resource"
+                && let Some(res) = block.get("resource").and_then(Value::as_object)
+                && res.get("blob").is_none_or(Value::is_null)
+                && let Some(text) = res.get("text").and_then(Value::as_str)
+            {
+                let uri = res.get("uri").and_then(Value::as_str).unwrap_or("");
+                let mime = res
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty());
+                if uri.is_empty() && text.is_empty() {
+                    None
+                } else {
+                    Some(Part::ResourceText { uri, mime, text })
+                }
+            } else if block["type"] == "resource_link"
+                && let Some(uri) = block
+                    .get("uri")
+                    .and_then(Value::as_str)
+                    .filter(|u| !u.is_empty())
+            {
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty());
+                let mime = block
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .filter(|m| !m.is_empty());
+                Some(Part::ResourceLink { name, mime, uri })
             } else {
                 omitted += 1;
                 None
@@ -873,6 +940,39 @@ fn write_tool_text(
         let followed_by_lf = parts.peek().is_some();
         let tail = match part {
             Part::Text(text) => text,
+            Part::ResourceText { uri, mime, text } => {
+                if !uri.is_empty() {
+                    stdout.write_all(b"Resource ")?;
+                    if let Some(mime) = mime {
+                        stdout.write_all(b"[")?;
+                        write_safe_text(stdout, mime)?;
+                        stdout.write_all(b"] ")?;
+                    }
+                    write_safe_text(stdout, uri)?;
+                    if !text.is_empty() {
+                        stdout.write_all(b":\n")?;
+                        text
+                    } else {
+                        ""
+                    }
+                } else {
+                    text
+                }
+            }
+            Part::ResourceLink { name, mime, uri } => {
+                stdout.write_all(b"Resource link")?;
+                if let Some(mime) = mime {
+                    stdout.write_all(b" [")?;
+                    write_safe_text(stdout, mime)?;
+                    stdout.write_all(b"]")?;
+                }
+                if let Some(name) = name {
+                    stdout.write_all(b" ")?;
+                    write_safe_text(stdout, name)?;
+                }
+                stdout.write_all(b": ")?;
+                uri
+            }
             Part::Saved(saved) => {
                 let kind = saved["kind"].as_str().unwrap_or("media");
                 let mime = saved["mimeType"]
@@ -1271,7 +1371,86 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             }
             EventsCommand::Stream { .. } => unreachable!("handled by run_events_stream"),
         },
+        Command::Auth { command } => {
+            match command {
+                AuthCommand::Status { server } => {
+                    let (value, text) = auth::status(&loaded.config.servers, server.as_deref())?;
+                    Ok(Output::with_text(value, text))
+                }
+                AuthCommand::Login {
+                    server,
+                    scopes,
+                    client_id,
+                    no_browser,
+                } => {
+                    cli.validate_request_timeout()?;
+                    let cfg = loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                    let ServerConfig::Http { url, .. } = cfg else {
+                        return Err(usage(
+                            "invalid_transport",
+                            format!(
+                                "server {server:?} uses stdio transport; OAuth applies only to http servers"
+                            ),
+                        ));
+                    };
+                    let budget = Duration::from_secs(cli.timeout_secs());
+                    let (value, text) = auth::login(auth::LoginOptions {
+                        server_name: server,
+                        server_url: url,
+                        scopes,
+                        client_id: client_id.as_deref(),
+                        no_browser: *no_browser,
+                        budget,
+                    })
+                    .await?;
+                    notify_daemon_reset(cli, &loaded, server).await;
+                    Ok(Output::with_text(value, text))
+                }
+                AuthCommand::Logout { server } => {
+                    cli.validate_request_timeout()?;
+                    let cfg = loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                    let ServerConfig::Http { url, .. } = cfg else {
+                        return Err(usage(
+                            "invalid_transport",
+                            format!(
+                                "server {server:?} uses stdio transport; OAuth applies only to http servers"
+                            ),
+                        ));
+                    };
+                    let budget = Duration::from_secs(cli.timeout_secs());
+                    let (value, text) = auth::logout(server, url, budget).await?;
+                    notify_daemon_reset(cli, &loaded, server).await;
+                    Ok(Output::with_text(value, text))
+                }
+            }
+        }
         Command::Daemon { .. } => unreachable!(),
+    }
+}
+
+async fn notify_daemon_reset(cli: &Cli, loaded: &LoadedConfig, server: &str) {
+    if cli.oneshot {
+        return;
+    }
+    let Ok(paths) = Paths::new(loaded.path.clone(), &cli.session) else {
+        return;
+    };
+    if !paths.running().unwrap_or(false) {
+        return;
+    }
+    if let Ok(req) = paths.request(
+        &loaded.digest,
+        Operation::Reset {
+            server: server.to_owned(),
+            force: true,
+        },
+        Duration::from_secs(5),
+    ) {
+        let _ = runtime::exchange(&paths, &req).await;
     }
 }
 
@@ -1419,10 +1598,12 @@ async fn run_events_stream(
             events_stream::wait_with_budget(Duration::from_secs(30), deadline, &cancel, async {
                 McpConnection::connect(server_config, Duration::from_secs(30))
                     .await
-                    .map_err(|error| daemon::mcp_error(error, false).into())
+                    .map_err(|error| {
+                        daemon::mcp_error_for_server(error, false, Some(server)).into()
+                    })
             })
             .await?;
-        let mut transport = DirectTransport::new(connection);
+        let mut transport = DirectTransport::with_server(connection, server.clone());
         let outcome = events_stream::run_stream(
             &mut transport,
             &stream_cfg,
@@ -1878,6 +2059,54 @@ mod tests {
         );
         // When --inline-media is set, any remote savedMedia field is ignored.
         assert_eq!(tool_text(&saved, true), "Read video\n");
+    }
+
+    #[test]
+    fn tool_text_renders_inline_text_resources_and_resource_links_without_omitted_warning() {
+        let payload = json!({
+            "content": [
+                {"type": "text", "text": "Header"},
+                {"type": "resource", "resource": {
+                    "uri": "file:///notes/todo.txt",
+                    "mimeType": "text/plain",
+                    "text": "line 1\r\nline 2"
+                }},
+                {"type": "resource_link", "uri": "https://example.test/spec.md", "name": "spec.md", "mimeType": "text/markdown"}
+            ]
+        });
+        assert_eq!(
+            tool_text(&payload, true),
+            "Header\nResource [text/plain] file:///notes/todo.txt:\nline 1\nline 2\nResource link [text/markdown] spec.md: https://example.test/spec.md\n"
+        );
+
+        let auth_login = Cli::try_parse_from([
+            "mcpcli",
+            "auth",
+            "login",
+            "remote",
+            "--scope",
+            "mcp:read",
+            "--scope",
+            "mcp:write",
+            "--client-id",
+            "my-client",
+            "--no-browser",
+        ])
+        .unwrap();
+        assert!(matches!(
+            auth_login.command,
+            Command::Auth {
+                command: AuthCommand::Login {
+                    ref server,
+                    ref scopes,
+                    ref client_id,
+                    no_browser: true,
+                }
+            } if server == "remote" && scopes == &["mcp:read", "mcp:write"] && client_id.as_deref() == Some("my-client")
+        ));
+        assert!(Cli::try_parse_from(["mcpcli", "auth", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["mcpcli", "auth", "status", "remote"]).is_ok());
+        assert!(Cli::try_parse_from(["mcpcli", "auth", "logout", "remote"]).is_ok());
     }
 
     #[test]

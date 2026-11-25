@@ -62,6 +62,13 @@ struct ServerState {
     streams_cancel: CancellationToken,
 }
 
+impl ServerState {
+    fn mark_lost(&mut self) {
+        self.lost = true;
+        self.streams_cancel.cancel();
+    }
+}
+
 impl Default for ServerState {
     fn default() -> Self {
         Self {
@@ -85,14 +92,32 @@ struct App {
 }
 
 pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
+    mcp_error_for_server(error, calling, None)
+}
+
+pub fn mcp_error_for_server(error: anyhow::Error, calling: bool, server: Option<&str>) -> Failure {
     if let Ok(error) = error.downcast::<McpFailure>() {
         let (code, kind) = match error.kind {
             FailureKind::Timeout => (5, "timeout"),
             FailureKind::Protocol => (4, "mcp_protocol"),
             FailureKind::Transport => (4, "mcp_transport"),
+            FailureKind::AuthRequired => (4, "auth_required"),
+            FailureKind::InsufficientScope => (4, "insufficient_scope"),
         };
-        let mut failure = Failure::new(code, kind, error.message).uncertain(error.outcome_unknown);
+        let message = if let Some(auth) = &error.auth {
+            let mut msg = auth.format_message(server);
+            if error.outcome_unknown {
+                msg.push_str("; outcome unknown, the call was not retried");
+            }
+            msg
+        } else {
+            error.message
+        };
+        let mut failure = Failure::new(code, kind, message).uncertain(error.outcome_unknown);
         failure.rpc_error = error.rpc_error;
+        if let Some(auth) = &error.auth {
+            failure.data = Some(auth.to_data_value(server));
+        }
         failure.lease = error.lease;
         failure
     } else {
@@ -263,8 +288,7 @@ impl App {
                 .as_ref()
                 .is_some_and(McpConnection::is_closed)
         {
-            state.lost = true;
-            state.streams_cancel.cancel();
+            state.mark_lost();
             return Err(Failure::new(
                 6,
                 "session_lost",
@@ -288,7 +312,7 @@ impl App {
             state.connection = Some(
                 McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone())
                     .await
-                    .map_err(|e| mcp_error(e, false))?,
+                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))?,
             );
         }
         let client = state
@@ -308,8 +332,7 @@ impl App {
                 .as_ref()
                 .is_some_and(McpConnection::is_closed)
             {
-                state.lost = true;
-                state.streams_cancel.cancel();
+                state.mark_lost();
             }
         }
     }
@@ -343,7 +366,7 @@ impl App {
                 if client.is_closed() {
                     self.mark_server_lost_if_closed(server).await;
                 }
-                let events = result.map_err(|e| mcp_error(e, false))?;
+                let events = result.map_err(|e| mcp_error_for_server(e, false, Some(server)))?;
                 let (events, lease) = events.into_parts();
                 let mut value = serde_json::Map::new();
                 value.insert("events".into(), Value::Array(events));
@@ -384,7 +407,7 @@ impl App {
                 if client.is_closed() {
                     self.mark_server_lost_if_closed(server).await;
                 }
-                let polled = result.map_err(|e| mcp_error(e, false))?;
+                let polled = result.map_err(|e| mcp_error_for_server(e, false, Some(server)))?;
                 let (value, lease) = polled.into_parts();
                 return Ok((value, lease, None));
             }
@@ -414,8 +437,7 @@ impl App {
             ));
         }
         if let Operation::Reset { force, .. } = operation {
-            state.lost = true;
-            state.streams_cancel.cancel();
+            state.mark_lost();
             state.streams_cancel = CancellationToken::new();
             let mut warning = None;
             if let Some(connection) = state.connection.as_mut()
@@ -457,8 +479,7 @@ impl App {
                 .as_ref()
                 .is_some_and(McpConnection::is_closed)
         {
-            state.lost = true;
-            state.streams_cancel.cancel();
+            state.mark_lost();
             return Err(Failure::new(
                 6,
                 "session_lost",
@@ -482,7 +503,7 @@ impl App {
             state.connection = Some(
                 McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone())
                     .await
-                    .map_err(|e| mcp_error(e, false))?,
+                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))?,
             );
         }
         let budget = deadline.saturating_duration_since(Instant::now());
@@ -503,15 +524,16 @@ impl App {
         match operation {
             Operation::Server { .. } => {
                 let result = connection.server_info();
-                if connection.is_closed() {
-                    state.lost = true;
+                let closed = connection.is_closed();
+                if closed {
+                    state.mark_lost();
                 }
                 result
                     .map(|value| {
                         let (value, lease) = value.into_parts();
                         (value, lease, None)
                     })
-                    .map_err(|e| mcp_error(e, false))
+                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))
             }
             Operation::Tools { .. } => {
                 let result = connection.list_tool_pages(budget).await.map(|pages| {
@@ -520,12 +542,13 @@ impl App {
                     value.insert("pages".into(), Value::Array(pages));
                     (Value::Object(value), lease)
                 });
-                if connection.is_closed() {
-                    state.lost = true;
+                let closed = connection.is_closed();
+                if closed {
+                    state.mark_lost();
                 }
                 result
                     .map(|(value, lease)| (value, lease, None))
-                    .map_err(|e| mcp_error(e, false))
+                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))
             }
             Operation::Call {
                 tool,
@@ -536,12 +559,14 @@ impl App {
                 let result = connection
                     .call_with_dispatch_leased(tool, arguments, budget, dispatched)
                     .await;
-                if connection.is_closed() {
-                    state.lost = true;
+                let closed = connection.is_closed();
+                if closed {
+                    state.mark_lost();
                 }
-                let (mut lease, mut value) = result
-                    .map(|(value, lease)| (lease, value))
-                    .map_err(|e| mcp_error(e, dispatched.load(Ordering::Acquire)))?;
+                let (mut lease, mut value) =
+                    result.map(|(value, lease)| (lease, value)).map_err(|e| {
+                        mcp_error_for_server(e, dispatched.load(Ordering::Acquire), Some(server))
+                    })?;
                 let inflight = if *inline_media {
                     None
                 } else {
@@ -797,7 +822,7 @@ async fn handle_events_stream(
             if client.is_closed() {
                 app.mark_server_lost_if_closed(server).await;
             }
-            res.map_err(|e| mcp_error(e, false))
+            res.map_err(|e| mcp_error_for_server(e, false, Some(server)))
         }
     };
 
@@ -1509,5 +1534,178 @@ mod tests {
         let mut state = app.servers["srv"].lock().await;
         state.connection.as_mut().unwrap().close().await.unwrap();
         server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn http_session_404_marks_server_lost_and_cancels_stream_tokens() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let srv = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = socket.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    loop {
+                        let mut content_len = 0usize;
+                        let mut has_session = false;
+                        let mut is_get = false;
+                        let mut is_delete = false;
+                        let mut line = String::new();
+                        let mut first = true;
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if first {
+                                is_get = line.starts_with("GET ");
+                                is_delete = line.starts_with("DELETE ");
+                                first = false;
+                            }
+                            if line == "\r\n" || line == "\n" {
+                                break;
+                            }
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                                if k.trim().eq_ignore_ascii_case("mcp-session-id") {
+                                    has_session = true;
+                                }
+                            }
+                        }
+                        if is_get {
+                            let _ = write_half
+                                .write_all(
+                                    b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
+                                )
+                                .await;
+                            continue;
+                        }
+                        if is_delete {
+                            let _ = write_half
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                            continue;
+                        }
+                        let mut body = vec![0u8; content_len];
+                        if reader.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+                            return;
+                        };
+                        let id = req.get("id").cloned().unwrap_or(json!(1));
+                        let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                        match method {
+                            "server/discover" => {
+                                let err = json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}});
+                                let payload = serde_json::to_vec(&err).unwrap();
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                                    payload.len()
+                                );
+                                let _ = write_half.write_all(hdr.as_bytes()).await;
+                                let _ = write_half.write_all(&payload).await;
+                            }
+                            "initialize" => {
+                                let resp = json!({
+                                    "jsonrpc": "2.0",
+                                    "id": id,
+                                    "result": {
+                                        "protocolVersion": "2025-11-25",
+                                        "capabilities": { "tools": {} },
+                                        "serverInfo": { "name": "stateful", "version": "1.0" }
+                                    }
+                                });
+                                let payload = serde_json::to_vec(&resp).unwrap();
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nMcp-Session-Id: sess-1\r\nContent-Length: {}\r\n\r\n",
+                                    payload.len()
+                                );
+                                let _ = write_half.write_all(hdr.as_bytes()).await;
+                                let _ = write_half.write_all(&payload).await;
+                            }
+                            "tools/list" if has_session => {
+                                let _ = write_half
+                                    .write_all(
+                                        b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                            }
+                            _ => {
+                                let _ = write_half
+                                    .write_all(
+                                        b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n",
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_vec(&json!({"servers": {"srv": {"transport": "http", "url": url}}}))
+                .unwrap(),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "exp404", &base_path.join("run")).unwrap();
+        let app = App {
+            paths,
+            config,
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            shutdown: CancellationToken::new(),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (_, stream_cancel) = app.ensure_events_client("srv", deadline).await.unwrap();
+        assert!(!stream_cancel.is_cancelled());
+
+        let dispatched = AtomicBool::new(false);
+        let err = app
+            .execute(
+                &Operation::Tools {
+                    server: "srv".into(),
+                },
+                deadline,
+                &dispatched,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.code, 4);
+        assert_eq!(err.kind, "mcp_transport");
+        assert!(stream_cancel.is_cancelled());
+        assert_eq!(app.status()["servers"]["srv"]["state"], "lost");
+
+        let next_err = app
+            .execute(
+                &Operation::Server {
+                    server: "srv".into(),
+                },
+                deadline,
+                &dispatched,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(next_err.code, 6);
+        assert_eq!(next_err.kind, "session_lost");
+        srv.abort();
     }
 }

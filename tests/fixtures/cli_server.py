@@ -86,6 +86,19 @@ def call(request):
                     {"type": "audio", "data": "!!!invalid-base64!!!", "mimeType": "audio/wav"},
                 ],
             }})
+        elif mode == "text_resources":
+            send({"jsonrpc": "2.0", "id": request_id, "result": {
+                "content": [
+                    {"type": "text", "text": "summary"},
+                    {"type": "resource", "resource": {
+                        "uri": "file:///docs/guide.txt",
+                        "mimeType": "text/plain",
+                        "text": "inline resource body",
+                    }},
+                    {"type": "resource_link", "uri": "https://example.invalid/ref.md",
+                     "name": "ref.md", "mimeType": "text/markdown"},
+                ],
+            }})
         else:
             send({"jsonrpc": "2.0", "id": request_id, "result": {
                 "content": [

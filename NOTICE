@@ -1,0 +1,307 @@
+mcpcli
+Copyright contributors to the mcpcli project.
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Binary distributions of mcpcli statically link third-party Rust, C, and
+assembly components resolved from Cargo.lock across Linux (musl), FreeBSD,
+macOS, and Windows targets. Their copyright and license notices follow.
+
+================================================================================
+1. AWS Libcrypto for Rust (aws-lc-rs and aws-lc-sys / AWS-LC)
+================================================================================
+
+Crates:
+  - aws-lc-rs (https://github.com/aws/aws-lc-rs)
+    SPDX-License-Identifier: ISC AND (Apache-2.0 OR ISC)
+  - aws-lc-sys (https://github.com/aws/aws-lc-rs)
+    SPDX-License-Identifier: ISC AND (Apache-2.0 OR ISC) AND Apache-2.0 AND MIT
+    AND BSD-3-Clause AND (Apache-2.0 OR ISC OR MIT) AND (Apache-2.0 OR ISC OR MIT-0)
+
+AWS-LC is a fork of BoringSSL, which is a fork of OpenSSL.
+
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+Licensed under the Apache License, Version 2.0 or the ISC License.
+
+BoringSSL-derived portions:
+  Copyright (c) 2014-2024 Google Inc. (ISC)
+  Copyright 2016 Brian Smith (ISC)
+  Copyright 2020 Arm Ltd (ISC)
+  Copyright 2022 Robert Nagy (ISC)
+  Copyright (c) 2025-2026 Google Inc. (Apache-2.0)
+
+OpenSSL and SSLeay-derived portions:
+  Copyright (c) 1998-2011 The OpenSSL Project. All rights reserved. (Apache-2.0)
+  Copyright (c) 1995-1998 Eric Young (eay@cryptsoft.com). All rights reserved. (Apache-2.0)
+  Contributions from Sun Microsystems, Inc. (Copyright 2002), Nokia (Copyright 2005),
+  and Intel Corporation (Copyright 2012-2021) under Apache-2.0.
+
+Libraries compiled into AWS-LC libcrypto:
+  - mlkem-native: Copyright (c) The mlkem-native project authors (Apache-2.0 OR ISC OR MIT)
+  - mldsa-native: Copyright (c) The mldsa-native project authors (Apache-2.0 OR ISC OR MIT)
+  - Fiat Cryptography: Copyright (c) 2015-2020 the fiat-crypto authors (MIT)
+  - s2n-bignum: Copyright Amazon.com, Inc. or its affiliates (Apache-2.0 OR ISC OR MIT-0)
+  - Jitter Entropy RNG: Copyright (C) 2017-2025 Stephan Mueller <smueller@chronox.de>,
+    distributed by AWS-LC under the 3-Clause BSD License (BSD-3-Clause)
+
+================================================================================
+2. rustls, rustls-webpki, untrusted, and ring (ISC / Apache-2.0 / BSD-3-Clause)
+================================================================================
+
+Crates:
+  - rustls, hyper-rustls, rustls-native-certs (https://github.com/rustls/rustls)
+    SPDX-License-Identifier: Apache-2.0 OR ISC OR MIT
+  - rustls-webpki (https://github.com/rustls/webpki)
+    SPDX-License-Identifier: ISC
+    Copyright 2015 Brian Smith.
+    Includes certificate and name-constraint logic adapted from Chromium:
+    Copyright 2015 The Chromium Authors. All rights reserved. (BSD-3-Clause)
+  - untrusted (https://github.com/briansmith/untrusted)
+    SPDX-License-Identifier: ISC
+    Copyright 2015-2016 Brian Smith.
+  - ring (https://github.com/briansmith/ring)
+    SPDX-License-Identifier: Apache-2.0 AND ISC
+    Copyright 2015-2025 Brian Smith, Google Inc. (BoringSSL), and the fiat-crypto authors.
+
+ISC License:
+
+  Permission to use, copy, modify, and/or distribute this software for any
+  purpose with or without fee is hereby granted, provided that the above
+  copyright notice and this permission notice appear in all copies.
+
+  THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+  WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+  MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+  ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+  WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+  ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+  OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+3. webpki-root-certs (CDLA-Permissive-2.0)
+================================================================================
+
+Crate:
+  - webpki-root-certs (https://github.com/rustls/webpki-roots)
+    SPDX-License-Identifier: CDLA-Permissive-2.0
+
+Community Data License Agreement - Permissive - Version 2.0
+
+  This is the Community Data License Agreement - Permissive, Version
+  2.0 (the "agreement"). Data Provider(s) and Data Recipient(s) agree
+  as follows:
+
+  1. Provision of the Data
+
+  1.1. A Data Recipient may use, modify, and share the Data made
+  available by Data Provider(s) under this agreement if that Data
+  Recipient follows the terms of this agreement.
+
+  1.2. This agreement does not impose any restriction on a Data
+  Recipient's use, modification, or sharing of any portions of the
+  Data that are in the public domain or that may be used, modified,
+  or shared under any other legal exception or limitation.
+
+  2. Conditions for Sharing Data
+
+  2.1. A Data Recipient may share Data, with or without modifications, so
+  long as the Data Recipient makes available the text of this agreement
+  with the shared Data.
+
+  3. No Restrictions on Results
+
+  3.1. This agreement does not impose any restriction or obligations
+  with respect to the use, modification, or sharing of Results.
+
+  4. No Warranty; Limitation of Liability
+
+  4.1. All Data Recipients receive the Data subject to the following
+  terms:
+
+  THE DATA IS PROVIDED ON AN "AS IS" BASIS, WITHOUT REPRESENTATIONS,
+  WARRANTIES OR CONDITIONS OF ANY KIND, EITHER EXPRESS OR IMPLIED
+  INCLUDING, WITHOUT LIMITATION, ANY WARRANTIES OR CONDITIONS OF TITLE,
+  NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS FOR A PARTICULAR PURPOSE.
+
+  NO DATA PROVIDER SHALL HAVE ANY LIABILITY FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING
+  WITHOUT LIMITATION LOST PROFITS), HOWEVER CAUSED AND ON ANY THEORY OF
+  LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+  NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE DATA OR RESULTS,
+  EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+
+  5. Definitions
+
+  5.1. "Data" means the material received by a Data Recipient under
+  this agreement.
+
+  5.2. "Data Provider" means any person who is the source of Data
+  provided under this agreement and in reliance on a Data Recipient's
+  agreement to its terms.
+
+  5.3. "Data Recipient" means any person who receives Data directly
+  or indirectly from a Data Provider and agrees to the terms of this
+  agreement.
+
+  5.4. "Results" means any outcome obtained by computational analysis
+  of Data, including for example machine learning models and models'
+  insights.
+
+================================================================================
+4. encoding_rs and subtle (BSD-3-Clause)
+================================================================================
+
+Crates:
+  - encoding_rs (https://github.com/hsivonen/encoding_rs)
+    SPDX-License-Identifier: (Apache-2.0 OR MIT) AND BSD-3-Clause
+    Copyright Mozilla Foundation (Apache-2.0 OR MIT).
+    Includes data derived from the WHATWG Encoding Standard:
+    Copyright (c) WHATWG (Apple, Google, Mozilla, Microsoft) (BSD-3-Clause).
+  - subtle (https://github.com/dalek-cryptography/subtle)
+    SPDX-License-Identifier: BSD-3-Clause
+    Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+    Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+BSD 3-Clause License (applies to WHATWG Encoding Standard tables in encoding_rs,
+subtle, Jitter Entropy RNG in aws-lc-sys, and Chromium-derived files in rustls-webpki):
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions are met:
+
+  1. Redistributions of source code must retain the above copyright notice, this
+     list of conditions and the following disclaimer.
+
+  2. Redistributions in binary form must reproduce the above copyright notice,
+     this list of conditions and the following disclaimer in the documentation
+     and/or other materials provided with the distribution.
+
+  3. Neither the name of the copyright holder nor the names of its
+     contributors may be used to endorse or promote products derived from
+     this software without specific prior written permission.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+  AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+  IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+  DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+  FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+  DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+  SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+  CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+5. ICU4X and Unicode Components (Unicode-3.0)
+================================================================================
+
+Crates:
+  - icu_collections, icu_locale_core, icu_normalizer, icu_normalizer_data,
+    icu_properties, icu_properties_data, icu_provider, litemap, potential_utf,
+    tinystr, writeable, yoke, yoke-derive, zerofrom, zerofrom-derive, zerotrie,
+    zerovec, zerovec-derive (https://github.com/unicode-org/icu4x)
+    SPDX-License-Identifier: Unicode-3.0
+    Copyright (c) 2020-2024 Unicode, Inc.
+    Portions of ICU4X may have been adapted from ICU4C and/or ICU4J:
+    ICU 1.8.1 to ICU 57.1 Copyright (c) 1995-2016 International Business Machines
+    Corporation and others.
+  - unicode-ident (https://github.com/dtolnay/unicode-ident)
+    SPDX-License-Identifier: (MIT OR Apache-2.0) AND Unicode-3.0
+    Copyright (c) 1991-2023 Unicode, Inc.
+
+UNICODE LICENSE V3
+
+  COPYRIGHT AND PERMISSION NOTICE
+
+  Copyright (c) 1991-2024 Unicode, Inc.
+
+  NOTICE TO USER: Carefully read the following legal agreement. BY
+  DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+  SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+  TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+  DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+  Permission is hereby granted, free of charge, to any person obtaining a
+  copy of data files and any associated documentation (the "Data Files") or
+  software and any associated documentation (the "Software") to deal in the
+  Data Files or Software without restriction, including without limitation
+  the rights to use, copy, modify, merge, publish, distribute, and/or sell
+  copies of the Data Files or Software, and to permit persons to whom the
+  Data Files or Software are furnished to do so, provided that either (a)
+  this copyright and permission notice appear with all copies of the Data
+  Files or Software, or (b) this copyright and permission notice appear in
+  associated Documentation.
+
+  THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+  KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+  THIRD PARTY RIGHTS.
+
+  IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+  BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+  OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+  WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+  ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+  FILES OR SOFTWARE.
+
+  Except as contained in this notice, the name of a copyright holder shall
+  not be used in advertising or otherwise to promote the sale, use or other
+  dealings in these Data Files or Software without prior written
+  authorization of the copyright holder.
+
+================================================================================
+6. MIT-Licensed Crates (MIT)
+================================================================================
+
+Crates licensed solely under MIT (or containing MIT-licensed components):
+  - bytes, mio, slab: Copyright (c) Carl Lerche and MIO/Tokio Contributors
+  - combine: Copyright (c) 2015 Markus Westerlind
+  - http-body, http-body-util, hyper, hyper-util, try-lock, want:
+    Copyright (c) 2014-2026 Sean McArthur, Alex Crichton, and Hyper Contributors
+  - schannel (Windows targets): Copyright (c) 2015 steffengy
+  - strsim: Copyright (c) 2015 Danny Guo, 2016 Titus Wormer, 2018 Akash Kurdekar
+  - synstructure: Copyright (c) 2016 Nika Layzell
+  - tokio, tokio-stream, tokio-util, tracing, tracing-attributes, tracing-core:
+    Copyright (c) Tokio Contributors
+  - tower, tower-http, tower-layer, tower-service:
+    Copyright (c) 2019-2021 Tower Contributors
+  - zmij: Copyright (c) David Tolnay
+
+MIT License:
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+================================================================================
+7. Apache-2.0 and Permissive Multi-Licensed Crates
+================================================================================
+
+Crates licensed under Apache-2.0 (including rmcp 3.9.0 from
+https://github.com/modelcontextprotocol/rust-sdk and sync_wrapper from
+https://github.com/Actyx/sync_wrapper) and crates dual- or multi-licensed under
+Apache-2.0 OR MIT (including atomic-waker, Copyright (c) 2016 Alex Crichton and
+Copyright (c) 2017 The Tokio Authors), Unlicense OR MIT (memchr), Zlib OR
+Apache-2.0 OR MIT (lru-slab, tinyvec), Apache-2.0 WITH LLVM-exception OR
+Apache-2.0 OR MIT (wasi), and MIT OR Apache-2.0 OR LGPL-2.1-or-later (r-efi)
+are distributed under the Apache License, Version 2.0 (see LICENSE) or the MIT
+License above.
+
+On macOS targets, security-framework (https://github.com/kornelski/rust-security-framework,
+licensed under MIT OR Apache-2.0) includes API documentation comments adapted
+from Apple Inc.'s Security Framework under the Apple Public Source License
+Version 2.0 (source code available from https://opensource.apple.com/ and the
+crate repository above).

@@ -22,7 +22,7 @@ def main():
     root = options.destination / name
     root.mkdir(parents=True, exist_ok=False)
     shutil.copy2(options.binary, root / options.binary.name)
-    for filename in ("LICENSE", "README.md", "examples/mcpcli.json", "docs/mcpcli-design.md"):
+    for filename in ("LICENSE", "NOTICE", "README.md", "examples/mcpcli.json", "docs/mcpcli-design.md"):
         output = root / filename
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(filename, output)

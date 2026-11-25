@@ -376,19 +376,50 @@ pub fn locate(path: &Path) -> Result<PathBuf> {
         .join(file))
 }
 
+fn validate_env_name(name: &str) -> Result<()> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+        bail!("invalid environment variable reference");
+    }
+    Ok(())
+}
+
 fn expand_env(value: &str) -> Result<String> {
     if let Some(name) = value
         .strip_prefix(concat!("$", "{"))
         .and_then(|v| v.strip_suffix('}'))
     {
-        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
-            bail!("invalid environment variable reference");
-        }
+        validate_env_name(name)?;
         std::env::var(name)
             .with_context(|| format!("environment variable {name} is missing or not UTF-8"))
     } else {
         Ok(value.to_owned())
     }
+}
+
+fn expand_header_template(value: &str) -> Result<String> {
+    let open = concat!("$", "{");
+    let Some(first) = value.find(open) else {
+        return Ok(value.to_owned());
+    };
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    let mut next_open = Some(first);
+    while let Some(pos) = next_open {
+        out.push_str(&rest[..pos]);
+        let after_open = &rest[pos + open.len()..];
+        let Some(close) = after_open.find('}') else {
+            bail!("unclosed environment variable reference");
+        };
+        let name = &after_open[..close];
+        validate_env_name(name)?;
+        let resolved = std::env::var(name)
+            .with_context(|| format!("environment variable {name} is missing or not UTF-8"))?;
+        out.push_str(&resolved);
+        rest = &after_open[close + 1..];
+        next_open = rest.find(open);
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 fn from_config_directory(parent: &Path, path: &Path) -> Result<PathBuf> {
@@ -540,7 +571,7 @@ impl LoadedConfig {
                                 "server {name}: a header reserved by the transport cannot be overridden"
                             );
                         }
-                        let resolved = expand_env(value)?;
+                        let resolved = expand_header_template(value)?;
                         http::HeaderValue::from_str(&resolved).map_err(|_| {
                             anyhow::anyhow!("server {name}: invalid HTTP header value")
                         })?;
@@ -649,6 +680,57 @@ mod tests {
         assert!(!text.contains("AGENT_SECRET"));
         assert!(text.contains("at agents:"));
     }
+    #[test]
+    fn http_headers_expand_inline_env_templates_and_reject_malformed_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcpcli.json");
+        unsafe {
+            std::env::set_var("MCPCLI_UNIT_TOKEN_A", "tok_alpha");
+            std::env::set_var("MCPCLI_UNIT_TOKEN_B", "tok_beta");
+            std::env::remove_var("MCPCLI_UNIT_MISSING_VAR");
+        }
+        std::fs::write(
+            &path,
+            r#"{"servers":{"x":{"transport":"http","url":"https://example.test/mcp","headers":{"Authorization":"Bearer ${MCPCLI_UNIT_TOKEN_A}","X-Trace":"${MCPCLI_UNIT_TOKEN_A}:${MCPCLI_UNIT_TOKEN_B}","X-Static":"plain$literal"}}}}"#,
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&path).unwrap();
+        let ServerConfig::Http { headers, .. } = &loaded.config.servers["x"] else {
+            panic!("expected http server");
+        };
+        assert_eq!(headers["authorization"], "Bearer tok_alpha");
+        assert_eq!(headers["x-trace"], "tok_alpha:tok_beta");
+        assert_eq!(headers["x-static"], "plain$literal");
+
+        for bad in [
+            "Bearer ${}",
+            "Bearer ${BAD-NAME}",
+            "Bearer ${UNCLOSED",
+            "${",
+            "Bearer ${MCPCLI_UNIT_MISSING_VAR}",
+            "Bearer ${A${B}}",
+        ] {
+            let doc = serde_json::json!({
+                "servers": {
+                    "x": {
+                        "transport": "http",
+                        "url": "https://example.test/mcp",
+                        "headers": { "Authorization": bad }
+                    }
+                }
+            });
+            std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+            assert!(
+                LoadedConfig::load(&path).is_err(),
+                "expected error for {bad:?}"
+            );
+        }
+        unsafe {
+            std::env::remove_var("MCPCLI_UNIT_TOKEN_A");
+            std::env::remove_var("MCPCLI_UNIT_TOKEN_B");
+        }
+    }
+
     #[test]
     fn missing_config_can_be_located_for_stop() {
         let dir = tempfile::tempdir().unwrap();

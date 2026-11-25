@@ -13,6 +13,10 @@ parser.add_argument("--discover-delay", type=float, default=0)
 parser.add_argument("--list-delay", type=float, default=0)
 parser.add_argument("--event-delay", type=float, default=0)
 parser.add_argument("--payload-bytes", type=int, default=0)
+parser.add_argument("--truncated", action="store_true")
+parser.add_argument("--midstream-truncated", action="store_true")
+parser.add_argument("--poll-mode", action="store_true")
+parser.add_argument("--bad-header-event", action="store_true")
 args = parser.parse_args()
 output_lock = threading.Lock()
 log_lock = threading.Lock()
@@ -49,17 +53,45 @@ def handle(request):
     elif method == "events/list":
         record("list")
         time.sleep(args.list_delay)
-        response(request, {"resultType": "complete", "events": [{
-            "name": "test.event", "delivery": ["push"],
+        events = [{
+            "name": "test.event", "delivery": ["poll"] if args.poll_mode else ["push"],
             "inputSchema": {"type": "object"}, "payloadSchema": {"type": "object"},
-        }]})
+        }]
+        if args.bad_header_event:
+            events.append({
+                "name": "bad.header.event", "delivery": ["push"],
+                "inputSchema": {"type": "object", "properties": {
+                    "ratio": {"type": "number", "x-mcp-header": "InvalidFloatHeader"},
+                }},
+                "payloadSchema": {"type": "object"},
+            })
+        response(request, {"resultType": "complete", "events": events})
+    elif method == "events/poll":
+        record("poll")
+        response(request, {
+            "resultType": "complete",
+            "events": [{
+                "name": "test.event", "eventId": "poll-one",
+                "timestamp": "2026-11-22T00:00:00Z",
+                "data": {"message": "ordinary event 中文 😀", "padding": "x" * args.payload_bytes},
+            }],
+            "cursor": "poll-after",
+            "truncated": args.truncated,
+            "hasMore": False,
+            "nextPollMs": 1000,
+        })
     elif method == "events/stream":
         cancelled = threading.Event()
         with pending_lock:
             pending[request["id"]] = cancelled
         meta = {"io.modelcontextprotocol/subscriptionId": request["id"]}
         send({"jsonrpc": "2.0", "method": "notifications/events/active",
-              "params": {"cursor": "before", "heartbeatMs": 30000, "_meta": meta}})
+              "params": {"cursor": "before", "truncated": args.truncated,
+                         "heartbeatMs": 30000, "_meta": meta}})
+        if args.midstream_truncated:
+            send({"jsonrpc": "2.0", "method": "notifications/events/active",
+                  "params": {"cursor": "mid", "truncated": True,
+                             "heartbeatMs": 30000, "_meta": meta}})
         record("active", request_id=request["id"])
         if not cancelled.wait(args.event_delay):
             send({"jsonrpc": "2.0", "method": "notifications/events/event",

@@ -1074,6 +1074,491 @@ def multimodal_media_and_inline_flag(f):
         assert saved_xdg.parent.samefile(xdg_cache / "mcpcli" / "media")
         assert saved_xdg.read_bytes() == b"\x01\x02\x03"
 
+    text_full = f.invoke("--text", "call", "state", "multimodal")
+    assert "non-text" not in text_full.stderr
+    assert "Resource [text/plain] file:///readme.txt:\nkeep-text" in text_full.stdout
+    text_links = f.invoke("--text", "call", "state", "multimodal", "--args", '{"mode":"text_resources"}')
+    assert not text_links.stderr
+    assert "Resource [text/plain] file:///docs/guide.txt:\ninline resource body" in text_links.stdout
+    assert "Resource link [text/markdown] ref.md: https://example.invalid/ref.md" in text_links.stdout
+
+
+def events_clean_sep3415_and_transport_header_rules(f):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import socketserver
+
+    script = f.script.with_name("events_server.py")
+    for poll_mode, extra_flags in [(False, ["--truncated"]), (False, ["--midstream-truncated"]), (True, ["--poll-mode", "--truncated"])]:
+        f.settings["servers"] = {"state": {
+            "transport": "stdio", "command": sys.executable,
+            "args": [str(script), "--log", str(f.log), "--bad-header-event", *extra_flags],
+        }}
+        f.save_config()
+        mode_arg = "poll" if poll_mode else "push"
+        out_res = f.invoke("--oneshot", "events", "stream", "state", "test.event",
+                           "--mode", mode_arg, "--once", timeout=5000)
+        event_obj = json.loads(out_res.stdout.strip())
+        assert "truncated" not in event_obj, f"truncated leaked into event stdout: {event_obj}"
+        assert event_obj["name"] == "test.event"
+        assert "truncated" in out_res.stderr
+        assert "next event will carry" not in out_res.stderr
+
+        captured = f.root / f"exec-{mode_arg}-{len(extra_flags)}.json"
+        cb = "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.stdin.readline(), encoding='utf-8')"
+        cb_res = f.invoke("--oneshot", "events", "stream", "state", "test.event",
+                          "--mode", mode_arg, "--once", "--", sys.executable, "-c", cb, str(captured),
+                          timeout=5000)
+        cb_event = json.loads(captured.read_text(encoding="utf-8").strip())
+        assert "truncated" not in cb_event, f"truncated leaked into --exec payload: {cb_event}"
+        assert "truncated" in cb_res.stderr
+
+    stdio_listed = f.value("--oneshot", "events", "list", "state")
+    assert {ev["name"] for ev in stdio_listed["events"]} == {"test.event", "bad.header.event"}
+
+    class EventsHttpHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *_):
+            pass
+        def do_GET(self):
+            self.send_response(405)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        def do_POST(self):
+            req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            req_id = req.get("id", 1)
+            method = req.get("method")
+            if method == "server/discover":
+                payload = {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                    "capabilities": {"extensions": {"io.modelcontextprotocol/events": {}}},
+                    "ttlMs": 60000, "cacheScope": "public",
+                    "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "http-ev", "version": "1"}},
+                }}
+            elif method == "events/list":
+                payload = {"jsonrpc": "2.0", "id": req_id, "result": {
+                    "resultType": "complete",
+                    "events": [
+                        {"name": "bad.header.event", "delivery": ["poll"],
+                         "inputSchema": {"type": "object", "properties": {
+                             "ratio": {"type": "number", "x-mcp-header": "InvalidFloatHeader"},
+                         }}},
+                        {"name": "good.event", "delivery": ["poll"],
+                         "inputSchema": {"type": "object", "properties": {
+                             "repo": {"type": "string", "x-mcp-header": "Repo"},
+                         }}},
+                    ],
+                }}
+            else:
+                payload = {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": "unused"}}
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+    class QuickServer(ThreadingHTTPServer):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "localhost"
+            self.server_port = self.server_address[1]
+
+    srv = QuickServer(("127.0.0.1", 0), EventsHttpHandler)
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        f.settings["servers"]["http_ev"] = {
+            "transport": "http", "url": f"http://127.0.0.1:{srv.server_port}/mcp",
+        }
+        f.save_config()
+        http_res = f.invoke("--oneshot", "events", "list", "http_ev")
+        http_events = json.loads(http_res.stdout)["events"]
+        assert [ev["name"] for ev in http_events] == ["good.event"]
+        assert "bad.header.event" in http_res.stderr and "x-mcp-header" in http_res.stderr
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def http_session_404_requires_reset(f):
+    f.use_http("expired")
+    f.value("tools", "state")
+    err = f.fail("call", "state", "set", "--args", '{"x":1}', code=4)
+    assert err["kind"] == "mcp_transport"
+    assert err["outcome_unknown"] is True
+    assert f.value("daemon", "status")["servers"]["state"]["state"] == "lost"
+    lost = f.fail("tools", "state", code=6)
+    assert lost["kind"] == "session_lost"
+    f.value("reset", "state")
+    assert f.value("tools", "state")["pages"]
+
+
+def oauth_cli_login_refresh_diagnostics_and_logout(f):
+    import base64
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import socketserver
+    import urllib.parse
+    import urllib.request
+
+    oauth_state = {
+        "dcr_calls": 0,
+        "clients": {},
+        "refresh_calls": 0,
+        "revoked": [],
+        "codes": {},
+        "tokens": {},
+        "refresh_tokens": {},
+        "counter": 0,
+    }
+    lock = threading.Lock()
+
+    class OAuthMcpServer(ThreadingHTTPServer):
+        def server_bind(self):
+            socketserver.TCPServer.server_bind(self)
+            self.server_name = "127.0.0.1"
+            self.server_port = self.server_address[1]
+
+    server_ref = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        def log_message(self, *_):
+            pass
+
+        def send_json(self, code, payload, headers=None):
+            raw = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def do_GET(self):
+            port = server_ref["port"]
+            base_url = f"http://127.0.0.1:{port}"
+            parsed = urllib.parse.urlsplit(self.path)
+            if parsed.path == "/.well-known/oauth-protected-resource/mcp":
+                self.send_json(200, {
+                    "resource": f"{base_url}/mcp",
+                    "authorization_servers": [f"{base_url}/issuer"],
+                    "scopes_supported": ["mcp:read", "mcp:admin"],
+                })
+                return
+            if parsed.path == "/.well-known/oauth-authorization-server/issuer":
+                self.send_json(200, {
+                    "issuer": f"{base_url}/issuer",
+                    "authorization_endpoint": f"{base_url}/oauth/authorize",
+                    "token_endpoint": f"{base_url}/oauth/token",
+                    "registration_endpoint": f"{base_url}/oauth/register",
+                    "revocation_endpoint": f"{base_url}/oauth/revoke",
+                    "code_challenge_methods_supported": ["S256"],
+                })
+                return
+            if parsed.path == "/oauth/authorize":
+                qs = dict(urllib.parse.parse_qsl(parsed.query))
+                assert qs.get("code_challenge_method") == "S256"
+                with lock:
+                    allowed_uris = oauth_state["clients"].get(qs.get("client_id", ""))
+                    if not allowed_uris or qs.get("redirect_uri") not in allowed_uris:
+                        self.send_json(400, {"error": "invalid_redirect_uri"})
+                        return
+                    oauth_state["counter"] += 1
+                    code = f"code_{oauth_state['counter']}"
+                    oauth_state["codes"][code] = {
+                        "client_id": qs["client_id"],
+                        "redirect_uri": qs["redirect_uri"],
+                        "code_challenge": qs["code_challenge"],
+                        "resource": qs["resource"],
+                        "scope": qs.get("scope", "mcp:read"),
+                    }
+                cb_params = urllib.parse.urlencode({
+                    "code": code,
+                    "state": qs["state"],
+                    "iss": f"{base_url}/issuer",
+                })
+                location = f"{qs['redirect_uri']}?{cb_params}"
+                self.send_response(302)
+                self.send_header("Location", location)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path.rstrip("/") == "/mcp":
+                self.send_response(405)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_DELETE(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_POST(self):
+            port = server_ref["port"]
+            base_url = f"http://127.0.0.1:{port}"
+            parsed = urllib.parse.urlsplit(self.path)
+            raw_body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            if parsed.path == "/oauth/register":
+                body = json.loads(raw_body)
+                assert body["token_endpoint_auth_method"] == "none"
+                assert "authorization_code" in body["grant_types"]
+                assert "refresh_token" in body["grant_types"]
+                assert body["response_types"] == ["code"]
+                with lock:
+                    oauth_state["dcr_calls"] += 1
+                    cid = f"dyn_client_{oauth_state['dcr_calls']}"
+                    oauth_state["clients"][cid] = set(body["redirect_uris"])
+                self.send_json(201, {"client_id": cid})
+                return
+            if parsed.path == "/oauth/token":
+                form = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
+                grant = form.get("grant_type")
+                if grant == "authorization_code":
+                    with lock:
+                        rec = oauth_state["codes"].pop(form.get("code", ""), None)
+                        allowed_uris = set(oauth_state["clients"].get(form.get("client_id", ""), ()))
+                    if (
+                        not rec
+                        or rec["client_id"] != form.get("client_id")
+                        or rec["resource"] != form.get("resource")
+                        or form.get("redirect_uri") != rec["redirect_uri"]
+                        or rec["redirect_uri"] not in allowed_uris
+                    ):
+                        self.send_json(400, {"error": "invalid_grant"})
+                        return
+                    verifier = form.get("code_verifier", "").encode("ascii")
+                    expected_challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier).digest()).rstrip(b"=").decode("ascii")
+                    if expected_challenge != rec["code_challenge"]:
+                        self.send_json(400, {"error": "invalid_grant"})
+                        return
+                    with lock:
+                        oauth_state["counter"] += 1
+                        idx = oauth_state["counter"]
+                        at = f"SECRET_AT_{idx}"
+                        rt = f"SECRET_RT_{idx}"
+                        scopes = rec["scope"].split()
+                        oauth_state["tokens"][at] = {"scopes": set(scopes), "active": True}
+                        oauth_state["refresh_tokens"][rt] = {"client_id": rec["client_id"], "resource": rec["resource"], "scopes": scopes}
+                    self.send_json(200, {
+                        "access_token": at, "token_type": "Bearer",
+                        "refresh_token": rt, "expires_in": 3600,
+                        "scope": " ".join(scopes),
+                    })
+                    return
+                if grant == "refresh_token":
+                    time.sleep(0.05)
+                    with lock:
+                        rt_rec = oauth_state["refresh_tokens"].pop(form.get("refresh_token", ""), None)
+                        if not rt_rec or rt_rec["client_id"] != form.get("client_id") or rt_rec["resource"] != form.get("resource"):
+                            self.send_json(400, {"error": "invalid_grant"})
+                            return
+                        oauth_state["refresh_calls"] += 1
+                        oauth_state["counter"] += 1
+                        idx = oauth_state["counter"]
+                        at = f"SECRET_AT_{idx}"
+                        rt = f"SECRET_RT_{idx}"
+                        oauth_state["tokens"][at] = {"scopes": set(rt_rec["scopes"]), "active": True}
+                        oauth_state["refresh_tokens"][rt] = rt_rec
+                    self.send_json(200, {
+                        "access_token": at, "token_type": "Bearer",
+                        "refresh_token": rt, "expires_in": 3600,
+                        "scope": " ".join(rt_rec["scopes"]),
+                    })
+                    return
+                self.send_json(400, {"error": "unsupported_grant_type"})
+                return
+            if parsed.path == "/oauth/revoke":
+                form = dict(urllib.parse.parse_qsl(raw_body.decode("utf-8")))
+                with lock:
+                    tok = form.get("token", "")
+                    oauth_state["revoked"].append(tok)
+                    if tok in oauth_state["tokens"]:
+                        oauth_state["tokens"][tok]["active"] = False
+                    oauth_state["refresh_tokens"].pop(tok, None)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if parsed.path.rstrip("/") == "/mcp":
+                auth_hdr = self.headers.get("Authorization", "")
+                prm_url = f"{base_url}/.well-known/oauth-protected-resource/mcp"
+                if auth_hdr == "Bearer STATIC_INLINE_OVERRIDE":
+                    token_scopes = {"mcp:read", "mcp:admin"}
+                else:
+                    bearer = auth_hdr[7:] if auth_hdr.startswith("Bearer ") else ""
+                    with lock:
+                        t_info = oauth_state["tokens"].get(bearer)
+                        valid = bool(t_info and t_info["active"])
+                        token_scopes = set(t_info["scopes"]) if valid else set()
+                    if not valid:
+                        self.send_json(401, {"error": "unauthorized"}, headers={
+                            "WWW-Authenticate": f'Bearer realm="hidden-realm", resource_metadata="{prm_url}", scope="mcp:read", error="invalid_token"',
+                        })
+                        return
+                req = json.loads(raw_body)
+                req_id = req.get("id", 1)
+                method = req.get("method")
+                if method == "server/discover":
+                    self.send_json(200, {"jsonrpc": "2.0", "id": req_id, "result": {
+                        "resultType": "complete", "supportedVersions": ["2026-07-28"],
+                        "capabilities": {"tools": {}}, "ttlMs": 0, "cacheScope": "private",
+                        "_meta": {"io.modelcontextprotocol/serverInfo": {"name": "oauth-mcp", "version": "1"}},
+                    }})
+                    return
+                if method == "tools/list":
+                    self.send_json(200, {"jsonrpc": "2.0", "id": req_id, "result": {
+                        "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
+                        "tools": [
+                            {"name": "ping", "description": "Read tool", "inputSchema": {"type": "object"}},
+                            {"name": "admin_op", "description": "Admin tool", "inputSchema": {"type": "object"}},
+                        ],
+                    }})
+                    return
+                if method == "tools/call":
+                    tname = req["params"]["name"]
+                    if tname == "admin_op" and "mcp:admin" not in token_scopes:
+                        self.send_json(403, {"error": "insufficient_scope"}, headers={
+                            "WWW-Authenticate": f'Bearer resource_metadata="{prm_url}", scope="mcp:read mcp:admin", error="insufficient_scope", error_description="admin scope required"',
+                        })
+                        return
+                    self.send_json(200, {"jsonrpc": "2.0", "id": req_id, "result": {
+                        "content": [{"type": "text", "text": f"ok:{tname}"}],
+                        "isError": False,
+                    }})
+                    return
+                self.send_response(202)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_json(404, {"error": "not_found"})
+
+    srv = OAuthMcpServer(("127.0.0.1", 0), Handler)
+    server_ref["port"] = srv.server_port
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base_url = f"http://127.0.0.1:{srv.server_port}"
+        cred_file = f.root / "isolated-creds.json"
+        f.env["MCPCLI_CREDENTIALS"] = str(cred_file)
+        f.env["MCPCLI_INLINE_HDR_TOK"] = "STATIC_INLINE_OVERRIDE"
+        f.settings["servers"] = {
+            "oauth_srv": {"transport": "http", "url": f"{base_url}/mcp/"},
+            "static_srv": {
+                "transport": "http", "url": f"{base_url}/mcp",
+                "headers": {"Authorization": "Bearer ${MCPCLI_INLINE_HDR_TOK}"},
+            },
+        }
+        f.save_config()
+
+        assert f.value("call", "static_srv", "admin_op")["result"]["content"][0]["text"] == "ok:admin_op"
+
+        daemon_before = f.value("daemon", "status")
+        assert f.value("auth", "status", "oauth_srv")["authenticated"] is False
+
+        err401 = f.fail("tools", "oauth_srv", code=4)
+        assert err401["kind"] == "auth_required"
+        assert "run: mcpcli auth login oauth_srv" in err401["message"]
+        assert "hidden-realm" not in err401["message"]
+        assert err401["data"]["status"] == 401
+        assert err401["data"]["resourceMetadata"] == f"{base_url}/.well-known/oauth-protected-resource/mcp"
+        assert err401["data"]["requiredScopes"] == ["mcp:read"]
+        assert err401["data"]["hint"] == "run: mcpcli auth login oauth_srv"
+
+        login_proc = f.start("auth", "login", "oauth_srv", "--no-browser", timeout=15)
+        hdr_line = readline_with_timeout(login_proc.stderr, 5)
+        assert "Authorize oauth_srv" in hdr_line
+        auth_url = readline_with_timeout(login_proc.stderr, 5).strip()
+        assert auth_url.startswith(f"{base_url}/oauth/authorize?")
+        with urllib.request.urlopen(auth_url, timeout=5) as resp:
+            assert resp.status == 200
+        login_out, login_rem_err = login_proc.communicate(timeout=5)
+        assert login_proc.returncode == 0, login_rem_err
+        assert "SECRET_AT_" not in login_out and "SECRET_RT_" not in login_out
+        login_json = json.loads(login_out)
+        assert login_json["authenticated"] is True
+        assert login_json["issuer"] == f"{base_url}/issuer"
+        assert login_json["scopes"] == ["mcp:read"]
+        assert oauth_state["dcr_calls"] == 1
+        if not WINDOWS:
+            assert (cred_file.stat().st_mode & 0o777) == 0o600
+
+        assert f.value("tools", "oauth_srv")["pages"]
+        assert f.value("call", "oauth_srv", "ping")["result"]["content"][0]["text"] == "ok:ping"
+        daemon_after = f.value("daemon", "status")
+        assert daemon_after["pid"] == daemon_before["pid"]
+        assert daemon_after["config_digest"] == daemon_before["config_digest"]
+
+        err403 = f.fail("call", "oauth_srv", "admin_op", code=4)
+        assert err403["kind"] == "insufficient_scope"
+        assert err403["data"]["status"] == 403
+        assert err403["data"]["requiredScopes"] == ["mcp:read", "mcp:admin"]
+        assert "run: mcpcli auth login oauth_srv" in err403["message"]
+
+        bad_proc = f.start("auth", "login", "oauth_srv", "--client-id", "dyn_client_1",
+                           "--no-browser", timeout=15, open_stdin=True)
+        readline_with_timeout(bad_proc.stderr, 5)
+        bad_auth_url = readline_with_timeout(bad_proc.stderr, 5).strip()
+        assert bad_auth_url.startswith(f"{base_url}/oauth/authorize?")
+        bad_out, bad_err = bad_proc.communicate(
+            input="http://127.0.0.1:9/callback?code=fake&state=wrong_state\n", timeout=5
+        )
+        assert bad_proc.returncode == 4 and not bad_out
+        assert "state" in error_value(subprocess.CompletedProcess([], 4, bad_out, bad_err))["message"]
+        assert oauth_state["dcr_calls"] == 1
+
+        paste_proc = f.start("--text", "auth", "login", "oauth_srv", "--scope", "mcp:read",
+                             "--scope", "mcp:admin", "--no-browser", timeout=15, open_stdin=True)
+        readline_with_timeout(paste_proc.stderr, 5)
+        step_auth_url = readline_with_timeout(paste_proc.stderr, 5).strip()
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        try:
+            opener.open(step_auth_url, timeout=5)
+            raise AssertionError("expected 302 redirect")
+        except urllib.error.HTTPError as redirect_resp:
+            assert redirect_resp.code == 302
+            callback_url = redirect_resp.headers["Location"]
+        paste_out, paste_err = paste_proc.communicate(input=callback_url + "\n", timeout=5)
+        assert paste_proc.returncode == 0, paste_err
+        assert "SECRET_" not in paste_out and "authenticated oauth_srv" in paste_out
+        assert oauth_state["dcr_calls"] == 2, f"expected fresh DCR registration for new port, got {oauth_state['dcr_calls']}"
+        assert f.value("call", "oauth_srv", "admin_op")["result"]["content"][0]["text"] == "ok:admin_op"
+
+        with lock:
+            for info in oauth_state["tokens"].values():
+                info["active"] = False
+        barrier = threading.Barrier(4)
+        def concurrent_ping(_):
+            barrier.wait()
+            return f.value("call", "oauth_srv", "ping")["result"]["content"][0]["text"]
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(concurrent_ping, range(4)))
+        assert results == ["ok:ping"] * 4
+        assert oauth_state["refresh_calls"] == 1, f"expected singleflight refresh, got {oauth_state['refresh_calls']}"
+
+        st_one = f.invoke("auth", "status", "oauth_srv")
+        assert "SECRET_" not in st_one.stdout
+        st_json = json.loads(st_one.stdout)
+        assert st_json["authenticated"] is True and st_json["scopes"] == ["mcp:read", "mcp:admin"]
+        st_all = f.value("auth", "status")
+        assert len(st_all["servers"]) == 2
+
+        logout_res = f.value("auth", "logout", "oauth_srv")
+        assert logout_res["loggedOut"] is True and logout_res["authenticated"] is False
+        assert oauth_state["revoked"], "expected revocation endpoint to receive tokens"
+        assert f.value("auth", "status", "oauth_srv")["authenticated"] is False
+        assert f.fail("tools", "oauth_srv", code=4)["kind"] == "auth_required"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
 
 CASES = [
     raw_semantic_disclosure, offline_skills, global_agents, state_and_discovery, json_inputs_and_outputs, multimodal_media_and_inline_flag, session_and_restart,
@@ -1088,6 +1573,7 @@ CASES = [
     interrupt_after_result_preserves_known_outcome, oneshot_unknown_inspect_closes_session,
     oneshot_unknown_inspect_signal_preserves_error, http_without_ca_store_keeps_tls_validation,
     burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
+    events_clean_sep3415_and_transport_header_rules, http_session_404_requires_reset, oauth_cli_login_refresh_diagnostics_and_logout,
     unprivileged_execute_only_ancestors,
 ]
 

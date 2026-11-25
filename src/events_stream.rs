@@ -140,11 +140,22 @@ impl EventStreamChannel for DirectChannel {
 
 pub struct DirectTransport {
     connection: McpConnection,
+    server: Option<String>,
 }
 
 impl DirectTransport {
     pub fn new(connection: McpConnection) -> Self {
-        Self { connection }
+        Self {
+            connection,
+            server: None,
+        }
+    }
+
+    pub fn with_server(connection: McpConnection, server: String) -> Self {
+        Self {
+            connection,
+            server: Some(server),
+        }
     }
 
     pub fn into_connection(self) -> McpConnection {
@@ -164,9 +175,9 @@ impl DirectTransport {
     }
 
     fn request_error(&self, error: anyhow::Error) -> anyhow::Error {
-        self.check_connection()
-            .err()
-            .unwrap_or_else(|| daemon::mcp_error(error, false).into())
+        self.check_connection().err().unwrap_or_else(|| {
+            daemon::mcp_error_for_server(error, false, self.server.as_deref()).into()
+        })
     }
 }
 
@@ -392,6 +403,8 @@ fn is_fatal_error(error: &anyhow::Error) -> bool {
             | "session_lost"
             | "stopping"
             | "stream_terminated"
+            | "auth_required"
+            | "insufficient_scope"
     ) {
         return true;
     }
@@ -676,13 +689,6 @@ fn persist_cursor(
     Ok(())
 }
 
-fn inject_truncated(mut event: Value, pending_truncated: bool) -> Value {
-    if pending_truncated && let Value::Object(ref mut map) = event {
-        map.insert("truncated".into(), Value::Bool(true));
-    }
-    event
-}
-
 /// Run the `events stream` loop until `--once` completes, `--timeout` expires,
 /// `notifications/events/terminated` is received, or `cancel` is triggered.
 pub async fn run_stream<T: EventTransport>(
@@ -806,7 +812,6 @@ async fn run_poll_loop<T: EventTransport>(
     sink: &mut Sink<'_>,
 ) -> Result<()> {
     let mut backoff = timings.initial_backoff;
-    let mut pending_truncated = false;
     let mut initial_max_age = config.max_age_ms;
 
     loop {
@@ -854,7 +859,6 @@ async fn run_poll_loop<T: EventTransport>(
                 "mcpcli: event stream {:?} truncated on server; some events may have been missed",
                 config.event
             );
-            pending_truncated = true;
         }
 
         let has_more = response
@@ -881,10 +885,8 @@ async fn run_poll_loop<T: EventTransport>(
         let batch_len = batch.0.len();
         let mut delivered_any = false;
         for event in batch.value_mut().0.drain(..) {
-            let payload = inject_truncated(event, pending_truncated);
-            sink.deliver_with_retry(&payload, timings, deadline, cancel)
+            sink.deliver_with_retry(&event, timings, deadline, cancel)
                 .await?;
-            pending_truncated = false;
             delivered_any = true;
             if config.once {
                 break;
@@ -925,7 +927,6 @@ async fn run_push_loop<T: EventTransport>(
     sink: &mut Sink<'_>,
 ) -> Result<()> {
     let mut backoff = timings.initial_backoff;
-    let mut pending_truncated = false;
     let mut initial_max_age = config.max_age_ms;
 
     loop {
@@ -1072,7 +1073,7 @@ async fn run_push_loop<T: EventTransport>(
                     {
                         if was_active {
                             eprintln!(
-                                "mcpcli: event stream {:?} experienced mid-stream truncation; next event will carry truncated=true",
+                                "mcpcli: event stream {:?} truncated mid-stream; some events may have been missed",
                                 config.event
                             );
                         } else {
@@ -1081,7 +1082,6 @@ async fn run_push_loop<T: EventTransport>(
                                 config.event
                             );
                         }
-                        pending_truncated = true;
                     }
                     let cursor = params
                         .as_ref()
@@ -1115,8 +1115,7 @@ async fn run_push_loop<T: EventTransport>(
                     }
                 }
                 "notifications/events/event" => {
-                    let event_obj = params.take().unwrap_or_else(|| Value::Object(Map::new()));
-                    let payload = inject_truncated(event_obj, pending_truncated);
+                    let payload = params.take().unwrap_or_else(|| Value::Object(Map::new()));
                     if let Err(err) = sink
                         .deliver_with_retry(&payload, timings, deadline, cancel)
                         .await
@@ -1124,7 +1123,6 @@ async fn run_push_loop<T: EventTransport>(
                         channel.close().await;
                         return Err(err);
                     }
-                    pending_truncated = false;
                     if let Err(err) = persist_cursor(
                         config.cursor_file.as_ref(),
                         current_cursor,
@@ -1326,7 +1324,7 @@ mod tests {
                 json!({
                     "events": [{"eventId": "e1", "name": "pr.merged", "data": {"n": 1}}],
                     "cursor": "b:2",
-                    "truncated": false,
+                    "truncated": true,
                     "hasMore": false,
                     "nextPollMs": 100
                 }),
@@ -1354,6 +1352,7 @@ mod tests {
         let rendered = String::from_utf8(out).unwrap();
         let line: Value = serde_json::from_str(rendered.trim()).unwrap();
         assert_eq!(line["eventId"], "e1");
+        assert!(!line.as_object().unwrap().contains_key("truncated"));
     }
 
     #[tokio::test]
@@ -1422,7 +1421,7 @@ mod tests {
         assert_eq!(store.read().unwrap().as_deref(), Some("b:16"));
         let line: Value = serde_json::from_str(std::str::from_utf8(&out).unwrap().trim()).unwrap();
         assert_eq!(line["eventId"], "e16");
-        assert_eq!(line["truncated"], true);
+        assert!(!line.as_object().unwrap().contains_key("truncated"));
     }
 
     #[tokio::test]

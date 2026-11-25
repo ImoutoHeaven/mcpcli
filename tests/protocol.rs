@@ -327,7 +327,14 @@ async fn http_does_not_follow_redirects_or_expose_transport_secrets() {
             );
         }
         let error = McpConnection::connect(&config, BUDGET).await.err().unwrap();
-        assert_eq!(kind(&error), FailureKind::Transport);
+        assert_eq!(
+            kind(&error),
+            if mode == "auth" {
+                FailureKind::AuthRequired
+            } else {
+                FailureKind::Transport
+            }
+        );
         assert!(!format!("{error:?}").contains("secret"));
         assert_eq!(fixture.count("server/discover"), 1);
     }
@@ -344,6 +351,7 @@ async fn http_session_expiry_does_not_reinitialize_or_replay_tool() {
         .unwrap_err();
     assert_eq!(kind(&error), FailureKind::Transport);
     assert!(error.to_string().contains("not retried"));
+    assert!(connection.is_closed());
     assert_eq!(fixture.count("initialize"), 1);
     assert_eq!(fixture.count("tools/call"), 1);
     connection.close().await.unwrap();
