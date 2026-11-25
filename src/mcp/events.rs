@@ -564,7 +564,7 @@ fn requires_base64(value: &str) -> bool {
     {
         return true;
     }
-    value.starts_with(BASE64_HEADER_PREFIX) && value.ends_with(BASE64_HEADER_SUFFIX)
+    value.starts_with(BASE64_HEADER_PREFIX)
 }
 
 pub(super) fn encode_header_value(value: &str) -> String {
@@ -886,6 +886,10 @@ mod tests {
         assert_eq!(
             encode_header_value("=?base64?abc?="),
             "=?base64?PT9iYXNlNjQ/YWJjPz0=?="
+        );
+        assert_eq!(
+            encode_header_value("=?base64?foo"),
+            "=?base64?PT9iYXNlNjQ/Zm9v?="
         );
 
         let valid_schema: Map<String, Value> = serde_json::from_value(json!({
