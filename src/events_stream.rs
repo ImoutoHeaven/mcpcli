@@ -413,7 +413,7 @@ fn is_unsupported_error(error: &anyhow::Error) -> bool {
         == Some(-32026)
 }
 
-fn select_auto_mode(events: &[Value], event_name: &str) -> StreamMode {
+fn select_auto_mode(events: &[Value], event_name: &str) -> Result<StreamMode> {
     for event in events {
         if event.get("name").and_then(Value::as_str) == Some(event_name)
             && let Some(modes) = event.get("delivery").and_then(Value::as_array)
@@ -421,14 +421,26 @@ fn select_auto_mode(events: &[Value], event_name: &str) -> StreamMode {
             let has_push = modes.iter().any(|m| m.as_str() == Some("push"));
             let has_poll = modes.iter().any(|m| m.as_str() == Some("poll"));
             if has_push {
-                return StreamMode::Push;
+                return Ok(StreamMode::Push);
             }
             if has_poll {
-                return StreamMode::Poll;
+                return Ok(StreamMode::Poll);
+            }
+            if !modes.is_empty() {
+                let declared: Vec<&str> = modes.iter().filter_map(Value::as_str).collect();
+                let message = if declared.is_empty() {
+                    format!("event {event_name:?} does not support push or poll delivery")
+                } else {
+                    format!(
+                        "event {event_name:?} does not support push or poll delivery (declared: {})",
+                        declared.join(", ")
+                    )
+                };
+                return Err(Failure::new(4, "mcp_protocol", message).into());
             }
         }
     }
-    StreamMode::Push
+    Ok(StreamMode::Push)
 }
 
 fn check_running(deadline: Option<Instant>, cancel: &CancellationToken) -> Result<()> {
@@ -738,7 +750,7 @@ async fn run_stream_inner<T: EventTransport>(
             .await;
             check_running(deadline, cancel)?;
             match listed {
-                Ok(events) => select_auto_mode(&events, &config.event),
+                Ok(events) => select_auto_mode(&events, &config.event)?,
                 Err(err) if is_fatal_error(&err) => return Err(err),
                 Err(_) => StreamMode::Push,
             }
@@ -1928,5 +1940,111 @@ mod tests {
             );
             assert_eq!(store.read().unwrap().as_deref(), Some("after"));
         }
+    }
+
+    #[tokio::test]
+    async fn auto_mode_fails_fast_for_webhook_only_event() {
+        let mut transport = MockTransport {
+            listed: vec![json!({"name": "pr.merged", "delivery": ["webhook"]})],
+            polls: VecDeque::new(),
+            poll_cursors: Vec::new(),
+            streams: VecDeque::new(),
+            stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
+        };
+        let cfg = base_config(None);
+        let mut out = Vec::new();
+        let err = run_stream(
+            &mut transport,
+            &cfg,
+            fast_timings(),
+            CancellationToken::new(),
+            Some(&mut out),
+        )
+        .await
+        .unwrap_err();
+        let failure = err.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.code, 4);
+        assert_eq!(failure.kind, "mcp_protocol");
+        assert!(failure.message.contains("webhook"));
+        assert!(transport.stream_cursors.is_empty());
+        assert!(transport.poll_cursors.is_empty());
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_mode_selects_poll_or_push_when_combined_with_webhook() {
+        let mut poll_transport = MockTransport {
+            listed: vec![json!({"name": "pr.merged", "delivery": ["webhook", "poll"]})],
+            polls: VecDeque::from([json!({
+                "events": [{"eventId": "e1", "name": "pr.merged", "data": {}}],
+                "cursor": "b:1",
+                "hasMore": false,
+                "nextPollMs": 100
+            })]),
+            poll_cursors: Vec::new(),
+            streams: VecDeque::new(),
+            stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
+        };
+        let mut cfg = base_config(None);
+        cfg.once = true;
+        let mut out = Vec::new();
+        run_stream(
+            &mut poll_transport,
+            &cfg,
+            fast_timings(),
+            CancellationToken::new(),
+            Some(&mut out),
+        )
+        .await
+        .unwrap();
+        assert_eq!(poll_transport.poll_cursors, vec![None]);
+        assert!(poll_transport.stream_cursors.is_empty());
+
+        let mut push_transport = MockTransport {
+            listed: vec![json!({"name": "pr.merged", "delivery": ["webhook", "push"]})],
+            polls: VecDeque::new(),
+            poll_cursors: Vec::new(),
+            streams: VecDeque::from([VecDeque::from([
+                MockStep::Yield(RawStreamEvent::Notification {
+                    method: "notifications/events/active".into(),
+                    params: Some(json!({"cursor": "b:1", "heartbeatMs": 50})),
+                }),
+                MockStep::Yield(RawStreamEvent::Notification {
+                    method: "notifications/events/event".into(),
+                    params: Some(
+                        json!({"eventId": "e2", "name": "pr.merged", "data": {}, "cursor": "b:2"}),
+                    ),
+                }),
+            ])]),
+            stream_cursors: Vec::new(),
+            budget: ByteBudget::new(1 << 20),
+        };
+        let mut out = Vec::new();
+        run_stream(
+            &mut push_transport,
+            &cfg,
+            fast_timings(),
+            CancellationToken::new(),
+            Some(&mut out),
+        )
+        .await
+        .unwrap();
+        assert_eq!(push_transport.stream_cursors, vec![None]);
+        assert!(push_transport.poll_cursors.is_empty());
+
+        assert_eq!(
+            select_auto_mode(&[json!({"name": "pr.merged", "delivery": []})], "pr.merged").unwrap(),
+            StreamMode::Push
+        );
+        assert_eq!(
+            select_auto_mode(
+                &[json!({"name": "other", "delivery": ["webhook"]})],
+                "pr.merged"
+            )
+            .unwrap(),
+            StreamMode::Push
+        );
     }
 }
