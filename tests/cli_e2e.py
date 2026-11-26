@@ -1543,6 +1543,21 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
         assert results == ["ok:ping"] * 4
         assert oauth_state["refresh_calls"] == 1, f"expected singleflight refresh, got {oauth_state['refresh_calls']}"
 
+        sessions = [f"oauth-refresh-{index}" for index in range(4)]
+        for session in sessions:
+            assert f.value("tools", "oauth_srv", session=session)["pages"]
+        with lock:
+            for info in oauth_state["tokens"].values():
+                info["active"] = False
+        process_barrier = threading.Barrier(len(sessions))
+        def ping_from_session(session):
+            process_barrier.wait()
+            return f.value("call", "oauth_srv", "ping", session=session)["result"]["content"][0]["text"]
+        with ThreadPoolExecutor(max_workers=len(sessions)) as pool:
+            results = list(pool.map(ping_from_session, sessions))
+        assert results == ["ok:ping"] * len(sessions)
+        assert oauth_state["refresh_calls"] == 2, f"expected one refresh across daemon processes, got {oauth_state['refresh_calls']}"
+
         st_one = f.invoke("auth", "status", "oauth_srv")
         assert "SECRET_" not in st_one.stdout
         st_json = json.loads(st_one.stdout)

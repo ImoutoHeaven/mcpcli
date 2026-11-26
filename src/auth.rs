@@ -6,14 +6,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     ffi::OsStr,
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -32,8 +32,6 @@ const PROACTIVE_REFRESH_WINDOW_SECS: u64 = 30;
 const STORE_LOCK_WAIT: Duration = Duration::from_secs(10);
 
 static WRITE_SEQ: AtomicU64 = AtomicU64::new(1);
-static REFRESH_LOCKS: OnceLock<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
-    OnceLock::new();
 
 fn store_version() -> u32 {
     1
@@ -1071,20 +1069,28 @@ fn validate_bearer_token_string(token: &str) -> Result<()> {
     Ok(())
 }
 
-fn resource_refresh_lock(key: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let map = REFRESH_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut guard = map.lock().unwrap_or_else(|p| p.into_inner());
-    guard
-        .entry(key.to_owned())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+async fn credential_lock(resource: &str) -> Result<Lock> {
+    let location = prepare_store_location_writable()?;
+    let parent = location
+        .file_path
+        .parent()
+        .context("credentials path has no parent")?;
+    let name = location
+        .file_path
+        .file_name()
+        .context("credentials path has no file name")?;
+    let mut key = name.as_encoded_bytes().to_vec();
+    key.push(0);
+    key.extend_from_slice(resource.as_bytes());
+    let path = parent.join(format!(".oauth-{}.lock", crate::config::digest(&key)));
+    // A refresh may take 15 seconds before committing its rotated token.
+    Lock::acquire(&path, Duration::from_secs(30)).await
 }
 
 pub struct HttpAuthManager {
     canonical_resource: String,
     allow_loopback: bool,
     oauth_client: Option<reqwest::Client>,
-    refresh_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl HttpAuthManager {
@@ -1102,17 +1108,10 @@ impl HttpAuthManager {
                 Duration::from_secs(10),
             )?)
         };
-        let lock_key = format!(
-            "{:?}:{canonical}",
-            std::env::var_os("MCPCLI_CREDENTIALS")
-                .or_else(|| std::env::var_os("MCPCLI_RUNTIME_DIR"))
-        );
-        let refresh_lock = resource_refresh_lock(&lock_key);
         Ok(Arc::new(Self {
             canonical_resource: canonical,
             allow_loopback,
             oauth_client,
-            refresh_lock,
         }))
     }
 
@@ -1139,7 +1138,14 @@ impl HttpAuthManager {
         if !needs_proactive {
             return (Some(cred.access_token.clone()), false);
         }
-        let _guard = self.refresh_lock.lock().await;
+        let Ok(_guard) = credential_lock(&self.canonical_resource).await else {
+            return (
+                cred.expires_at
+                    .is_none_or(|exp| exp > now_unix_secs())
+                    .then(|| cred.access_token.clone()),
+                true,
+            );
+        };
         let Ok(reloaded_store) = read_store_readonly() else {
             if cred.expires_at.is_some_and(|exp| exp <= now_unix_secs()) {
                 return (None, true);
@@ -1180,7 +1186,14 @@ impl HttpAuthManager {
         client: &reqwest::Client,
         rejected_token: Option<&str>,
     ) -> Option<String> {
-        let _guard = self.refresh_lock.lock().await;
+        if !read_store_readonly()
+            .ok()?
+            .resources
+            .contains_key(&self.canonical_resource)
+        {
+            return None;
+        }
+        let _guard = credential_lock(&self.canonical_resource).await.ok()?;
         let store = read_store_readonly().ok()?;
         let cred = store.resources.get(&self.canonical_resource)?;
         if validate_bearer_token_string(&cred.access_token).is_err() {
@@ -2319,6 +2332,9 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         expires_at,
         scopes: granted_scopes.clone(),
     };
+    let _guard = credential_lock(&canonical_server_resource)
+        .await
+        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?;
     let key = canonical_server_resource.clone();
     mutate_store(|store| {
         store.resources.insert(key, stored);
@@ -2428,6 +2444,18 @@ pub async fn logout(
     let server_loopback = is_loopback_literal_host(parsed_server.host_str());
     let canonical = canonical_resource_url(server_url)
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
+    let _guard = if resolve_store_location_readonly()
+        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?
+        .is_some()
+    {
+        Some(
+            credential_lock(&canonical)
+                .await
+                .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?,
+        )
+    } else {
+        None
+    };
     let existing = read_store_readonly()
         .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?
         .resources
@@ -2511,6 +2539,7 @@ pub async fn logout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::OnceLock;
 
     #[test]
     fn canonical_resource_normalizes_scheme_host_port_slash_and_fragment() {
@@ -2715,31 +2744,36 @@ mod tests {
         );
     }
 
+    async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut reader = BufReader::new(socket);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                length = value.trim().parse().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).await.unwrap();
+        body
+    }
+
     #[tokio::test]
     async fn login_deadline_includes_metadata_response_body() {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let resource = format!("http://{}/mcp", listener.local_addr().unwrap());
         let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             for is_metadata in [false, true] {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut reader = BufReader::new(&mut socket);
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
-                    }
-                    if let Some((name, value)) = line.split_once(':')
-                        && name.eq_ignore_ascii_case("content-length")
-                    {
-                        length = value.trim().parse().unwrap();
-                    }
-                }
-                reader.read_exact(&mut vec![0; length]).await.unwrap();
+                read_http_body(&mut socket).await;
                 if is_metadata {
                     socket
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
@@ -2786,8 +2820,7 @@ mod tests {
         let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 4096];
-            socket.read(&mut request).await.unwrap();
+            read_http_body(&mut socket).await;
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
                 .await
@@ -2932,6 +2965,92 @@ mod tests {
             std::env::remove_var("MCPCLI_CREDENTIALS");
         }
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn logout_waits_for_refresh_then_removes_the_rotated_credential() {
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let credential_path = dir.path().canonicalize().unwrap().join("credentials.json");
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", &credential_path) };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let resource = "http://127.0.0.1/mcp";
+        mutate_store(|store| {
+            store.resources.insert(
+                resource.into(),
+                StoredCredential {
+                    resource: resource.into(),
+                    issuer: "http://127.0.0.1".into(),
+                    token_endpoint: endpoint,
+                    revocation_endpoint: None,
+                    client_id: "client".into(),
+                    access_token: "expired-access".into(),
+                    refresh_token: Some("refresh".into()),
+                    expires_at: Some(0),
+                    scopes: vec![],
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let (requested, request_received) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_body(&mut socket).await;
+            requested.send(()).unwrap();
+            released.await.unwrap();
+            let body = r#"{"access_token":"fresh-access","refresh_token":"fresh-refresh","expires_in":3600}"#;
+            socket.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).await.unwrap();
+        });
+        let refresh = tokio::spawn(async move {
+            HttpAuthManager::for_server_url(resource)
+                .unwrap()
+                .prepare_token(&reqwest::Client::new())
+                .await
+        });
+        timeout(Duration::from_secs(5), request_received)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut logout = tokio::spawn(super::logout("server", resource, Duration::from_secs(5)));
+        let finished_early = timeout(Duration::from_millis(100), &mut logout)
+            .await
+            .is_ok();
+        release.send(()).unwrap();
+        let refreshed = refresh.await.unwrap();
+        if !finished_early {
+            logout.await.unwrap().unwrap();
+        }
+        let saved = read_store_at(&credential_path).unwrap();
+        server.await.unwrap();
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MCPCLI_CREDENTIALS", value),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
+        assert!(
+            !finished_early,
+            "logout must serialize with an ongoing refresh"
+        );
+        assert_eq!(refreshed.0.as_deref(), Some("fresh-access"));
+        assert!(
+            saved.resources.is_empty(),
+            "a completed refresh must not restore logged-out credentials"
+        );
     }
 
     #[tokio::test]
