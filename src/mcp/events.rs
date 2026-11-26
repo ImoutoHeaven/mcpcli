@@ -2,6 +2,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, RwLock},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -25,6 +26,7 @@ pub const EVENTS_EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 pub const MAX_EVENT_NOTIFICATION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENT_PAGES: usize = 100;
 const EVENT_CHANNEL_CAPACITY: usize = 128;
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
 
 const BASE64_HEADER_PREFIX: &str = "=?base64?";
 const BASE64_HEADER_SUFFIX: &str = "?=";
@@ -271,12 +273,16 @@ impl EventRouter {
     }
 }
 
+async fn cancel_handle(handle: RequestHandle<RoleClient>, reason: Option<String>) {
+    let _ = tokio::time::timeout(CANCEL_TIMEOUT, handle.cancel(reason)).await;
+}
+
 fn spawn_cancel_handle(handle: SharedRequestHandle, reason: Option<String>) {
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         rt.spawn(async move {
             let taken = handle.lock().unwrap_or_else(|p| p.into_inner()).take();
             if let Some(request_handle) = taken {
-                let _ = request_handle.cancel(reason).await;
+                cancel_handle(request_handle, reason).await;
             }
         });
     }
@@ -323,7 +329,7 @@ impl EventStreamHandle {
         self.ingress.untrack(&self.id);
         let taken = self.handle.lock().unwrap_or_else(|p| p.into_inner()).take();
         if let Some(handle) = taken {
-            let _ = handle.cancel(Some("client cancelled".into())).await;
+            cancel_handle(handle, Some("client cancelled".into())).await;
         }
         Ok(())
     }
@@ -803,6 +809,134 @@ mod tests {
 
         async fn close(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn event_cancellation_is_bounded_and_releases_local_tracking() {
+        struct SlowCancellation {
+            sent: mpsc::Sender<ClientJsonRpcMessage>,
+            release: Arc<tokio::sync::Notify>,
+            ingress: Ingress,
+        }
+
+        impl Transport<RoleClient> for SlowCancellation {
+            type Error = std::io::Error;
+
+            fn send(
+                &mut self,
+                message: ClientJsonRpcMessage,
+            ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+                self.ingress.track(&message);
+                let cancelled = matches!(
+                    &message,
+                    ClientJsonRpcMessage::Notification(notification)
+                        if matches!(
+                            notification.notification,
+                            ClientNotification::CancelledNotification(_)
+                        )
+                );
+                let sent = self.sent.clone();
+                let release = self.release.clone();
+                async move {
+                    sent.send(message).await.map_err(std::io::Error::other)?;
+                    if cancelled {
+                        release.notified().await;
+                    }
+                    Ok(())
+                }
+            }
+
+            async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
+                std::future::pending().await
+            }
+
+            async fn close(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        for explicit in [true, false] {
+            let budget = ByteBudget::new(4096);
+            let router = EventRouter::new(budget.clone());
+            let ingress = Ingress::default();
+            let release = Arc::new(tokio::sync::Notify::new());
+            let (sent_tx, mut sent) = mpsc::channel(4);
+            let mut service = rmcp::service::serve_directly(
+                (),
+                SlowCancellation {
+                    sent: sent_tx,
+                    release: release.clone(),
+                    ingress: ingress.clone(),
+                },
+                None,
+            );
+            let request = serde_json::from_value(json!({
+                "method": "events/stream", "params": {"name": "sample.changed"}
+            }))
+            .unwrap();
+            let request_handle = service
+                .peer()
+                .send_request_with_option(request, rmcp::service::PeerRequestOptions::default())
+                .await
+                .unwrap();
+            let stream = EventStreamHandle::new(request_handle, router.clone(), ingress.clone());
+            let id = stream.id().clone();
+            let mut receiver = router.take_receiver(&id);
+            let handle_owner = Arc::downgrade(&stream.handle);
+            let request = tokio::time::timeout(Duration::from_secs(1), sent.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(request).unwrap()["method"],
+                "events/stream"
+            );
+
+            let cleanup = tokio::spawn(async move {
+                if explicit {
+                    stream.cancel().await.unwrap();
+                }
+                drop(stream);
+            });
+            let cancelled = tokio::time::timeout(Duration::from_secs(1), sent.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let cancelled = serde_json::to_value(cancelled).unwrap();
+            assert_eq!(cancelled["method"], "notifications/cancelled");
+            assert_eq!(
+                cancelled["params"]["requestId"],
+                serde_json::to_value(&id).unwrap()
+            );
+            assert!(router.slots.lock().unwrap().is_empty());
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let response =
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":{}})).unwrap();
+            assert!(matches!(
+                ingress
+                    .observe_bytes(&response, 4096, &budget, false)
+                    .unwrap(),
+                super::super::ingress::ObserveOutcome::NotMatched
+            ));
+            assert_eq!(budget.used(), 0);
+
+            // The peer has received cancellation but has not acknowledged it yet.
+            tokio::time::timeout(CANCEL_TIMEOUT + Duration::from_secs(1), async {
+                cleanup.await.unwrap();
+                while handle_owner.strong_count() != 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("cancellation retained the local stream while waiting for the peer");
+            release.notify_one();
+            service.close().await.unwrap();
         }
     }
 

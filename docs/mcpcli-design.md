@@ -380,19 +380,23 @@ the value does not begin with `=?base64?`; all other values encode as
 `=?base64?<standard-base64>?=` using standard `=`-padded Base64. During HTTP
 `events/list`, event definitions with invalid `x-mcp-header` schemas are
 omitted with a `stderr` warning. If HTTP `events/poll` or `events/stream`
-receives `-32602` while header annotations were uncached or stale, the client
-refreshes `events/list` once and retries with updated headers. On `stdio`
-transport, HTTP header annotations have no wire meaning: `events/list` ignores
-`x-mcp-header` and retains every valid event definition.
+receives `-32020` (`HeaderMismatch`) while header annotations were uncached or
+stale, the client refreshes `events/list` once and retries with updated headers.
+On `stdio` transport, HTTP header annotations have no wire meaning: `events/list`
+ignores `x-mcp-header` and retains every valid event definition.
 
 `EventRouter` pre-registers subscription slots before writing `events/stream` on
 the wire so early `notifications/events/active` frames arriving ahead of the
 RPC response are buffered in order. Each notification is capped at
 `MAX_EVENT_NOTIFICATION_BYTES = 4 MiB` with per-subscription queue depth
 `EVENT_CHANNEL_CAPACITY = 128`. Receiving `notifications/events/terminated` or
-closing the stream cancels the underlying SDK `RequestHandle` immediately. The
-daemon bounds concurrent streams at `MAX_EVENT_STREAMS = 32`; foreground
-handshakes cap at `ACTIVE_HANDSHAKE_TIMEOUT = 30s`, poll intervals enforce
+closing the stream starts best-effort cancellation of the underlying SDK
+`RequestHandle`, bounded by `CANCEL_TIMEOUT = 2s`. Explicit close and dropping the
+stream release local routing and ingress tracking before waiting for cancellation;
+a slow cancellation acknowledgment does not change an already delivered event or
+committed cursor. The daemon bounds concurrent streams at
+`MAX_EVENT_STREAMS = 32`; foreground handshakes cap at
+`ACTIVE_HANDSHAKE_TIMEOUT = 30s`, poll intervals enforce
 `MIN_POLL_INTERVAL_MS = 1000`, and transient stream reconnects apply exponential
 backoff from `INITIAL_BACKOFF = 1s` to `MAX_BACKOFF = 60s`.
 
