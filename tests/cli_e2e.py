@@ -1211,6 +1211,7 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
         "counter": 0,
     }
     lock = threading.Lock()
+    slow_call_started = threading.Event()
 
     class OAuthMcpServer(ThreadingHTTPServer):
         def server_bind(self):
@@ -1415,12 +1416,16 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
                         "resultType": "complete", "ttlMs": 0, "cacheScope": "private",
                         "tools": [
                             {"name": "ping", "description": "Read tool", "inputSchema": {"type": "object"}},
+                            {"name": "slow_ping", "description": "Slow read tool", "inputSchema": {"type": "object"}},
                             {"name": "admin_op", "description": "Admin tool", "inputSchema": {"type": "object"}},
                         ],
                     }})
                     return
                 if method == "tools/call":
                     tname = req["params"]["name"]
+                    if tname == "slow_ping":
+                        slow_call_started.set()
+                        time.sleep(3)
                     if tname == "admin_op" and "mcp:admin" not in token_scopes:
                         self.send_json(403, {"error": "insufficient_scope"}, headers={
                             "WWW-Authenticate": f'Bearer resource_metadata="{prm_url}", scope="mcp:read mcp:admin", error="insufficient_scope", error_description="admin scope required"',
@@ -1565,10 +1570,18 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
         st_all = f.value("auth", "status")
         assert len(st_all["servers"]) == 2
 
-        logout_res = f.value("auth", "logout", "oauth_srv")
+        slow_call = f.start("call", "oauth_srv", "slow_ping")
+        assert slow_call_started.wait(5), "slow call did not reach the server"
+        started = time.monotonic()
+        logout_res = f.value("auth", "logout", "oauth_srv", timeout=1)
+        assert time.monotonic() - started < 2.5, "best-effort daemon reset exceeded the auth deadline"
         assert logout_res["loggedOut"] is True and logout_res["authenticated"] is False
         assert oauth_state["revoked"], "expected revocation endpoint to receive tokens"
         assert f.value("auth", "status", "oauth_srv")["authenticated"] is False
+        slow_out, slow_err = slow_call.communicate(timeout=5)
+        assert slow_call.returncode == 0, slow_err
+        assert json.loads(slow_out)["result"]["content"][0]["text"] == "ok:slow_ping"
+        f.value("reset", "--force", "oauth_srv")
         assert f.fail("tools", "oauth_srv", code=4)["kind"] == "auth_required"
     finally:
         srv.shutdown()

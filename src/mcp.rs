@@ -2708,19 +2708,22 @@ impl StreamableHttpClient for BoundedHttp {
         auth: Option<String>,
         headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), HttpError> {
-        let dynamic_token = match (&self.auth_manager, &auth) {
-            (Some(mgr), None) => mgr.prepare_token(&self.client).await.0,
-            _ => None,
+        let deletion = async {
+            let dynamic_token = match (&self.auth_manager, &auth) {
+                (Some(mgr), None) => mgr.prepare_token(&self.client).await.0,
+                _ => None,
+            };
+            let mut request = self.client.delete(uri.as_ref());
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            request = request.header("Mcp-Session-Id", session.as_ref());
+            if let Some(token) = auth.or(dynamic_token) {
+                request = request.bearer_auth(token);
+            }
+            request.send().await
         };
-        let mut request = self.client.delete(uri.as_ref());
-        for (name, value) in headers {
-            request = request.header(name, value);
-        }
-        request = request.header("Mcp-Session-Id", session.as_ref());
-        if let Some(token) = auth.or(dynamic_token) {
-            request = request.bearer_auth(token);
-        }
-        match timeout(Duration::from_secs(2), request.send()).await {
+        match timeout(Duration::from_secs(2), deletion).await {
             Ok(Ok(response)) => {
                 let status = response.status();
                 if status.is_success()

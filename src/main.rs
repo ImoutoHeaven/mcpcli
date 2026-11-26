@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 
 #[derive(Parser)]
 #[command(
@@ -1396,6 +1396,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         ));
                     };
                     let budget = Duration::from_secs(cli.timeout_secs());
+                    let deadline = Instant::now() + budget;
                     let (value, text) = auth::login(auth::LoginOptions {
                         server_name: server,
                         server_url: url,
@@ -1405,7 +1406,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         budget,
                     })
                     .await?;
-                    notify_daemon_reset(cli, &loaded, server).await;
+                    notify_daemon_reset(cli, &loaded, server, deadline).await;
                     Ok(Output::with_text(value, text))
                 }
                 AuthCommand::Logout { server } => {
@@ -1422,8 +1423,9 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         ));
                     };
                     let budget = Duration::from_secs(cli.timeout_secs());
+                    let deadline = Instant::now() + budget;
                     let (value, text) = auth::logout(server, url, budget).await?;
-                    notify_daemon_reset(cli, &loaded, server).await;
+                    notify_daemon_reset(cli, &loaded, server, deadline).await;
                     Ok(Output::with_text(value, text))
                 }
             }
@@ -1432,8 +1434,8 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
     }
 }
 
-async fn notify_daemon_reset(cli: &Cli, loaded: &LoadedConfig, server: &str) {
-    if cli.oneshot {
+async fn notify_daemon_reset(cli: &Cli, loaded: &LoadedConfig, server: &str, deadline: Instant) {
+    if cli.oneshot || Instant::now() >= deadline {
         return;
     }
     let Ok(paths) = Paths::new(loaded.path.clone(), &cli.session) else {
@@ -1442,15 +1444,20 @@ async fn notify_daemon_reset(cli: &Cli, loaded: &LoadedConfig, server: &str) {
     if !paths.running().unwrap_or(false) {
         return;
     }
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(5));
+    let budget = deadline.saturating_duration_since(Instant::now());
+    if budget < Duration::from_millis(1) {
+        return;
+    }
     if let Ok(req) = paths.request(
         &loaded.digest,
         Operation::Reset {
             server: server.to_owned(),
             force: true,
         },
-        Duration::from_secs(5),
+        budget,
     ) {
-        let _ = runtime::exchange(&paths, &req).await;
+        let _ = timeout_at(deadline, runtime::exchange(&paths, &req)).await;
     }
 }
 
