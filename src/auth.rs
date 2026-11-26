@@ -1200,6 +1200,20 @@ impl HttpAuthManager {
         cred: &StoredCredential,
         rejected_by_resource: bool,
     ) -> Result<String> {
+        timeout(
+            Duration::from_secs(15),
+            self.exchange_refresh_token_inner(fallback_client, cred, rejected_by_resource),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth token refresh timed out"))?
+    }
+
+    async fn exchange_refresh_token_inner(
+        &self,
+        fallback_client: &reqwest::Client,
+        cred: &StoredCredential,
+        rejected_by_resource: bool,
+    ) -> Result<String> {
         let refresh_token = cred
             .refresh_token
             .as_deref()
@@ -2050,6 +2064,12 @@ async fn ensure_resolved_host_allowed(
 }
 
 pub async fn login(opts: LoginOptions<'_>) -> Result<(Value, String)> {
+    timeout(opts.budget, login_inner(opts))
+        .await
+        .map_err(|_| Failure::new(5, "timeout", "OAuth login timed out"))?
+}
+
+async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
     let deadline = Instant::now() + opts.budget;
     let (server_url, allow_loopback) = validate_mcp_server_url(opts.server_url)
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
@@ -2692,6 +2712,116 @@ mod tests {
             parse_www_authenticate(&spnego).scope.as_deref(),
             Some("mcp:read")
         );
+    }
+
+    #[tokio::test]
+    async fn login_deadline_includes_metadata_response_body() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let resource = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            for is_metadata in [false, true] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(&mut socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("content-length")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                reader.read_exact(&mut vec![0; length]).await.unwrap();
+                if is_metadata {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    headers_sent.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                socket
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let login = tokio::spawn(async move {
+            super::login(LoginOptions {
+                server_name: "slow-metadata",
+                server_url: &resource,
+                scopes: &[],
+                client_id: None,
+                no_browser: true,
+                budget: Duration::from_secs(1),
+            })
+            .await
+        });
+        timeout(Duration::from_secs(5), received_headers)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = timeout(Duration::from_secs(5), login)
+            .await
+            .expect("login did not enforce its total deadline")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<Failure>().unwrap().kind, "timeout");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn refresh_deadline_includes_token_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+        let (headers_sent, received_headers) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            headers_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        let refresh = tokio::spawn(async move {
+            let manager = HttpAuthManager::for_server_url("http://127.0.0.1/mcp").unwrap();
+            let credential = StoredCredential {
+                resource: "http://127.0.0.1/mcp".into(),
+                issuer: "http://127.0.0.1".into(),
+                token_endpoint,
+                revocation_endpoint: None,
+                client_id: "client".into(),
+                access_token: "access".into(),
+                refresh_token: Some("refresh".into()),
+                expires_at: Some(0),
+                scopes: vec![],
+            };
+            manager
+                .exchange_refresh_token(&reqwest::Client::new(), &credential, false)
+                .await
+        });
+        timeout(Duration::from_secs(5), received_headers)
+            .await
+            .unwrap()
+            .unwrap();
+        let error = timeout(Duration::from_secs(20), refresh)
+            .await
+            .expect("refresh did not enforce its total deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        server.abort();
     }
 
     #[tokio::test]
