@@ -73,11 +73,17 @@ impl CursorStore {
     }
 
     pub fn read(&self) -> io::Result<Option<String>> {
-        let file = match std::fs::File::open(&self.path) {
+        let file = match platform::open_input(&self.path) {
             Ok(file) => file,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err),
         };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cursor file must be a regular file",
+            ));
+        }
         let mut buf = Vec::new();
         file.take((MAX_CURSOR_BYTES + 1) as u64)
             .read_to_end(&mut buf)?;
@@ -844,6 +850,7 @@ mod tests {
         let target_dir = dir.path().join("occupied");
         std::fs::create_dir(&target_dir).unwrap();
         let bad_store = CursorStore::new(&target_dir);
+        assert!(bad_store.read().is_err());
         assert!(bad_store.write("boot:100").is_err());
 
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
