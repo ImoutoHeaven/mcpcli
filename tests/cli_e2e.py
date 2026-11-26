@@ -1447,7 +1447,7 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
         f.env["MCPCLI_CREDENTIALS"] = str(cred_file)
         f.env["MCPCLI_INLINE_HDR_TOK"] = "STATIC_INLINE_OVERRIDE"
         f.settings["servers"] = {
-            "oauth_srv": {"transport": "http", "url": f"{base_url}/mcp/"},
+            "oauth_srv": {"transport": "http", "url": f"{base_url}/mcp"},
             "static_srv": {
                 "transport": "http", "url": f"{base_url}/mcp",
                 "headers": {"Authorization": "Bearer ${MCPCLI_INLINE_HDR_TOK}"},

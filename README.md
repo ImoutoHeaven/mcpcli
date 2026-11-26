@@ -45,9 +45,9 @@ Create `mcpcli.json`, or select another file with `-c PATH`, `--config PATH`, or
 }
 ~~~
 
-Paths resolve from the configuration directory. `env` and HTTP `headers` values expand
-`${VAR}` placeholders from the launch environment, including templates such as
-`"Bearer ${MCP_TOKEN}"`, while `args` pass directly to the OS process API without interpolation.
+Paths resolve from the configuration directory. `env` expands whole-value references such as
+`"${VAR}"`. HTTP `headers` also expand inline templates such as `"Bearer ${MCP_TOKEN}"`.
+Both use the launch environment; `args` pass directly to the OS process API without interpolation.
 On Windows, use `npx.cmd` for npm launchers. Optional `agents` points to one global `AGENTS.md`
 file, and each `skills` entry mounts a skill directory or a parent directory of skills.
 
@@ -73,8 +73,8 @@ Credentials live in a private file (`0600` on Unix, owner-only DACL on Windows) 
 `MCPCLI_CREDENTIALS`, `<MCPCLI_RUNTIME_DIR>/credentials.json`, `$XDG_STATE_HOME/mcpcli/credentials.json`
 or `$HOME/.local/state/mcpcli/credentials.json` or `<runtime>/credentials.json` on Unix, and
 `%LOCALAPPDATA%\mcpcli\state\credentials.json` on Windows. Stored tokens stay outside `mcpcli.json`
-and rotate under a singleflight refresh lock near expiry or upon any `401` response when a
-`refresh_token` is present, without restarting the daemon.
+and rotate under a per-resource file lock shared by daemon and oneshot processes near expiry or
+upon any `401` response when a `refresh_token` is present, without restarting the daemon.
 
 ## Use
 

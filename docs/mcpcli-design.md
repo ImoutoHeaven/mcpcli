@@ -121,9 +121,8 @@ cannot contain keys that collide case-insensitively on Windows. Arguments go
 directly to the OS process API; npm wrappers on Windows require `.cmd` (such as
 `npx.cmd`).
 
-Environment expansion applies to `env` and HTTP `headers` values containing
-`${NAME}` placeholders, supporting both whole-value references
-(`"${MCP_AUTHORIZATION}"`) and inline templates (`"Bearer ${MCP_TOKEN}"`).
+`env` expands whole-value references such as `"${NAME}"`. HTTP `headers` also
+expand inline templates such as `"Bearer ${MCP_TOKEN}"`.
 Missing or non-UTF-8 referenced variables fail configuration loading, and
 `args` values are never interpolated. HTTP URLs cannot include credentials or
 fragments. Protocol-owned headers (`Host`, `Content-Length`, `Content-Type`,
@@ -453,7 +452,10 @@ Authorization Server Metadata ([RFC 8414](https://datatracker.ietf.org/doc/html/
 rather than reusing a prior client registration tied to an older port.
 Authorization requests always use Authorization Code with PKCE `S256`
 ([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)), a cryptographic `state` parameter, and
-the canonical target `resource` URI ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)).
+the `resource` URI from the verified metadata ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)).
+Credential keys preserve non-root path slashes and query components: `/mcp`,
+`/mcp/`, and `/mcp?tenant=a` remain distinct resources. Protected Resource
+Metadata discovery inserts the well-known path while preserving the resource query.
 
 For non-loopback MCP servers, all OAuth metadata, registration, authorization,
 token, and revocation endpoints must use `https://` and must not address or
@@ -467,7 +469,8 @@ browser unless `--no-browser` is passed, and exchanges the authorization code
 after constant-time `state` (and optional `iss`) verification. With
 `--no-browser`, `auth login` skips browser launch while accepting either the
 loopback callback or a pasted redirect URL or authorization code on `stdin` for
-SSH and headless sessions.
+SSH and headless sessions. The login deadline covers discovery, response bodies,
+the callback, token exchange, and waiting to persist the credential.
 
 Acquired tokens, refresh tokens, expiration timestamps, granted scopes, and
 client metadata are stored in a private `credentials.json` file (`0600` on
@@ -477,7 +480,8 @@ first, then `<MCPCLI_RUNTIME_DIR>/credentials.json` when `MCPCLI_RUNTIME_DIR`
 is set; otherwise Unix resolves `$XDG_STATE_HOME/mcpcli/credentials.json` (when
 `XDG_STATE_HOME` is an absolute path), `$HOME/.local/state/mcpcli/credentials.json`
 (when `HOME` is an absolute path), or `<runtime>/credentials.json`, and Windows
-resolves `%LOCALAPPDATA%\mcpcli\state\credentials.json`. Explicit
+resolves `%LOCALAPPDATA%\mcpcli\state\credentials.json`. Writing to an unusable
+selected state path fails without choosing another location. Explicit
 `Authorization` headers configured in `mcpcli.json` take precedence over stored
 OAuth credentials. Because `credentials.json` is separate from `mcpcli.json`
 and excluded from the daemon configuration `digest`, logging in, rotating
@@ -487,11 +491,17 @@ restarting other server sessions.
 When a stored access token is within 30 seconds of expiry (`expires_at <= now + 30s`)
 or an upstream HTTP server returns any `401 Unauthorized` while a
 `refresh_token` is held, `BoundedHttp` runs `grant_type=refresh_token` once
-under a per-resource singleflight lock, atomically persists rotated credentials,
-and retries the request once. If the token endpoint rejects refresh with
+under a per-resource file lock shared by daemon and oneshot processes, atomically
+persists rotated credentials, and retries the request once. Login commits and logout
+use the same lock, so a completed refresh cannot overwrite a later login or restore
+a logged-out credential. The complete refresh exchange, including its response body,
+has a 15-second deadline. If the token endpoint rejects refresh with
 `invalid_grant`, `invalid_client`, or `unauthorized_client`, `mcpcli` clears
 the stored `refresh_token` on disk and withholds confirmed-expired access
 tokens from upstream requests.
+
+The logout deadline covers lock acquisition and local credential deletion.
+After deletion, remote revocation is best effort and uses the remaining budget.
 
 When an HTTP server returns `401 Unauthorized` or `403 Forbidden` that cannot
 be satisfied automatically, `BoundedHttp` parses RFC 6750 and RFC 9728

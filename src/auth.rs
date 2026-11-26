@@ -200,8 +200,7 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-/// Normalize an MCP `resource` URI per RFC 8707: lowercase scheme and host,
-/// omit default port, strip fragment, and strip redundant trailing slashes.
+/// Preserve non-root paths and queries when identifying an OAuth resource.
 pub fn canonical_resource_url(raw: &str) -> Result<String> {
     let mut url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid resource URL"))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -214,14 +213,8 @@ pub fn canonical_resource_url(raw: &str) -> Result<String> {
     url.set_fragment(None);
     let query = url.query().map(str::to_owned);
     url.set_query(None);
-    let trimmed_path = url.path().trim_end_matches('/').to_owned();
-    url.set_path(if trimmed_path.is_empty() {
-        "/"
-    } else {
-        &trimmed_path
-    });
     let mut canonical = url.as_str().to_owned();
-    if trimmed_path.is_empty() {
+    if url.path() == "/" {
         canonical = canonical.trim_end_matches('/').to_owned();
     }
     if let Some(q) = query {
@@ -1380,17 +1373,18 @@ pub(crate) fn protected_resource_metadata_urls(
         let validated = validate_oauth_endpoint_url(hint, "resource_metadata", allow_loopback)?;
         push_unique(validated);
     }
-    let trimmed_path = server_url.path().trim_end_matches('/');
-    if !trimmed_path.is_empty() {
-        push_unique(origin_with_path(
-            server_url,
-            &format!("/.well-known/oauth-protected-resource{trimmed_path}"),
-        ));
-    }
-    push_unique(origin_with_path(
-        server_url,
-        "/.well-known/oauth-protected-resource",
+    let resource_path = if server_url.path() == "/" {
+        ""
+    } else {
+        server_url.path()
+    };
+    let mut metadata_url = server_url.clone();
+    metadata_url.set_path(&format!(
+        "/.well-known/oauth-protected-resource{resource_path}"
     ));
+    push_unique(metadata_url.clone());
+    metadata_url.set_path("/.well-known/oauth-protected-resource");
+    push_unique(metadata_url);
     Ok(urls)
 }
 
@@ -2518,10 +2512,10 @@ mod tests {
     use std::sync::OnceLock;
 
     #[test]
-    fn canonical_resource_normalizes_scheme_host_port_slash_and_fragment() {
+    fn canonical_resource_preserves_distinct_paths_and_queries() {
         assert_eq!(
             canonical_resource_url("HTTPS://Example.COM:443/mcp/#frag").unwrap(),
-            "https://example.com/mcp"
+            "https://example.com/mcp/"
         );
         assert_eq!(
             canonical_resource_url("https://example.com/").unwrap(),
@@ -2529,8 +2523,20 @@ mod tests {
         );
         assert_eq!(
             canonical_resource_url("http://127.0.0.1:8080/v1/mcp///").unwrap(),
-            "http://127.0.0.1:8080/v1/mcp"
+            "http://127.0.0.1:8080/v1/mcp///"
         );
+        let resources = [
+            "https://example.com/mcp",
+            "https://example.com/mcp/",
+            "https://example.com/mcp//",
+            "https://example.com/mcp?tenant=a",
+            "https://example.com/mcp?tenant=b",
+        ];
+        let keys: std::collections::HashSet<_> = resources
+            .iter()
+            .map(|url| canonical_resource_url(url).unwrap())
+            .collect();
+        assert_eq!(keys.len(), resources.len());
         assert!(canonical_resource_url("https://user:pass@example.com/mcp").is_err());
         assert!(canonical_resource_url("ftp://example.com/mcp").is_err());
     }
@@ -2661,6 +2667,25 @@ mod tests {
                 "https://api.example.com/.well-known/oauth-protected-resource/v1/mcp",
                 "https://api.example.com/.well-known/oauth-protected-resource",
             ]
+        );
+
+        let resource = reqwest::Url::parse("https://api.example.com/mcp/?tenant=a%2Fb").unwrap();
+        let metadata_urls: Vec<String> = protected_resource_metadata_urls(&resource, None)
+            .unwrap()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        assert_eq!(
+            metadata_urls,
+            [
+                "https://api.example.com/.well-known/oauth-protected-resource/mcp/?tenant=a%2Fb",
+                "https://api.example.com/.well-known/oauth-protected-resource?tenant=a%2Fb",
+            ]
+        );
+        let root = reqwest::Url::parse("https://api.example.com/?tenant=a").unwrap();
+        assert_eq!(
+            protected_resource_metadata_urls(&root, None).unwrap()[0].as_str(),
+            "https://api.example.com/.well-known/oauth-protected-resource?tenant=a",
         );
 
         let tenant_issuer = reqwest::Url::parse("https://auth.example.com/tenant").unwrap();
@@ -2905,7 +2930,7 @@ mod tests {
             std::env::set_var("MCPCLI_CREDENTIALS", &cred_path);
         }
 
-        let mgr = HttpAuthManager::for_server_url("http://127.0.0.1:7777/mcp/").unwrap();
+        let mgr = HttpAuthManager::for_server_url("http://127.0.0.1:7777/mcp").unwrap();
         let client =
             build_oauth_http_client("http://127.0.0.1:7777/mcp", true, Duration::from_secs(5))
                 .unwrap();
