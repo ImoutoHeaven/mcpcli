@@ -21,7 +21,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    time::{Instant, timeout},
+    time::{Instant, timeout, timeout_at},
 };
 
 const MAX_CREDENTIALS_BYTES: usize = 1 << 20;
@@ -1075,14 +1075,11 @@ async fn credential_lock(resource: &str) -> Result<Lock> {
         .file_path
         .parent()
         .context("credentials path has no parent")?;
-    let name = location
-        .file_path
-        .file_name()
-        .context("credentials path has no file name")?;
-    let mut key = name.as_encoded_bytes().to_vec();
-    key.push(0);
-    key.extend_from_slice(resource.as_bytes());
-    let path = parent.join(format!(".oauth-{}.lock", crate::config::digest(&key)));
+    // Keep one lock across filename aliases and the first store creation.
+    let path = parent.join(format!(
+        ".oauth-{}.lock",
+        crate::config::digest(resource.as_bytes())
+    ));
     // A refresh may take 15 seconds before committing its rotated token.
     Lock::acquire(&path, Duration::from_secs(30)).await
 }
@@ -2439,93 +2436,72 @@ pub async fn logout(
     server_url: &str,
     budget: Duration,
 ) -> Result<(Value, String)> {
+    let deadline = Instant::now() + budget;
     let parsed_server = reqwest::Url::parse(server_url)
         .map_err(|_| Failure::new(2, "configuration", "invalid MCP server URL"))?;
     let server_loopback = is_loopback_literal_host(parsed_server.host_str());
     let canonical = canonical_resource_url(server_url)
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
-    let _guard = if resolve_store_location_readonly()
-        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?
-        .is_some()
-    {
-        Some(
-            credential_lock(&canonical)
-                .await
-                .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?,
-        )
-    } else {
-        None
-    };
-    let existing = read_store_readonly()
-        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?
-        .resources
-        .get(&canonical)
-        .cloned();
-
-    if let Some(ref cred) = existing
-        && let Some(ref rev_raw) = cred.revocation_endpoint
-    {
-        let resource_loopback = reqwest::Url::parse(&cred.resource)
-            .ok()
-            .is_some_and(|u| is_loopback_literal_host(u.host_str()));
-        let allow_loopback = server_loopback && resource_loopback;
-        if let Ok(rev_url) =
-            validate_oauth_endpoint_url(rev_raw, "revocation_endpoint", allow_loopback)
-            && let Ok(client) =
-                build_oauth_http_client(rev_raw, allow_loopback, Duration::from_secs(5))
-        {
-            let step = budget.min(Duration::from_secs(5));
-            if let Some(ref rt) = cred.refresh_token {
-                let form = encode_form(&[
-                    ("token", rt),
-                    ("token_type_hint", "refresh_token"),
-                    ("client_id", &cred.client_id),
-                ]);
-                let _ = timeout(
-                    step,
-                    client
-                        .post(rev_url.clone())
-                        .header(
-                            http::header::CONTENT_TYPE,
-                            "application/x-www-form-urlencoded",
-                        )
-                        .body(form)
-                        .send(),
-                )
-                .await;
-            }
-            let form = encode_form(&[
-                ("token", &cred.access_token),
-                ("token_type_hint", "access_token"),
-                ("client_id", &cred.client_id),
-            ]);
-            let _ = timeout(
-                step,
-                client
-                    .post(rev_url)
-                    .header(
-                        http::header::CONTENT_TYPE,
-                        "application/x-www-form-urlencoded",
-                    )
-                    .body(form)
-                    .send(),
-            )
-            .await;
+    let (_guard, existing) = timeout_at(deadline, async {
+        if resolve_store_location_readonly()?.is_none() {
+            return Ok::<_, anyhow::Error>((None, None));
         }
-    }
+        let guard = credential_lock(&canonical).await?;
+        let existing = read_store_readonly()?.resources.get(&canonical).cloned();
+        if existing.is_some() {
+            mutate_store(|store| {
+                store.resources.remove(&canonical);
+                Ok(())
+            })
+            .await?;
+        }
+        Ok((Some(guard), existing))
+    })
+    .await
+    .map_err(|_| Failure::new(5, "timeout", "OAuth logout deadline exceeded"))?
+    .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?;
 
-    if resolve_store_location_readonly()
-        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?
-        .is_some()
-    {
-        let key = canonical.clone();
-        mutate_store(|store| {
-            store.resources.remove(&key);
-            Ok(())
-        })
-        .await
-        .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?;
-    }
+    // Local deletion is committed before best-effort remote revocation.
+    let _ = timeout_at(deadline, async {
+        if let Some(ref cred) = existing
+            && let Some(ref rev_raw) = cred.revocation_endpoint
+        {
+            let resource_loopback = reqwest::Url::parse(&cred.resource)
+                .ok()
+                .is_some_and(|u| is_loopback_literal_host(u.host_str()));
+            let allow_loopback = server_loopback && resource_loopback;
+            if let Ok(rev_url) =
+                validate_oauth_endpoint_url(rev_raw, "revocation_endpoint", allow_loopback)
+                && let Ok(client) =
+                    build_oauth_http_client(rev_raw, allow_loopback, Duration::from_secs(5))
+            {
+                for (token, hint) in [
+                    (cred.refresh_token.as_deref(), "refresh_token"),
+                    (Some(cred.access_token.as_str()), "access_token"),
+                ] {
+                    let Some(token) = token else { continue };
+                    let form = encode_form(&[
+                        ("token", token),
+                        ("token_type_hint", hint),
+                        ("client_id", &cred.client_id),
+                    ]);
+                    let _ = timeout(
+                        Duration::from_secs(5),
+                        client
+                            .post(rev_url.clone())
+                            .header(
+                                http::header::CONTENT_TYPE,
+                                "application/x-www-form-urlencoded",
+                            )
+                            .body(form)
+                            .send(),
+                    )
+                    .await;
+                }
+            }
+        }
+    })
+    .await;
 
     let out_json = json!({
         "server": server_name,
@@ -2965,6 +2941,135 @@ mod tests {
             std::env::remove_var("MCPCLI_CREDENTIALS");
         }
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn credential_lock_is_stable_across_store_filename_case() {
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().canonicalize().unwrap();
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", parent.join("Credentials.json")) };
+        let first = credential_lock("https://example.com/mcp").await.unwrap();
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", parent.join("credentials.json")) };
+        let second = credential_lock("https://example.com/mcp");
+        tokio::pin!(second);
+        assert!(
+            timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err()
+        );
+        drop(first);
+        let second = timeout(Duration::from_secs(5), second)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(second);
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MCPCLI_CREDENTIALS", value),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_deadline_bounds_locks_and_best_effort_revocation() {
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("credentials.json");
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", &path) };
+        let resource = "http://127.0.0.1/mcp";
+        let guard = credential_lock(resource).await.unwrap();
+        // An empty store makes logout a no-op even while a first login is in progress.
+        let empty = timeout(
+            Duration::from_secs(1),
+            logout("server", resource, Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(empty.0["loggedOut"], true);
+        assert!(!path.exists());
+        drop(guard);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let revocation = format!("http://{}/revoke", listener.local_addr().unwrap());
+        mutate_store(|store| {
+            store.resources.insert(
+                resource.into(),
+                StoredCredential {
+                    resource: resource.into(),
+                    issuer: "http://127.0.0.1".into(),
+                    token_endpoint: "http://127.0.0.1/token".into(),
+                    revocation_endpoint: Some(revocation),
+                    client_id: "client".into(),
+                    access_token: "access".into(),
+                    refresh_token: Some("refresh".into()),
+                    expires_at: None,
+                    scopes: vec![],
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let guard = credential_lock(resource).await.unwrap();
+        let waiting = timeout(
+            Duration::from_secs(2),
+            logout("server", resource, Duration::from_millis(100)),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(waiting.downcast_ref::<Failure>().unwrap().code, 5);
+        assert!(
+            read_store_at(&path)
+                .unwrap()
+                .resources
+                .contains_key(resource)
+        );
+        drop(guard);
+
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_http_body(&mut socket).await;
+            sent.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+        let logged_out = timeout(
+            Duration::from_secs(3),
+            logout("server", resource, Duration::from_secs(1)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(logged_out.0["loggedOut"], true);
+        received.await.unwrap();
+        assert!(read_store_at(&path).unwrap().resources.is_empty());
+        server.abort();
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("MCPCLI_CREDENTIALS", value),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
     }
 
     #[tokio::test]
