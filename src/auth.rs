@@ -774,17 +774,18 @@ fn prepare_store_location_writable() -> Result<StoreLocation> {
     #[cfg(unix)]
     {
         if let Some(xdg) = non_empty_env("XDG_STATE_HOME")
-            && let Ok(dir) = ensure_state_base_unix(Path::new(&xdg))
+            && Path::new(&xdg).is_absolute()
         {
+            let dir = ensure_state_base_unix(Path::new(&xdg))?;
             return Ok(StoreLocation {
                 file_path: dir.join("credentials.json"),
                 explicit_override: false,
             });
         }
         if let Some(home) = non_empty_env("HOME")
-            && let Ok(dir) =
-                ensure_state_base_unix(&PathBuf::from(home).join(".local").join("state"))
+            && Path::new(&home).is_absolute()
         {
+            let dir = ensure_state_base_unix(&PathBuf::from(home).join(".local").join("state"))?;
             return Ok(StoreLocation {
                 file_path: dir.join("credentials.json"),
                 explicit_override: false,
@@ -3136,7 +3137,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn relative_xdg_state_home_falls_back_to_home_state_for_write_and_read() {
+    async fn xdg_state_path_selection_is_consistent_for_reads_and_writes() {
         let _env_guard = test_env_lock().lock().await;
         let home_dir = tempfile::tempdir_in("/tmp").unwrap();
         let canon_home = home_dir.path().canonicalize().unwrap();
@@ -3184,6 +3185,24 @@ mod tests {
             resolve_store_location_readonly().unwrap().as_deref(),
             Some(expected.as_path())
         );
+
+        let unusable_state = canon_home.join("state-file");
+        std::fs::write(&unusable_state, b"regular file").unwrap();
+        let original = std::fs::read(&expected).unwrap();
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &unusable_state);
+        }
+        assert!(
+            mutate_store(|store| {
+                store.resources.clear();
+                Ok(())
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&expected).unwrap(), original);
+        assert!(read_store_readonly().unwrap().resources.is_empty());
 
         // SAFETY: serialized across tests in this module via `test_env_lock`.
         unsafe {
