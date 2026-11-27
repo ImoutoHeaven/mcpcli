@@ -242,6 +242,13 @@ elsewhere), configuration digest, timeout budget (`timeout_ms`), optional
 monotonic deadline, and optional explicit deadline. Version, binary, or
 configuration mismatches fail with exit status `6` until `daemon restart`.
 
+For calls, `timeout_ms` and `max_timeout_ms` retain the original idle and hard
+budgets. The absolute deadline includes time already spent starting the daemon.
+With a hard cap, the admission deadline is
+`deadline_ms - (max_timeout_ms - timeout_ms)`; without one, it is `deadline_ms`.
+Both IPC admission and daemon queueing use that shared deadline. Startup and
+queueing consume the pre-dispatch budget without shortening later progress gaps.
+
 `startup.lock` serializes concurrent starters and `daemon.lock` stays locked
 for the daemon's lifetime. Lock files are never unlinked, and stale Unix
 sockets are unlinked only while holding `daemon.lock` after verifying socket
@@ -285,7 +292,7 @@ On the CLI side, request/response IPC exchange splits into Stage 1a, Stage 1b,
 and Stage 2:
 
 - Stage 1a (`connect` and `write_raw_idle`) is always bounded by
-  `admission_deadline` (derived from `timeout_ms` or `deadline_ms`), so a
+  the shared `admission_deadline` described above, so a
   stalled socket connect or request write fails with exit `5` instead of
   hanging.
 - Stage 1b (`read_frame_header`) waits for the validated 4-byte response
@@ -409,7 +416,11 @@ allocations after handoff have the limits described under WONT FIX:
   avoiding full-size rendering copies. Server, tool-list, and inspect text
   also stream borrowed fields; inspect moves its selected raw tool from the
   owned pages, normalizing and truncating its short display name without
-  copying the full name.
+  copying the full name. Tool filtering and summary move selected payloads from
+  the owned pages; lowercasing scratch space and new summary descriptions retain
+  their own byte-budget leases. Events routing headers reserve their lease before
+  construction and retain it through OAuth token preparation and any 401 refresh
+  retry until the final HTTP send completes.
 - Oversize frames and byte-budget exhaustion store a connection-scoped
   termination error, suppress HTTP SSE GET reconnects, and wake pending
   operations immediately.
@@ -433,8 +444,10 @@ daemon also keeps an unlocked per-server `call_cancels` side table holding a
 `CancellationToken` registered upon acquiring `ServerState` (covering
 connection setup, `walk_tools`, and the post-dispatch response wait).
 `reset --force SERVER` cancels any active `call_cancels` token before awaiting
-`ServerState`, interrupting an in-flight `Call` immediately rather than waiting
-behind the server lock. Cancellation before dispatch returns `code: 4`,
+`ServerState`. Its cancellation remains active while the reset waits for and
+holds the slot, so calls already queued ahead of the reset are cancelled before
+dispatch and cannot block it again. Concurrent force resets retain independent
+cancellation guards. Cancellation before dispatch returns `code: 4`,
 `kind: "cancelled"`, `outcome_unknown: false`; cancellation after dispatch
 sends a best-effort `notifications/cancelled` (2-second timeout) and returns
 `code: 4`, `kind: "cancelled"`, `outcome_unknown: true`, after which
@@ -475,8 +488,9 @@ Daemon backgrounding detaches from any parent Job; supervisors that forbid Job
 breakaway should run `daemon run` directly.
 
 Stdio child `stderr` is piped into a bounded 16 KiB ring buffer
-(`stderr_tail_bytes`, backed by a fixed `ByteLease`; falls back to null if the
-lease is unavailable) and drained continuously by a background task so noisy
+(`stderr_tail_bytes`, with its full capacity and fixed `ByteLease` reserved
+before spawning; falls back to null if allocation or the lease is unavailable)
+and drained continuously by a background task so noisy
 children do not block on a full OS pipe. Only on spawn, handshake, or transport
 failure (never on success), `mcpcli` waits up to 100 ms for `stderr` EOF, takes
 up to the last 4 KiB on a valid UTF-8 boundary, escapes control characters with
@@ -608,7 +622,10 @@ normalization on `<issuer_path>`).
 `auth login` binds a literal `127.0.0.1:<port>` loopback HTTP callback listener
 (`http://127.0.0.1:<port><callback_path>`, ephemeral port `0` and `"/callback"`
 by default, per RFC 8252 Section 8.3 to avoid IPv4/IPv6 `localhost` mismatch)
-before client resolution. When no `client_id` is supplied by CLI or config,
+before client resolution. The listener compares callback paths after URL
+normalization, including ordinary dot segments; registration, authorization,
+and token exchange retain the same original `redirect_uri`.
+When no `client_id` is supplied by CLI or config,
 every login performs Dynamic Client Registration
 ([RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)) as a public native
 CLI client (`client_name` defaulting to `"mcpcli"`,
@@ -618,7 +635,9 @@ CLI client (`client_name` defaulting to `"mcpcli"`,
 rather than reusing a prior client registration tied to an older port.
 
 When `oauth.client_secret` is configured with `client_id`, `auth login` acts as
-a confidential client. It checks `token_endpoint_auth_methods_supported` in AS
+a confidential client. Configured client IDs retain their exact expanded value
+through login, refresh, and revocation; CLI `--client-id` retains its existing
+surrounding-whitespace trimming. It checks `token_endpoint_auth_methods_supported` in AS
 metadata, selecting `"client_secret_basic"` if supported or absent, else
 `"client_secret_post"` if supported, and failing with `mcp_protocol` otherwise.
 The chosen `token_endpoint_auth_method` (`"none"`, `"client_secret_basic"`, or
