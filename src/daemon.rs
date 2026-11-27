@@ -80,7 +80,13 @@ impl Default for ServerState {
     }
 }
 
-type CallCancelSlot = Arc<std::sync::Mutex<Option<CancellationToken>>>;
+#[derive(Default)]
+struct CallCancelState {
+    active: Option<CancellationToken>,
+    force_resets: usize,
+}
+
+type CallCancelSlot = Arc<std::sync::Mutex<CallCancelState>>;
 
 struct CallCancelRegistration {
     slot: CallCancelSlot,
@@ -89,14 +95,42 @@ struct CallCancelRegistration {
 impl CallCancelRegistration {
     fn register(slot: &CallCancelSlot) -> (Self, CancellationToken) {
         let token = CancellationToken::new();
-        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
+        let mut state = slot.lock().unwrap_or_else(|p| p.into_inner());
+        if state.force_resets > 0 {
+            token.cancel();
+        }
+        state.active = Some(token.clone());
         (Self { slot: slot.clone() }, token)
     }
 }
 
 impl Drop for CallCancelRegistration {
     fn drop(&mut self) {
-        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        self.slot.lock().unwrap_or_else(|p| p.into_inner()).active = None;
+    }
+}
+
+struct ForceResetCancellation {
+    slot: CallCancelSlot,
+}
+
+impl ForceResetCancellation {
+    fn begin(slot: &CallCancelSlot) -> Self {
+        let mut state = slot.lock().unwrap_or_else(|p| p.into_inner());
+        state.force_resets += 1;
+        if let Some(token) = &state.active {
+            token.cancel();
+        }
+        Self { slot: slot.clone() }
+    }
+}
+
+impl Drop for ForceResetCancellation {
+    fn drop(&mut self) {
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .force_resets -= 1;
     }
 }
 
@@ -502,12 +536,11 @@ impl App {
         let state = self.servers.get(server).ok_or_else(|| {
             Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
         })?;
-        if matches!(operation, Operation::Reset { force: true, .. })
-            && let Some(slot) = self.call_cancels.get(server)
-            && let Some(token) = slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
-        {
-            token.cancel();
-        }
+        let _force_reset = if matches!(operation, Operation::Reset { force: true, .. }) {
+            Some(ForceResetCancellation::begin(&self.call_cancels[server]))
+        } else {
+            None
+        };
         let mut state = match timeout_at(deadline, state.lock()).await {
             Ok(guard) => guard,
             Err(_) => {
@@ -1257,7 +1290,7 @@ pub async fn run_with_options(
         .config
         .servers
         .keys()
-        .map(|name| (name.clone(), Arc::new(std::sync::Mutex::new(None))))
+        .map(|name| (name.clone(), CallCancelSlot::default()))
         .collect();
     let app = Arc::new(App {
         paths: paths.clone(),
@@ -1691,7 +1724,7 @@ mod tests {
             state: State::fresh(),
             options: DaemonOptions::default(),
             servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
-            call_cancels: BTreeMap::from([("srv".into(), Arc::new(std::sync::Mutex::new(None)))]),
+            call_cancels: BTreeMap::from([("srv".into(), CallCancelSlot::default())]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
             shutdown: CancellationToken::new(),
@@ -1870,7 +1903,7 @@ mod tests {
             state: State::fresh(),
             options: DaemonOptions::default(),
             servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
-            call_cancels: BTreeMap::from([("srv".into(), Arc::new(std::sync::Mutex::new(None)))]),
+            call_cancels: BTreeMap::from([("srv".into(), CallCancelSlot::default())]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
             shutdown: CancellationToken::new(),
@@ -2434,6 +2467,132 @@ mod tests {
     }
 
     #[test]
+    fn force_reset_cancellation_survives_another_reset_finishing() {
+        let slot = CallCancelSlot::default();
+        let (active, token) = CallCancelRegistration::register(&slot);
+        let first = ForceResetCancellation::begin(&slot);
+        let second = ForceResetCancellation::begin(&slot);
+        assert!(token.is_cancelled());
+        drop(active);
+        drop(first);
+        let (queued, token) = CallCancelRegistration::register(&slot);
+        assert!(token.is_cancelled());
+        drop(queued);
+        drop(second);
+        let (_fresh, token) = CallCancelRegistration::register(&slot);
+        assert!(!token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn force_reset_cancels_call_already_queued_behind_active_call() {
+        let (url, server_task) = start_mock_progress_http_server().await;
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_vec(&json!({
+                "servers": {"mock": {"transport": "http", "url": url}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "resetqueue", &base_path.join("run")).unwrap();
+        let app = App {
+            paths,
+            config,
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([(
+                "mock".into(),
+                Arc::new(Mutex::new(ServerState::default())),
+            )]),
+            call_cancels: BTreeMap::from([("mock".into(), CallCancelSlot::default())]),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            shutdown: CancellationToken::new(),
+        };
+        let deadlines = ExecuteDeadlines {
+            pre_dispatch: Instant::now() + Duration::from_secs(10),
+            call_idle: Duration::from_secs(10),
+            call_hard: None,
+        };
+        let operation = Operation::Call {
+            server: "mock".into(),
+            tool: "progress_forever".into(),
+            arguments: serde_json::Map::new(),
+            inline_media: true,
+        };
+        let active_dispatched = AtomicBool::new(false);
+        let active = app.execute(&operation, deadlines, &active_dispatched);
+        tokio::pin!(active);
+        timeout(
+            Duration::from_secs(5),
+            std::future::poll_fn(|cx| {
+                assert!(active.as_mut().poll(cx).is_pending());
+                if active_dispatched.load(Ordering::Acquire) {
+                    std::task::Poll::Ready(())
+                } else {
+                    std::task::Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let queued_dispatched = AtomicBool::new(false);
+        let queued = app.execute(&operation, deadlines, &queued_dispatched);
+        tokio::pin!(queued);
+        assert!(futures_util::poll!(&mut queued).is_pending());
+        let reset_operation = Operation::Reset {
+            server: "mock".into(),
+            force: true,
+        };
+        let reset_dispatched = AtomicBool::new(false);
+        let reset = app.execute(&reset_operation, deadlines, &reset_dispatched);
+        tokio::pin!(reset);
+        assert!(futures_util::poll!(&mut reset).is_pending());
+
+        let (active_result, queued_result, reset_result) = timeout(Duration::from_secs(3), async {
+            tokio::join!(&mut active, &mut queued, &mut reset)
+        })
+        .await
+        .expect("force reset must not wait for the queued call to run");
+        let active_error = active_result.err().unwrap();
+        assert_eq!(active_error.kind, "cancelled");
+        assert!(active_error.outcome_unknown);
+        let queued_error = queued_result.err().unwrap();
+        assert_eq!(queued_error.kind, "cancelled");
+        assert!(!queued_error.outcome_unknown);
+        assert!(!queued_dispatched.load(Ordering::Acquire));
+        assert_eq!(reset_result.unwrap().0["reset"], true);
+
+        let fresh_operation = Operation::Call {
+            server: "mock".into(),
+            tool: "progress_ok".into(),
+            arguments: json!({"interval_ms": 10, "steps": 1})
+                .as_object()
+                .unwrap()
+                .clone(),
+            inline_media: true,
+        };
+        let fresh_dispatched = AtomicBool::new(false);
+        let (value, _, _) = app
+            .execute(&fresh_operation, deadlines, &fresh_dispatched)
+            .await
+            .unwrap();
+        assert_eq!(value["content"][0]["text"], "completed");
+        let mut state = app.servers["mock"].lock().await;
+        state.connection.as_mut().unwrap().close().await.unwrap();
+        server_task.abort();
+    }
+
+    #[test]
     fn disabled_server_reports_disabled_status_and_fails_validate() {
         #[cfg(unix)]
         let base = tempfile::tempdir_in("/tmp").unwrap();
@@ -2465,8 +2624,8 @@ mod tests {
                 ("off".into(), Arc::new(Mutex::new(ServerState::default()))),
             ]),
             call_cancels: BTreeMap::from([
-                ("on".into(), Arc::new(std::sync::Mutex::new(None))),
-                ("off".into(), Arc::new(std::sync::Mutex::new(None))),
+                ("on".into(), CallCancelSlot::default()),
+                ("off".into(), CallCancelSlot::default()),
             ]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
