@@ -1242,6 +1242,61 @@ done
     }
 
     #[cfg(windows)]
+    const ONESHOT_STDIN_HELPER: &str = "events_exec::tests::windows_oneshot_stdin_helper_entry";
+    #[cfg(windows)]
+    const ONESHOT_FAILURE_HELPER: &str = "events_exec::tests::windows_oneshot_failure_helper_entry";
+
+    #[cfg(windows)]
+    fn selected_helper(name: &str) -> bool {
+        std::env::args_os().any(|arg| arg == "--exact")
+            && std::env::args_os().any(|arg| arg == name)
+    }
+
+    #[cfg(windows)]
+    fn native_callback_argv(name: &str) -> Vec<String> {
+        vec![
+            std::env::current_exe()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            "--exact".to_owned(),
+            name.to_owned(),
+            "--nocapture".to_owned(),
+            "--test-threads=1".to_owned(),
+        ]
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_oneshot_stdin_helper_entry() {
+        if !selected_helper(ONESHOT_STDIN_HELPER) {
+            return;
+        }
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        assert_eq!(
+            input,
+            concat!(r#"{"eventId":"win-1","data":{"ok":true}}"#, "\n")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_oneshot_failure_helper_entry() {
+        if !selected_helper(ONESHOT_FAILURE_HELPER) {
+            return;
+        }
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input).unwrap();
+        assert_eq!(input, concat!(r#"{"id":1}"#, "\n"));
+        let mut stderr = std::io::stderr().lock();
+        writeln!(stderr, "win fatal").unwrap();
+        stderr.flush().unwrap();
+        std::process::exit(7);
+    }
+
+    #[cfg(windows)]
     fn ps(script: &str) -> Vec<String> {
         vec![
             "powershell.exe".to_owned(),
@@ -1269,11 +1324,6 @@ done
         const WORKER_HELPER: &str =
             "events_exec::tests::callback_tree_tests::windows_callback_worker_helper_entry";
         const WORKER_PID_PREFIX: &str = "mcpcli-callback-worker:";
-
-        fn selected_helper(name: &str) -> bool {
-            std::env::args_os().any(|arg| arg == "--exact")
-                && std::env::args_os().any(|arg| arg == name)
-        }
 
         #[test]
         fn windows_callback_parent_helper_entry() {
@@ -1359,17 +1409,7 @@ done
         }
 
         async fn start_callback(mode: ExecMode) -> (ProcessTree, Worker) {
-            let argv = vec![
-                std::env::current_exe()
-                    .unwrap()
-                    .to_str()
-                    .unwrap()
-                    .to_owned(),
-                "--exact".to_owned(),
-                PARENT_HELPER.to_owned(),
-                "--nocapture".to_owned(),
-                "--test-threads=1".to_owned(),
-            ];
+            let argv = native_callback_argv(PARENT_HELPER);
             let mut tree = ProcessTree::spawn(&argv, mode).unwrap();
             let mut stderr =
                 BufReader::new(tree.take_stderr().expect("piped callback stderr")).lines();
@@ -1423,28 +1463,26 @@ done
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_oneshot_succeeds_and_delivers_json_over_stdin() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("event.json");
-        let script = format!(
-            "[System.IO.File]::WriteAllText('{}', [Console]::In.ReadToEnd())",
-            out.display()
-        );
-        let mut exec =
-            CallbackExecutor::new(ps(&script), ExecMode::Oneshot, Duration::from_secs(15)).unwrap();
+        let mut exec = CallbackExecutor::new(
+            native_callback_argv(ONESHOT_STDIN_HELPER),
+            ExecMode::Oneshot,
+            Duration::from_secs(15),
+        )
+        .unwrap();
 
         let payload = r#"{"eventId":"win-1","data":{"ok":true}}"#;
         exec.deliver(payload).await.unwrap();
-        let saved = std::fs::read_to_string(&out).unwrap();
-        assert_eq!(saved.trim(), payload);
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_oneshot_non_zero_exit_captures_exit_code_and_stderr() {
-        let script =
-            "[void][Console]::In.ReadToEnd(); [Console]::Error.WriteLine('win fatal'); exit 7";
-        let mut exec =
-            CallbackExecutor::new(ps(script), ExecMode::Oneshot, Duration::from_secs(15)).unwrap();
+        let mut exec = CallbackExecutor::new(
+            native_callback_argv(ONESHOT_FAILURE_HELPER),
+            ExecMode::Oneshot,
+            Duration::from_secs(15),
+        )
+        .unwrap();
 
         let err = exec.deliver(r#"{"id":1}"#).await.unwrap_err();
         match err {
