@@ -635,6 +635,21 @@ impl Drop for CancelOnDropGuard {
     }
 }
 
+async fn attach_stderr_tail(
+    mut error: anyhow::Error,
+    capture: Option<&Arc<StderrCapture>>,
+    is_closed: bool,
+) -> anyhow::Error {
+    if let Some(capture) = capture
+        && let Some(failure) = error.downcast_mut::<McpFailure>()
+        && failure.stderr_tail.is_none()
+        && (failure.kind == FailureKind::Transport || is_closed)
+    {
+        failure.stderr_tail = capture.snapshot_tail(STDERR_SNAPSHOT_WAIT).await;
+    }
+    error
+}
+
 async fn attach_stderr_tail_and_abort(
     mut error: anyhow::Error,
     capture: Option<Arc<StderrCapture>>,
@@ -966,15 +981,8 @@ impl McpConnection {
         Ok(Leased::new(value, lease))
     }
 
-    async fn attach_stderr_tail(&self, mut error: anyhow::Error) -> anyhow::Error {
-        if let Some(capture) = &self.stderr_capture
-            && let Some(failure) = error.downcast_mut::<McpFailure>()
-            && failure.stderr_tail.is_none()
-            && (failure.kind == FailureKind::Transport || self.is_closed())
-        {
-            failure.stderr_tail = capture.snapshot_tail(STDERR_SNAPSHOT_WAIT).await;
-        }
-        error
+    async fn attach_stderr_tail(&self, error: anyhow::Error) -> anyhow::Error {
+        attach_stderr_tail(error, self.stderr_capture.as_ref(), self.is_closed()).await
     }
 
     pub async fn list_tools(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
@@ -1435,6 +1443,7 @@ impl McpConnection {
             event_router: self.event_router.clone(),
             event_schemas: self.event_schemas.clone(),
             termination: self.termination.clone(),
+            stderr_capture: self.stderr_capture.clone(),
             limits: self.limits.clone(),
             http: self.http,
         }
@@ -1546,6 +1555,7 @@ pub struct McpEventsClient {
     event_router: EventRouter,
     event_schemas: EventSchemaCache,
     termination: Arc<TransportTermination>,
+    stderr_capture: Option<Arc<StderrCapture>>,
     limits: McpLimits,
     http: bool,
 }
@@ -1637,6 +1647,10 @@ impl McpEventsClient {
         self.termination.is_terminated() || self.peer.is_transport_closed()
     }
 
+    async fn attach_stderr_tail(&self, error: anyhow::Error) -> anyhow::Error {
+        attach_stderr_tail(error, self.stderr_capture.as_ref(), self.is_closed()).await
+    }
+
     pub fn supports_events(&self) -> bool {
         self.check_events_support().is_ok()
     }
@@ -1649,7 +1663,9 @@ impl McpEventsClient {
         self.check_events_support()?;
         if self.termination.is_terminated() {
             self.abort_service();
-            return Err(self.termination.failure(false));
+            return Err(self
+                .attach_stderr_tail(self.termination.failure(false))
+                .await);
         }
         self.termination.clear_transient();
         let listing = async {
@@ -1780,9 +1796,13 @@ impl McpEventsClient {
                 "Event catalog exceeds the 100-page pagination limit",
             ))
         };
-        timeout(budget, listing)
+        let result = timeout(budget, listing)
             .await
-            .map_err(|_| failure(FailureKind::Timeout, "Event discovery timed out"))?
+            .map_err(|_| failure(FailureKind::Timeout, "Event discovery timed out"))?;
+        match result {
+            Ok(events) => Ok(events),
+            Err(error) => Err(self.attach_stderr_tail(error).await),
+        }
     }
 
     pub async fn poll_events(
@@ -1793,7 +1813,9 @@ impl McpEventsClient {
         self.check_events_support()?;
         if self.termination.is_terminated() {
             self.abort_service();
-            return Err(self.termination.failure(false));
+            return Err(self
+                .attach_stderr_tail(self.termination.failure(false))
+                .await);
         }
         let started = tokio::time::Instant::now();
         self.termination.clear_transient();
@@ -1851,7 +1873,7 @@ impl McpEventsClient {
                     continue;
                 }
                 Err(error) => {
-                    return Err(self.service_failure(error));
+                    return Err(self.attach_stderr_tail(self.service_failure(error)).await);
                 }
             }
         }
@@ -1877,7 +1899,9 @@ impl McpEventsClient {
         self.check_events_support()?;
         if self.termination.is_terminated() {
             self.abort_service();
-            return Err(self.termination.failure(false));
+            return Err(self
+                .attach_stderr_tail(self.termination.failure(false))
+                .await);
         }
         let started = tokio::time::Instant::now();
         self.termination.clear_transient();
@@ -1888,14 +1912,17 @@ impl McpEventsClient {
             }
             let (request, request_lease) =
                 self.event_request("events/stream", &params)?.into_parts();
-            let mut handle = timeout(
+            let mut handle = match timeout(
                 remaining,
                 self.peer
                     .send_cancellable_request(request, PeerRequestOptions::no_options()),
             )
             .await
             .map_err(|_| failure(FailureKind::Timeout, "Event stream open timed out"))?
-            .map_err(|e| self.service_failure(e))?;
+            {
+                Ok(handle) => handle,
+                Err(e) => return Err(self.attach_stderr_tail(self.service_failure(e)).await),
+            };
             drop(request_lease);
             let id = handle.id.clone();
             let (_, empty_response) = tokio::sync::oneshot::channel();
@@ -1926,7 +1953,7 @@ impl McpEventsClient {
                         "Timed out waiting for event stream start",
                     ));
                 }
-                Ok(Err(err)) => return Err(err),
+                Ok(Err(err)) => return Err(self.attach_stderr_tail(err).await),
                 Ok(Ok(EitherStreamStart::Notification(first))) => {
                     return Ok((stream_handle, EventStreamReceiver::new(Some(first), rx)));
                 }
@@ -1939,11 +1966,17 @@ impl McpEventsClient {
                         let _ = self.list_events(refresh_budget).await?;
                         continue;
                     }
-                    Ok(Err(err)) => return Err(self.service_failure(err)),
+                    Ok(Err(err)) => {
+                        return Err(self.attach_stderr_tail(self.service_failure(err)).await);
+                    }
                     Ok(Ok(_)) => {
                         return Ok((stream_handle, EventStreamReceiver::new(None, rx)));
                     }
-                    Err(_) => return Err(self.termination.failure(false)),
+                    Err(_) => {
+                        return Err(self
+                            .attach_stderr_tail(self.termination.failure(false))
+                            .await);
+                    }
                 },
             }
         }
@@ -4260,6 +4293,7 @@ mod event_lifecycle_tests {
                 event_router: router,
                 event_schemas: EventSchemaCache::default(),
                 termination,
+                stderr_capture: None,
                 limits: McpLimits {
                     budget,
                     ..McpLimits::default()
@@ -4742,5 +4776,83 @@ mod stderr_capture_tests {
         grand_capture.abort();
         assert_eq!(budget.used(), 0);
         grand_transport.shutdown().await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_events_list_failure_surfaces_stderr_tail_and_close_releases_lease() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "server/discover":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/events": {"listChanged": False}
+                    }
+                },
+                "ttlMs": 60000,
+                "cacheScope": "public",
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "events-crash",
+                        "version": "0.1.0"
+                    }
+                }
+            }
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "events/list":
+        sys.stderr.write("events_list_boom_stderr\n")
+        sys.stderr.flush()
+        sys.exit(1)
+"#;
+        let config = ServerConfig::Stdio {
+            command: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            description: None,
+            enabled: true,
+            timeout: None,
+        };
+        let budget = ByteBudget::new(1024 * 1024);
+        let limits = McpLimits {
+            budget: budget.clone(),
+            ..McpLimits::default()
+        };
+        let mut conn = McpConnection::connect_with_limits(&config, Duration::from_secs(5), limits)
+            .await
+            .expect("connect to stdio events server");
+        let events_client = conn.events_client();
+        let err = events_client
+            .list_events(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        let failure = err
+            .downcast_ref::<McpFailure>()
+            .expect("expected McpFailure");
+        assert_eq!(failure.kind, FailureKind::Transport);
+        assert!(
+            failure
+                .stderr_tail
+                .as_deref()
+                .is_some_and(|tail| tail.contains("events_list_boom_stderr")),
+            "expected stderr_tail to contain crash diagnostic, got {:?}",
+            failure.stderr_tail
+        );
+        let _ = conn.close().await;
+        drop(conn);
+        // ByteLease must already be released even while a cloned McpEventsClient is still alive.
+        assert_eq!(budget.used(), 0);
+        drop(events_client);
     }
 }

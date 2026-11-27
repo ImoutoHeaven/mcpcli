@@ -837,12 +837,7 @@ async fn remote(
             "deadline elapsed while starting the daemon; tool was not dispatched",
         )
     })??;
-    let elapsed = started.elapsed();
-    let remaining = budget.saturating_sub(elapsed);
-    let remaining_hard = hard.map(|h| h.saturating_sub(elapsed));
-    if remaining.is_zero() || remaining_hard.is_some_and(|d| d.is_zero()) {
-        return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
-    }
+    let (remaining, remaining_hard) = check_dispatch_budgets(budget, hard, started.elapsed())?;
     let (input_lease, operation) = {
         let (operation, lease) = operation.into_parts();
         (lease, operation)
@@ -867,6 +862,25 @@ async fn remote(
         inflight: None,
         lease: Some(response_lease),
     })
+}
+
+fn check_dispatch_budgets(
+    budget: Duration,
+    hard: Option<Duration>,
+    elapsed: Duration,
+) -> std::result::Result<(Duration, Option<Duration>), Failure> {
+    let remaining = budget.saturating_sub(elapsed);
+    let remaining_hard = hard.map(|h| h.saturating_sub(elapsed));
+    if remaining < Duration::from_millis(1)
+        || remaining_hard.is_some_and(|d| d < Duration::from_millis(1))
+    {
+        return Err(Failure::new(
+            5,
+            "timeout",
+            "deadline elapsed before dispatch",
+        ));
+    }
+    Ok((remaining, remaining_hard))
 }
 
 struct ServerView<'a> {
@@ -2899,5 +2913,40 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn sub_millisecond_dispatch_budget_returns_exit_5_timeout() {
+        let err = check_dispatch_budgets(
+            Duration::from_millis(1000),
+            None,
+            Duration::from_micros(999_500),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, 5);
+        assert_eq!(err.kind, "timeout");
+
+        let hard_err = check_dispatch_budgets(
+            Duration::from_secs(5),
+            Some(Duration::from_millis(1000)),
+            Duration::from_micros(999_999),
+        )
+        .unwrap_err();
+        assert_eq!(hard_err.code, 5);
+        assert_eq!(hard_err.kind, "timeout");
+
+        let zero_err = check_dispatch_budgets(Duration::from_secs(1), None, Duration::from_secs(2))
+            .unwrap_err();
+        assert_eq!(zero_err.code, 5);
+        assert_eq!(zero_err.kind, "timeout");
+
+        let (rem, rem_hard) = check_dispatch_budgets(
+            Duration::from_millis(1000),
+            Some(Duration::from_millis(2000)),
+            Duration::from_millis(999),
+        )
+        .unwrap();
+        assert_eq!(rem, Duration::from_millis(1));
+        assert_eq!(rem_hard, Some(Duration::from_millis(1001)));
     }
 }

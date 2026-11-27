@@ -307,12 +307,28 @@ struct LimitedVecWriter {
 }
 
 impl LimitedVecWriter {
+    fn memory_limit_msg(prefix: usize) -> &'static str {
+        if prefix == 4 {
+            "IPC frame exceeded active memory limit"
+        } else {
+            "JSON payload exceeded active memory limit"
+        }
+    }
+
+    fn size_limit_msg(prefix: usize) -> &'static str {
+        if prefix == 4 {
+            "IPC response exceeds frame limit"
+        } else {
+            "JSON payload exceeds size limit"
+        }
+    }
+
     fn new(max: usize, budget: &Arc<ByteBudget>, prefix: usize) -> io::Result<Self> {
         let mut lease = budget.empty_lease();
         if !lease.try_grow(prefix) {
             return Err(io::Error::new(
                 io::ErrorKind::OutOfMemory,
-                "IPC frame exceeded active memory limit",
+                Self::memory_limit_msg(prefix),
             ));
         }
         Ok(Self {
@@ -334,7 +350,7 @@ impl LimitedVecWriter {
             self.lease.release();
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "IPC response exceeds frame limit",
+                Self::size_limit_msg(self.prefix),
             ));
         }
         self.lease.shrink_to(self.buf.capacity());
@@ -350,26 +366,16 @@ impl io::Write for LimitedVecWriter {
         let Some(payload_len) = (self.buf.len() - self.prefix).checked_add(bytes.len()) else {
             self.buf = Vec::new();
             self.lease.release();
-            self.abort = Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC response exceeds frame limit",
-            ));
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC response exceeds frame limit",
-            ));
+            let msg = Self::size_limit_msg(self.prefix);
+            self.abort = Some(io::Error::new(io::ErrorKind::InvalidData, msg));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
         };
         if payload_len > self.max || payload_len > u32::MAX as usize {
             self.buf = Vec::new();
             self.lease.release();
-            self.abort = Some(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC response exceeds frame limit",
-            ));
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "IPC response exceeds frame limit",
-            ));
+            let msg = Self::size_limit_msg(self.prefix);
+            self.abort = Some(io::Error::new(io::ErrorKind::InvalidData, msg));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, msg));
         }
         let needed = self.prefix + payload_len;
         if !self
@@ -378,14 +384,9 @@ impl io::Write for LimitedVecWriter {
         {
             self.buf = Vec::new();
             self.lease.release();
-            self.abort = Some(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "IPC frame exceeded active memory limit",
-            ));
-            return Err(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "IPC frame exceeded active memory limit",
-            ));
+            let msg = Self::memory_limit_msg(self.prefix);
+            self.abort = Some(io::Error::new(io::ErrorKind::OutOfMemory, msg));
+            return Err(io::Error::new(io::ErrorKind::OutOfMemory, msg));
         }
         self.buf.extend_from_slice(bytes);
         Ok(bytes.len())
@@ -654,5 +655,34 @@ mod tests {
     fn caps_input() {
         assert!(read_limited(&b"abcd"[..], 3).is_err());
         assert_eq!(read_limited(&b"abc"[..], 3).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn encode_json_leased_uses_json_payload_messages_while_ipc_prefix_keeps_ipc_messages() {
+        let budget = ByteBudget::new(1024);
+        let size_err = encode_json_leased(&"hello", 4, &budget).unwrap_err();
+        assert_eq!(size_err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(size_err.to_string(), "JSON payload exceeds size limit");
+        assert_eq!(budget.used(), 0);
+
+        let tiny = ByteBudget::new(4);
+        let mem_err = encode_json_leased(&"hello", 64, &tiny).unwrap_err();
+        assert_eq!(mem_err.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            mem_err.to_string(),
+            "JSON payload exceeded active memory limit"
+        );
+        assert_eq!(tiny.used(), 0);
+
+        let ipc_size_err = encode_leased(&"hello", 4, &budget, 4).unwrap_err();
+        assert_eq!(ipc_size_err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(ipc_size_err.to_string(), "IPC response exceeds frame limit");
+
+        let ipc_mem_err = encode_leased(&"hello", 64, &tiny, 4).unwrap_err();
+        assert_eq!(ipc_mem_err.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(
+            ipc_mem_err.to_string(),
+            "IPC frame exceeded active memory limit"
+        );
     }
 }
