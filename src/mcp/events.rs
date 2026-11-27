@@ -584,6 +584,56 @@ pub(super) fn encode_header_value(value: &str) -> String {
     }
 }
 
+pub(super) fn routing_header_payload_bound(
+    name: &str,
+    arguments: Option<&Map<String, Value>>,
+    schema: Option<&Map<String, Value>>,
+) -> usize {
+    fn encoded_len(bytes: usize) -> usize {
+        bytes.div_ceil(3).saturating_mul(4).saturating_add(10)
+    }
+    fn properties(schema: &Map<String, Value>, arguments: &Map<String, Value>) -> usize {
+        let Some(fields) = schema.get("properties").and_then(Value::as_object) else {
+            return 0;
+        };
+        let mut total = 0usize;
+        for (key, field) in fields {
+            let Some(value) = arguments.get(key) else {
+                continue;
+            };
+            if let Some(header) = field.get("x-mcp-header").and_then(Value::as_str) {
+                let bytes = match value {
+                    Value::String(value) => Some(value.len()),
+                    Value::Number(_) => {
+                        Some(crate::json::serialized_len(value).unwrap_or(usize::MAX))
+                    }
+                    Value::Bool(value) => Some(if *value { 4 } else { 5 }),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    total = total
+                        .saturating_add(encoded_len(bytes))
+                        .saturating_add("Mcp-Param-".len())
+                        .saturating_add(header.len());
+                }
+            }
+            if let Some(arguments) = value.as_object()
+                && let Some(schema) = field.as_object()
+            {
+                total = total.saturating_add(properties(schema, arguments));
+            }
+        }
+        total
+    }
+    encoded_len(name.len())
+        .saturating_add("Mcp-Name".len())
+        .saturating_add(
+            schema
+                .zip(arguments)
+                .map_or(0, |(schema, arguments)| properties(schema, arguments)),
+        )
+}
+
 fn is_tchar(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || matches!(
@@ -727,16 +777,30 @@ pub(super) fn event_request_headers(
     method: &str,
     params: Option<&Value>,
     schemas: &EventSchemaCache,
-) -> Vec<(HeaderName, HeaderValue)> {
+    budget: &Arc<ByteBudget>,
+) -> Option<Leased<Vec<(HeaderName, HeaderValue)>>> {
+    let empty = || Some(Leased::new(Vec::new(), budget.empty_lease()));
     if !matches!(method, "events/poll" | "events/stream") {
-        return Vec::new();
+        return empty();
     }
     let Some(params) = params else {
-        return Vec::new();
+        return empty();
     };
     let Some(name) = params.get("name").and_then(Value::as_str) else {
-        return Vec::new();
+        return empty();
     };
+    let guard = schemas.read().ok();
+    let schema = guard
+        .as_ref()
+        .and_then(|guard| guard.as_ref())
+        .and_then(|schemas| schemas.get(name));
+    let header_bytes = routing_header_payload_bound(
+        name,
+        params.get("arguments").and_then(Value::as_object),
+        schema,
+    );
+    // Cover primitive copies, base64 temporaries, and retained request headers.
+    let lease = budget.try_acquire(header_bytes.saturating_mul(5))?;
     let mut out = Vec::new();
     let mut push = |header_name: &str, value: &str| {
         if let (Ok(k), Ok(v)) = (
@@ -749,8 +813,7 @@ pub(super) fn event_request_headers(
     push(HEADER_MCP_NAME, &encode_header_value(name));
 
     if let Some(arguments) = params.get("arguments")
-        && let Ok(guard) = schemas.read()
-        && let Some(schema) = guard.as_ref().and_then(|schemas| schemas.get(name))
+        && let Some(schema) = schema
     {
         for annotation in property_annotations(schema) {
             let Value::String(header) = annotation.header else {
@@ -771,7 +834,7 @@ pub(super) fn event_request_headers(
             push(&format!("{HEADER_MCP_PARAM_PREFIX}{header}"), &encoded);
         }
     }
-    out
+    Some(Leased::new(out, lease))
 }
 
 #[cfg(test)]
@@ -1076,27 +1139,76 @@ mod tests {
                 "nested": { "count": 42, "active": true }
             }
         });
-        let headers: HashMap<String, String> =
-            event_request_headers("events/stream", Some(&params), &cache)
-                .into_iter()
-                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap().to_owned()))
-                .collect();
+        let budget = ByteBudget::new(4096);
+        let headers =
+            event_request_headers("events/stream", Some(&params), &cache, &budget).unwrap();
+        assert!(budget.used() > 0);
+        let observed: HashMap<String, String> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap().to_owned()))
+            .collect();
+        drop(headers);
+        assert_eq!(budget.used(), 0);
         assert_eq!(
-            headers.get("mcp-name").map(String::as_str),
+            observed.get("mcp-name").map(String::as_str),
             Some("pr.merged")
         );
         assert_eq!(
-            headers.get("mcp-param-repo").map(String::as_str),
+            observed.get("mcp-param-repo").map(String::as_str),
             Some("org/app")
         );
         assert_eq!(
-            headers.get("mcp-param-count").map(String::as_str),
+            observed.get("mcp-param-count").map(String::as_str),
             Some("42")
         );
         assert_eq!(
-            headers.get("mcp-param-active").map(String::as_str),
+            observed.get("mcp-param-active").map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn event_headers_reserve_budget_and_release_encoded_values() {
+        let schema = serde_json::from_value(json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "x-mcp-header": "Repo" }
+            }
+        }))
+        .unwrap();
+        let cache = Arc::new(RwLock::new(Some(Leased::new(
+            HashMap::from([("事件".into(), schema)]),
+            ByteBudget::new(0).empty_lease(),
+        ))));
+        let params = json!({"name": "事件", "arguments": {"repo": " leading"}});
+        let small = ByteBudget::new(1);
+        assert!(event_request_headers("events/poll", Some(&params), &cache, &small).is_none());
+        assert_eq!(small.used(), 0);
+
+        let budget = ByteBudget::new(4096);
+        let prior = budget.try_acquire(8).unwrap();
+        let headers = event_request_headers("events/poll", Some(&params), &cache, &budget).unwrap();
+        assert!(budget.used() > prior.bytes());
+        assert_eq!(headers[0].1, "=?base64?5LqL5Lu2?=");
+        assert_eq!(headers[1].0, "mcp-param-repo");
+        assert_eq!(headers[1].1, "=?base64?IGxlYWRpbmc=?=");
+        drop(headers);
+        assert_eq!(budget.used(), prior.bytes());
+        drop(prior);
+        assert_eq!(budget.used(), 0);
+
+        let no_schema = EventSchemaCache::default();
+        let headers =
+            event_request_headers("events/stream", Some(&params), &no_schema, &budget).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].1, "=?base64?5LqL5Lu2?=");
+        drop(headers);
+        assert_eq!(budget.used(), 0);
+        for (method, params) in [("events/list", Some(&params)), ("events/poll", None)] {
+            let headers = event_request_headers(method, params, &cache, &small).unwrap();
+            assert!(headers.is_empty());
+            assert_eq!(small.used(), 0);
+        }
     }
 
     #[tokio::test]

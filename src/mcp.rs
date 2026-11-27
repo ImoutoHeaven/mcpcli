@@ -1270,8 +1270,9 @@ impl McpConnection {
                 .filter_map(|page| page.get("tools").and_then(Value::as_array))
                 .flatten()
                 .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-                .and_then(|tool| tool.get("inputSchema"));
-            call_header_payload_bound(name, arguments, schema)
+                .and_then(|tool| tool.get("inputSchema"))
+                .and_then(Value::as_object);
+            events::routing_header_payload_bound(name, Some(arguments), schema)
         } else {
             0
         };
@@ -2047,48 +2048,6 @@ fn encode_mcp_message(
     })
 }
 
-fn call_header_payload_bound(
-    name: &str,
-    arguments: &Map<String, Value>,
-    schema: Option<&Value>,
-) -> usize {
-    fn encoded_len(bytes: usize) -> usize {
-        bytes.div_ceil(3).saturating_mul(4).saturating_add(10)
-    }
-    fn properties(schema: &Value, arguments: &Map<String, Value>) -> usize {
-        let Some(fields) = schema.get("properties").and_then(Value::as_object) else {
-            return 0;
-        };
-        let mut total = 0usize;
-        for (key, field) in fields {
-            let Some(value) = arguments.get(key) else {
-                continue;
-            };
-            if let Some(header) = field.get("x-mcp-header").and_then(Value::as_str) {
-                let bytes = match value {
-                    Value::String(value) => Some(value.len()),
-                    Value::Number(value) => Some(value.to_string().len()),
-                    Value::Bool(value) => Some(if *value { 4 } else { 5 }),
-                    _ => None,
-                };
-                if let Some(bytes) = bytes {
-                    total = total
-                        .saturating_add(encoded_len(bytes))
-                        .saturating_add("Mcp-Param-".len())
-                        .saturating_add(header.len());
-                }
-            }
-            if let Some(arguments) = value.as_object() {
-                total = total.saturating_add(properties(field, arguments));
-            }
-        }
-        total
-    }
-    encoded_len(name.len())
-        .saturating_add("Mcp-Name".len())
-        .saturating_add(schema.map_or(0, |schema| properties(schema, arguments)))
-}
-
 fn has_media_type(content_type: &str, expected: &str) -> bool {
     let essence = content_type
         .split_once(';')
@@ -2761,17 +2720,30 @@ impl BoundedHttp {
             &message,
             ClientJsonRpcMessage::Request(request) if request.request.method() == "events/stream"
         );
-        let event_headers = match &message {
-            ClientJsonRpcMessage::Request(request) => match &request.request {
-                ClientRequest::CustomRequest(custom) => events::event_request_headers(
-                    &custom.method,
-                    custom.params.as_ref(),
-                    &self.event_schemas,
-                ),
-                _ => Vec::new(),
-            },
-            _ => Vec::new(),
-        };
+        let event_headers = if let ClientJsonRpcMessage::Request(request) = &message
+            && let ClientRequest::CustomRequest(custom) = &request.request
+        {
+            events::event_request_headers(
+                &custom.method,
+                custom.params.as_ref(),
+                &self.event_schemas,
+                &self.budget,
+            )
+        } else {
+            Some(Leased::new(Vec::new(), self.budget.empty_lease()))
+        }
+        .ok_or_else(|| {
+            let message = format!(
+                "MCP event headers exceeded the {} active memory limit",
+                format_bytes(self.budget.limit())
+            );
+            self.termination
+                .terminate(FailureKind::Transport, message.clone());
+            HttpError::Io(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                message,
+            ))
+        })?;
         let discover_id = match &message {
             ClientJsonRpcMessage::Request(request)
                 if !had_session && matches!(request.request, ClientRequest::DiscoverRequest(_)) =>
@@ -2803,7 +2775,7 @@ impl BoundedHttp {
             for (name, value) in &headers {
                 request = request.header(name, value);
             }
-            for (name, value) in &event_headers {
+            for (name, value) in event_headers.iter() {
                 request = request.header(name, value);
             }
             if let Some(session) = &session_id {
@@ -2840,6 +2812,7 @@ impl BoundedHttp {
             dynamic_token = Some(refreshed);
             response = send_post(dynamic_token.as_deref()).await?;
         }
+        drop(event_headers);
         drop(body);
         let status = response.status();
         if status == http::StatusCode::UNAUTHORIZED || status == http::StatusCode::FORBIDDEN {
@@ -3725,6 +3698,128 @@ mod http_tests {
         let body = buf[header_end..header_end + content_len].to_vec();
         buf.drain(..header_end + content_len);
         Some((header_str, body))
+    }
+
+    #[tokio::test]
+    async fn event_http_headers_keep_their_lease_during_send() {
+        let schema = serde_json::from_value(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "repo": { "type": "string", "x-mcp-header": "Repo" }
+            }
+        }))
+        .unwrap();
+        let event_schemas = Arc::new(std::sync::RwLock::new(Some(Leased::new(
+            HashMap::from([("task.exited".into(), schema)]),
+            ByteBudget::new(0).empty_lease(),
+        ))));
+        let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "events/poll",
+            "params": {"name": "task.exited", "arguments": {"repo": " leading"}}
+        }))
+        .unwrap();
+        let mut http = BoundedHttp {
+            client: reqwest::Client::new(),
+            auth_manager: None,
+            cleanup: CleanupState::default(),
+            ingress: Ingress::default(),
+            event_schemas,
+            termination: Arc::new(TransportTermination::default()),
+            max_response_bytes: 4096,
+            budget: ByteBudget::new(16 * 1024),
+        };
+        let encoded = encode_mcp_message(&message, 4096, &http.budget, &http.termination).unwrap();
+        let body_charge = encoded.capacity();
+        drop(encoded);
+
+        for completion in ["accepted", "closed", "cancelled"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (received, observed) = tokio::sync::oneshot::channel();
+            let (finish, wait) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let (headers, _) = read_framed_http(&mut socket, &mut Vec::new())
+                    .await
+                    .unwrap();
+                received.send(headers).unwrap();
+                if wait.await.unwrap_or(false) {
+                    socket
+                        .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            });
+            let sender = http.clone();
+            let request = message.clone();
+            let sent = tokio::spawn(async move {
+                sender
+                    .post(
+                        format!("http://{address}/mcp").into(),
+                        request,
+                        None,
+                        None,
+                        HashMap::new(),
+                        4096,
+                    )
+                    .await
+            });
+            let headers = timeout(Duration::from_secs(5), observed)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(headers.contains("mcp-name: task.exited"));
+            assert!(headers.contains("mcp-param-repo: =?base64?IGxlYWRpbmc=?="));
+            assert!(
+                http.budget.used() > body_charge,
+                "event headers must remain charged while POST waits for its response"
+            );
+            if completion == "cancelled" {
+                sent.abort();
+                assert!(sent.await.unwrap_err().is_cancelled());
+                finish.send(false).unwrap();
+            } else {
+                finish.send(completion == "accepted").unwrap();
+                let result = sent.await.unwrap();
+                if completion == "accepted" {
+                    assert!(matches!(result, Ok(StreamableHttpPostResponse::Accepted)));
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+            server.await.unwrap();
+            assert_eq!(http.budget.used(), 0);
+        }
+
+        http.budget = ByteBudget::new(1);
+        let error = http
+            .post(
+                "http://127.0.0.1:1/mcp".into(),
+                message,
+                None,
+                None,
+                HashMap::new(),
+                4096,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HttpError::Io(ref error) if error.kind() == std::io::ErrorKind::OutOfMemory
+        ));
+        assert!(error.to_string().contains("event headers"));
+        assert!(http.termination.is_terminated());
+        assert_eq!(
+            http.termination
+                .failure(false)
+                .downcast_ref::<McpFailure>()
+                .unwrap()
+                .kind,
+            FailureKind::Transport
+        );
+        assert_eq!(http.budget.used(), 0);
     }
 
     #[tokio::test]
