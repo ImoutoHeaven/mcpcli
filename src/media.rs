@@ -492,14 +492,46 @@ fn gc_locked(
 }
 
 const WRAPPER_KEY_BYTES: usize = "result".len() + "savedMedia".len();
+const SAVED_MEDIA_KEY_BYTES: usize = "savedMedia".len();
 
-fn media_memory_failure(budget: &ByteBudget) -> Failure {
+fn media_memory_failure(budget: &ByteBudget, uncertain: bool) -> Failure {
+    let suffix = if uncertain {
+        "; side effects may have occurred, the call was not retried"
+    } else {
+        ""
+    };
     Failure::new(
         1,
         "memory_limit_exceeded",
-        format!("saving MCP media exceeded the {} active memory limit; side effects may have occurred, the call was not retried",
-            format_bytes(budget.limit())),
-    ).uncertain(true)
+        format!(
+            "saving MCP media exceeded the {} active memory limit{suffix}",
+            format_bytes(budget.limit())
+        ),
+    )
+    .uncertain(uncertain)
+}
+
+fn is_media_resource(res: &serde_json::Map<String, Value>) -> bool {
+    match res.get("blob") {
+        None => false,
+        Some(Value::Null) if res.get("text").is_some_and(Value::is_string) => false,
+        Some(_) => true,
+    }
+}
+
+fn content_has_media(root: &serde_json::Map<String, Value>) -> bool {
+    root.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|block| match block["type"].as_str() {
+                Some("image" | "audio") => block.get("data").is_some(),
+                Some("resource") => block
+                    .get("resource")
+                    .and_then(Value::as_object)
+                    .is_some_and(is_media_resource),
+                _ => false,
+            })
+        })
 }
 
 #[derive(Serialize)]
@@ -598,93 +630,90 @@ impl MediaStore {
         gc_locked(&media_dir, &mut index, now_ms, self.protection_ms)
     }
 
-    pub async fn extract_and_save(
+    async fn prepare_cache_locked(
         &self,
-        result: &mut Value,
-        result_lease: &mut ByteLease,
-        budget: &Arc<ByteBudget>,
-    ) -> std::result::Result<Option<InflightBatch>, Failure> {
-        let mut records_lease = budget
-            .try_acquire(WRAPPER_KEY_BYTES)
-            .ok_or_else(|| media_memory_failure(budget))?;
-        let Some(root) = result.as_object_mut() else {
-            wrap_saved_media(result, Vec::new());
-            result_lease.merge(records_lease);
-            return Ok(None);
+        uncertain: bool,
+    ) -> std::result::Result<(PathBuf, usize, Lock, u64, MediaIndex, u64), Failure> {
+        let suffix = if uncertain {
+            "; side effects may have occurred, the call was not retried"
+        } else {
+            ""
         };
-
-        let is_media_resource = |res: &serde_json::Map<String, Value>| match res.get("blob") {
-            None => false,
-            Some(Value::Null) if res.get("text").is_some_and(Value::is_string) => false,
-            Some(_) => true,
-        };
-        let has_media = root
-            .get("content")
-            .and_then(Value::as_array)
-            .is_some_and(|items| {
-                items.iter().any(|block| match block["type"].as_str() {
-                    Some("image" | "audio") => block.get("data").is_some(),
-                    Some("resource") => block
-                        .get("resource")
-                        .and_then(Value::as_object)
-                        .is_some_and(is_media_resource),
-                    _ => false,
-                })
-            });
-        if !has_media {
-            wrap_saved_media(result, Vec::new());
-            result_lease.merge(records_lease);
-            return Ok(None);
-        }
-
         let media_dir = self.directory().map_err(|error| {
             Failure::new(
                 1,
                 "media_cache",
-                format!("cannot prepare local media cache: {error:#}; side effects may have occurred, the call was not retried"),
+                format!("cannot prepare local media cache: {error:#}{suffix}"),
             )
-            .uncertain(true)
+            .uncertain(uncertain)
         })?;
-        let media_dir_text = media_dir.to_str().ok_or_else(|| Failure::new(1, "media_cache",
-            "local media cache path cannot be represented as UTF-8; side effects may have occurred, the call was not retried").uncertain(true))?;
+        let media_dir_text = media_dir.to_str().ok_or_else(|| {
+            Failure::new(
+                1,
+                "media_cache",
+                format!("local media cache path cannot be represented as UTF-8{suffix}"),
+            )
+            .uncertain(uncertain)
+        })?;
         // ASCII generated filenames fit within 96 bytes. PathBuf joining may
         // double its capacity; reserve before constructing or copying paths.
         let path_bytes = media_dir_text
             .len()
             .saturating_add(1 + 96)
             .saturating_mul(2);
-        let _dir_lock = Lock::acquire(&media_dir.join(".lock"), self.lock_wait)
+        let dir_lock = Lock::acquire(&media_dir.join(".lock"), self.lock_wait)
             .await
             .map_err(|error| {
                 Failure::new(
                     1,
                     "media_cache",
-                    format!("cannot acquire local media cache lock: {error:#}; side effects may have occurred, the call was not retried"),
+                    format!("cannot acquire local media cache lock: {error:#}{suffix}"),
                 )
-                .uncertain(true)
+                .uncertain(uncertain)
             })?;
-
         let now_ms = (self.clock)().map_err(|error| {
             Failure::new(
                 1,
                 "media_cache",
-                format!("cannot read monotonic clock: {error}; side effects may have occurred, the call was not retried"),
+                format!("cannot read monotonic clock: {error}{suffix}"),
             )
-            .uncertain(true)
+            .uncertain(uncertain)
         })?;
         let mut index = load_index(&media_dir).map_err(|error| {
-            Failure::new(1, "media_cache", format!("cannot read media cache index: {error:#}; side effects may have occurred, the call was not retried")).uncertain(true)
+            Failure::new(
+                1,
+                "media_cache",
+                format!("cannot read media cache index: {error:#}{suffix}"),
+            )
+            .uncertain(uncertain)
         })?;
-        let used_bytes = gc_locked(&media_dir, &mut index, now_ms, self.protection_ms).map_err(
-            |error| {
+        let used_bytes =
+            gc_locked(&media_dir, &mut index, now_ms, self.protection_ms).map_err(|error| {
                 Failure::new(
                     1,
                     "media_cache",
-                    format!("media cache cleanup failed: {error:#}; side effects may have occurred, the call was not retried"),
+                    format!("media cache cleanup failed: {error:#}{suffix}"),
                 )
-                .uncertain(true)
-            },
-        )?;
+                .uncertain(uncertain)
+            })?;
+        Ok((media_dir, path_bytes, dir_lock, now_ms, index, used_bytes))
+    }
+
+    async fn extract_content_media(
+        &self,
+        content: &mut [Value],
+        result_lease: &mut ByteLease,
+        records_lease: &mut ByteLease,
+        budget: &Arc<ByteBudget>,
+        uncertain: bool,
+    ) -> std::result::Result<(Vec<Value>, InflightBatch), Failure> {
+        let suffix = if uncertain {
+            "; side effects may have occurred, the call was not retried"
+        } else {
+            ""
+        };
+        let (media_dir, path_bytes, _dir_lock, now_ms, mut index, used_bytes) =
+            self.prepare_cache_locked(uncertain).await?;
 
         let mut created_paths_lease = budget.empty_lease();
         let mut created_paths: Vec<PathBuf> = Vec::new();
@@ -692,12 +721,6 @@ impl MediaStore {
         let pid = std::process::id();
 
         let outcome = (|| -> std::result::Result<(Vec<Value>, InflightBatch), Failure> {
-            let root = result.as_object_mut().expect("verified object");
-            let content = root
-                .get_mut("content")
-                .and_then(Value::as_array_mut)
-                .expect("verified content array");
-
             let mut batch_bytes = 0u64;
             let mut batch_filenames = Vec::new();
             let mut saved_entries = Vec::new();
@@ -753,9 +776,9 @@ impl MediaStore {
                     return Err(Failure::new(
                         4,
                         "mcp_protocol",
-                        "MCP media payload is not a base64 string; side effects may have occurred, the call was not retried",
+                        format!("MCP media payload is not a base64 string{suffix}"),
                     )
-                    .uncertain(true));
+                    .uncertain(uncertain));
                 };
                 let encoded_len = encoded.len();
                 let decode_res = decode_base64_leased(&encoded, budget);
@@ -768,20 +791,20 @@ impl MediaStore {
                         return Err(Failure::new(
                             4,
                             "mcp_protocol",
-                            "MCP media payload contains invalid base64; side effects may have occurred, the call was not retried",
+                            format!("MCP media payload contains invalid base64{suffix}"),
                         )
-                        .uncertain(true));
+                        .uncertain(uncertain));
                     }
                     Err(DecodeError::MemoryLimitExceeded) => {
                         return Err(Failure::new(
                             1,
                             "memory_limit_exceeded",
                             format!(
-                                "decoding MCP media exceeded the {} active memory limit; side effects may have occurred, the call was not retried",
+                                "decoding MCP media exceeded the {} active memory limit{suffix}",
                                 format_bytes(budget.limit())
                             ),
                         )
-                        .uncertain(true));
+                        .uncertain(uncertain));
                     }
                 };
 
@@ -792,21 +815,21 @@ impl MediaStore {
                         1,
                         "media_cache_full",
                         format!(
-                            "local media cache exceeded its {} limit; side effects may have occurred, the call was not retried",
+                            "local media cache exceeded its {} limit{suffix}",
                             format_bytes(self.max_bytes as usize)
                         ),
                     )
-                    .uncertain(true));
+                    .uncertain(uncertain));
                 }
 
                 if !created_paths_lease.try_grow(path_bytes) {
-                    return Err(media_memory_failure(budget));
+                    return Err(media_memory_failure(budget, uncertain));
                 }
                 // tmp path, final path and replacement rollback-path copy may
                 // coexist; the retained rollback list has its own allowance.
                 let _path_workspace = budget
                     .try_acquire(path_bytes.saturating_mul(3))
-                    .ok_or_else(|| media_memory_failure(budget))?;
+                    .ok_or_else(|| media_memory_failure(budget, uncertain))?;
                 let seq = next_sequence();
                 let tmp_name = format!(".tmp-{pid}-{seq}-{}", random_hex(16));
                 let tmp_path = media_dir.join(tmp_name);
@@ -814,9 +837,9 @@ impl MediaStore {
                     Failure::new(
                         1,
                         "media_cache",
-                        format!("cannot create media staging file: {error}; side effects may have occurred, the call was not retried"),
+                        format!("cannot create media staging file: {error}{suffix}"),
                     )
-                    .uncertain(true)
+                    .uncertain(uncertain)
                 })?;
                 created_paths.push(tmp_path.clone());
 
@@ -824,9 +847,9 @@ impl MediaStore {
                     return Err(Failure::new(
                         1,
                         "media_cache",
-                        format!("cannot write media file: {error}; side effects may have occurred, the call was not retried"),
+                        format!("cannot write media file: {error}{suffix}"),
                     )
-                    .uncertain(true));
+                    .uncertain(uncertain));
                 }
                 drop(file);
                 drop(decoded);
@@ -843,9 +866,9 @@ impl MediaStore {
                             return Err(Failure::new(
                                 1,
                                 "media_cache",
-                                format!("cannot inspect media cache entry: {error}; side effects may have occurred, the call was not retried"),
+                                format!("cannot inspect media cache entry: {error}{suffix}"),
                             )
-                            .uncertain(true));
+                            .uncertain(uncertain));
                         }
                     }
                 };
@@ -864,18 +887,18 @@ impl MediaStore {
                         "media_cache",
                         format!("cannot encode local media record: {error}"),
                     )
-                    .uncertain(true)
+                    .uncertain(uncertain)
                 })?;
                 if !records_lease.try_grow(record_bytes) {
-                    return Err(media_memory_failure(budget));
+                    return Err(media_memory_failure(budget, uncertain));
                 }
                 platform::replace_file(&tmp_path, &final_path).map_err(|error| {
                     Failure::new(
                         1,
                         "media_cache",
-                        format!("cannot publish media file: {error}; side effects may have occurred, the call was not retried"),
+                        format!("cannot publish media file: {error}{suffix}"),
                     )
-                    .uncertain(true)
+                    .uncertain(uncertain)
                 })?;
                 if let Some(last) = created_paths.last_mut() {
                     *last = final_path.clone();
@@ -893,17 +916,17 @@ impl MediaStore {
                     Failure::new(
                         1,
                         "media_cache",
-                        format!("cannot create in-flight batch lock: {error:#}; side effects may have occurred, the call was not retried"),
+                        format!("cannot create in-flight batch lock: {error:#}{suffix}"),
                     )
-                    .uncertain(true)
+                    .uncertain(uncertain)
                 })?
                 .ok_or_else(|| {
                     Failure::new(
                         1,
                         "media_cache",
-                        "in-flight batch lock collision; side effects may have occurred, the call was not retried",
+                        format!("in-flight batch lock collision{suffix}"),
                     )
-                    .uncertain(true)
+                    .uncertain(uncertain)
                 })?;
             inflight_lock_path = Some(batch_lock_path.clone());
 
@@ -920,9 +943,9 @@ impl MediaStore {
                 Failure::new(
                     1,
                     "media_cache",
-                    format!("cannot update media cache index: {error:#}; side effects may have occurred, the call was not retried"),
+                    format!("cannot update media cache index: {error:#}{suffix}"),
                 )
-                .uncertain(true)
+                .uncertain(uncertain)
             })?;
 
             Ok((
@@ -934,22 +957,227 @@ impl MediaStore {
             ))
         })();
 
-        match outcome {
-            Ok((saved_entries, inflight)) => {
-                wrap_saved_media(result, saved_entries);
-                result_lease.merge(records_lease);
-                Ok(Some(inflight))
+        if outcome.is_err() {
+            for path in &created_paths {
+                let _ = remove_ignoring_benign(path);
             }
-            Err(failure) => {
-                for path in &created_paths {
-                    let _ = remove_ignoring_benign(path);
-                }
-                if let Some(lock_path) = &inflight_lock_path {
-                    let _ = remove_ignoring_benign(lock_path);
-                }
-                Err(failure)
+            if let Some(lock_path) = &inflight_lock_path {
+                let _ = remove_ignoring_benign(lock_path);
             }
         }
+        outcome
+    }
+
+    pub async fn extract_and_save(
+        &self,
+        result: &mut Value,
+        result_lease: &mut ByteLease,
+        budget: &Arc<ByteBudget>,
+    ) -> std::result::Result<Option<InflightBatch>, Failure> {
+        let mut records_lease = budget
+            .try_acquire(WRAPPER_KEY_BYTES)
+            .ok_or_else(|| media_memory_failure(budget, true))?;
+        let Some(root) = result.as_object_mut() else {
+            wrap_saved_media(result, Vec::new());
+            result_lease.merge(records_lease);
+            return Ok(None);
+        };
+        if !content_has_media(root) {
+            wrap_saved_media(result, Vec::new());
+            result_lease.merge(records_lease);
+            return Ok(None);
+        }
+        let content = root
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .expect("verified content array");
+        let (saved_entries, inflight) = self
+            .extract_content_media(content, result_lease, &mut records_lease, budget, true)
+            .await?;
+        wrap_saved_media(result, saved_entries);
+        result_lease.merge(records_lease);
+        Ok(Some(inflight))
+    }
+
+    /// Extract binary media from a flattened `GetTaskResult`'s `result.content`
+    /// in place and attach top-level `"savedMedia"` without double-wrapping `"result"`.
+    pub async fn extract_task_result_media(
+        &self,
+        task_result: &mut Value,
+        result_lease: &mut ByteLease,
+        budget: &Arc<ByteBudget>,
+    ) -> std::result::Result<Option<InflightBatch>, Failure> {
+        let mut records_lease = budget
+            .try_acquire(SAVED_MEDIA_KEY_BYTES)
+            .ok_or_else(|| media_memory_failure(budget, false))?;
+        let Some(root) = task_result.as_object_mut() else {
+            return Ok(None);
+        };
+        let has_media = root
+            .get("result")
+            .and_then(Value::as_object)
+            .is_some_and(content_has_media);
+        if !has_media {
+            root.insert("savedMedia".into(), Value::Array(Vec::new()));
+            result_lease.merge(records_lease);
+            return Ok(None);
+        }
+        let content = root
+            .get_mut("result")
+            .and_then(Value::as_object_mut)
+            .and_then(|res| res.get_mut("content"))
+            .and_then(Value::as_array_mut)
+            .expect("verified task result content array");
+        let (saved_entries, inflight) = self
+            .extract_content_media(content, result_lease, &mut records_lease, budget, false)
+            .await?;
+        root.insert("savedMedia".into(), Value::Array(saved_entries));
+        result_lease.merge(records_lease);
+        Ok(Some(inflight))
+    }
+
+    /// Persist already-decoded binary resource bytes (for `skills read`) into
+    /// the private media cache under `ByteBudget` and `InflightBatch`.
+    pub async fn extract_resource_blob(
+        &self,
+        decoded: &[u8],
+        mime_type: &str,
+        budget: &Arc<ByteBudget>,
+    ) -> std::result::Result<(Value, ByteLease, InflightBatch), Failure> {
+        let (media_dir, path_bytes, _dir_lock, now_ms, mut index, used_bytes) =
+            self.prepare_cache_locked(false).await?;
+        let decoded_len = decoded.len() as u64;
+        if used_bytes.saturating_add(decoded_len) > self.max_bytes {
+            return Err(Failure::new(
+                1,
+                "media_cache_full",
+                format!(
+                    "local media cache exceeded its {} limit",
+                    format_bytes(self.max_bytes as usize)
+                ),
+            ));
+        }
+        let _path_workspace = budget
+            .try_acquire(path_bytes.saturating_mul(3))
+            .ok_or_else(|| media_memory_failure(budget, false))?;
+
+        let pid = std::process::id();
+        let mut created_path: Option<PathBuf> = None;
+        let mut inflight_lock_path: Option<PathBuf> = None;
+
+        let outcome = (|| -> std::result::Result<(Value, ByteLease, InflightBatch), Failure> {
+            let seq = next_sequence();
+            let tmp_name = format!(".tmp-{pid}-{seq}-{}", random_hex(16));
+            let tmp_path = media_dir.join(tmp_name);
+            let mut file = platform::new_private_file(&tmp_path).map_err(|error| {
+                Failure::new(
+                    1,
+                    "media_cache",
+                    format!("cannot create media staging file: {error}"),
+                )
+            })?;
+            created_path = Some(tmp_path.clone());
+            if let Err(error) = file.write_all(decoded).and_then(|()| file.flush()) {
+                return Err(Failure::new(
+                    1,
+                    "media_cache",
+                    format!("cannot write media file: {error}"),
+                ));
+            }
+            drop(file);
+
+            let ext = extension_for_mime(mime_type);
+            let (final_name, final_path) = loop {
+                let candidate_name = format!("{}{ext}", random_hex(32));
+                let candidate_path = media_dir.join(&candidate_name);
+                match candidate_path.try_exists() {
+                    Ok(false) => break (candidate_name, candidate_path),
+                    Ok(true) => continue,
+                    Err(error) => {
+                        return Err(Failure::new(
+                            1,
+                            "media_cache",
+                            format!("cannot inspect media cache entry: {error}"),
+                        ));
+                    }
+                }
+            };
+            let record = SavedMediaRecord {
+                content_index: 0,
+                kind: "resource",
+                saved_path: final_path
+                    .to_str()
+                    .expect("UTF-8 directory and ASCII filename"),
+                mime_type,
+                bytes: decoded_len,
+            };
+            let record_bytes = crate::json::serialized_len(&record).map_err(|error| {
+                Failure::new(
+                    1,
+                    "media_cache",
+                    format!("cannot encode local media record: {error}"),
+                )
+            })?;
+            let record_lease = budget
+                .try_acquire(record_bytes)
+                .ok_or_else(|| media_memory_failure(budget, false))?;
+            let record_value = record.into_value();
+            platform::replace_file(&tmp_path, &final_path).map_err(|error| {
+                Failure::new(
+                    1,
+                    "media_cache",
+                    format!("cannot publish media file: {error}"),
+                )
+            })?;
+            created_path = Some(final_path);
+
+            let batch_id = format!("{pid}-{}-{}", next_sequence(), random_hex(16));
+            let batch_lock_path = media_dir.join(format!(".inflight-{batch_id}.lock"));
+            let batch_lock = Lock::try_acquire(&batch_lock_path)
+                .map_err(|error| {
+                    Failure::new(
+                        1,
+                        "media_cache",
+                        format!("cannot create in-flight batch lock: {error:#}"),
+                    )
+                })?
+                .ok_or_else(|| Failure::new(1, "media_cache", "in-flight batch lock collision"))?;
+            inflight_lock_path = Some(batch_lock_path);
+
+            index.files.insert(
+                final_name.clone(),
+                FileMeta {
+                    published_ms: now_ms,
+                },
+            );
+            index.inflight.insert(batch_id, vec![final_name]);
+            save_index(&media_dir, &index).map_err(|error| {
+                Failure::new(
+                    1,
+                    "media_cache",
+                    format!("cannot update media cache index: {error:#}"),
+                )
+            })?;
+
+            Ok((
+                record_value,
+                record_lease,
+                InflightBatch {
+                    clock: self.clock.clone(),
+                    lock: Some(batch_lock),
+                },
+            ))
+        })();
+
+        if outcome.is_err() {
+            if let Some(path) = &created_path {
+                let _ = remove_ignoring_benign(path);
+            }
+            if let Some(lock_path) = &inflight_lock_path {
+                let _ = remove_ignoring_benign(lock_path);
+            }
+        }
+        outcome
     }
 }
 
@@ -1702,5 +1930,142 @@ mod tests {
             .unwrap();
         assert_eq!(err.code, 4);
         assert_eq!(err.kind, "mcp_protocol");
+    }
+
+    #[tokio::test]
+    async fn extract_resource_blob_persists_bytes_under_budget_and_gc_lifecycle() {
+        let (_base, media_dir) = test_media_dir();
+        let now = Arc::new(AtomicU64::new(1_000));
+        let clock_now = now.clone();
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            16,
+            60_000,
+            Duration::from_secs(1),
+            Arc::new(move || Ok(clock_now.load(Ordering::Acquire))),
+        );
+        let budget = ByteBudget::new(16 << 10);
+        let payload = b"\x89PNG\r\n\x1a\n";
+        let (record, lease, batch) = store
+            .extract_resource_blob(payload, "image/png", &budget)
+            .await
+            .unwrap();
+        assert_eq!(record["contentIndex"], 0);
+        assert_eq!(record["kind"], "resource");
+        assert_eq!(record["mimeType"], "image/png");
+        assert_eq!(record["bytes"], payload.len());
+        let saved_path = PathBuf::from(record["savedPath"].as_str().unwrap());
+        assert!(saved_path.to_str().unwrap().ends_with(".png"));
+        assert_eq!(std::fs::read(&saved_path).unwrap(), payload);
+        assert!(lease.bytes() > 0);
+        batch.complete().await.unwrap();
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+
+        // Over-capacity write fails cleanly with outcome_unknown: false.
+        let err = store
+            .extract_resource_blob(&[0u8; 32], "application/octet-stream", &budget)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind, "media_cache_full");
+        assert!(!err.outcome_unknown);
+        assert!(saved_path.exists());
+
+        now.store(61_000, Ordering::Release);
+        assert_eq!(store.run_gc().await.unwrap(), 0);
+        assert!(!saved_path.exists());
+    }
+
+    #[tokio::test]
+    async fn extract_task_result_media_extracts_in_place_without_double_wrapping() {
+        let (_base, media_dir) = test_media_dir();
+        let store = MediaStore::with_options(
+            media_dir.clone(),
+            4096,
+            60_000,
+            Duration::from_secs(1),
+            Arc::new(|| Ok(1_000)),
+        );
+        let budget = ByteBudget::new(16 << 10);
+
+        let mut task_res = json!({
+            "taskId": "task-9",
+            "status": "completed",
+            "result": {
+                "isError": false,
+                "content": [
+                    {"type": "text", "text": "summary"},
+                    {"type": "image", "mimeType": "image/png", "data": "AQID"},
+                    {"type": "resource", "resource": {"uri": "skill://a/f.pdf", "mimeType": "application/pdf", "blob": "BAUG"}}
+                ]
+            }
+        });
+        let mut lease = budget.try_acquire(128).unwrap();
+        let batch = store
+            .extract_task_result_media(&mut task_res, &mut lease, &budget)
+            .await
+            .unwrap()
+            .unwrap();
+        batch.complete().await.unwrap();
+
+        // Top-level GetTaskResult fields stay flat; never double-wrapped in "result".
+        assert_eq!(task_res["taskId"], "task-9");
+        assert_eq!(task_res["status"], "completed");
+        assert!(task_res["result"].get("result").is_none());
+        assert_eq!(task_res["result"]["content"][0]["text"], "summary");
+        assert!(task_res["result"]["content"][1].get("data").is_none());
+        assert!(
+            task_res["result"]["content"][2]["resource"]
+                .get("blob")
+                .is_none()
+        );
+        let saved = task_res["savedMedia"].as_array().unwrap();
+        assert_eq!(saved.len(), 2);
+        assert_eq!(saved[0]["contentIndex"], 1);
+        assert_eq!(saved[0]["mimeType"], "image/png");
+        assert_eq!(
+            std::fs::read(saved[0]["savedPath"].as_str().unwrap()).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(saved[1]["contentIndex"], 2);
+        assert_eq!(saved[1]["mimeType"], "application/pdf");
+        assert_eq!(
+            std::fs::read(saved[1]["savedPath"].as_str().unwrap()).unwrap(),
+            vec![4, 5, 6]
+        );
+
+        // Text-only GetTaskResult attaches empty savedMedia at top level without wrapping.
+        let mut text_only = json!({
+            "taskId": "task-10",
+            "status": "completed",
+            "result": {"content": [{"type": "text", "text": "plain"}]}
+        });
+        let mut lease = budget.try_acquire(64).unwrap();
+        assert!(
+            store
+                .extract_task_result_media(&mut text_only, &mut lease, &budget)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(text_only["taskId"], "task-10");
+        assert!(text_only["result"].get("result").is_none());
+        assert_eq!(text_only["savedMedia"], json!([]));
+
+        // Read-only GetTaskResult media failures keep outcome_unknown: false.
+        let mut invalid = json!({
+            "taskId": "task-11",
+            "status": "completed",
+            "result": {"content": [{"type": "image", "mimeType": "image/png", "data": "bad!"}]}
+        });
+        let mut lease = budget.try_acquire(64).unwrap();
+        let err = store
+            .extract_task_result_media(&mut invalid, &mut lease, &budget)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(err.kind, "mcp_protocol");
+        assert!(!err.outcome_unknown);
     }
 }

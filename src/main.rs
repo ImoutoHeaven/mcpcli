@@ -1494,6 +1494,8 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         tool: tool.clone(),
                         arguments: args,
                         inline_media: *inline_media,
+                        detach: false,
+                        expected_schema: None,
                     },
                     input_lease,
                 ),

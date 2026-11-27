@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 pub const REQUEST_LIMIT: usize = 4 << 20;
 pub const RESPONSE_LIMIT: usize = 512 << 20;
 pub const ARGUMENT_LIMIT: usize = 1 << 20;
@@ -40,7 +40,7 @@ pub struct Request {
 
 impl Request {
     pub fn admission_deadline_ms(&self) -> u64 {
-        let hard_extension = if self.operation.is_call() {
+        let hard_extension = if self.operation.uses_dual_clock() {
             self.max_timeout_ms
                 .map_or(0, |hard| hard.saturating_sub(self.timeout_ms))
         } else {
@@ -66,10 +66,51 @@ pub enum Operation {
         tool: String,
         arguments: Map<String, Value>,
         inline_media: bool,
+        #[serde(default)]
+        detach: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_schema: Option<crate::schema::ExpectedSchema>,
     },
     Reset {
         server: String,
         force: bool,
+    },
+    SkillsList {
+        server: String,
+    },
+    SkillsGet {
+        server: String,
+        selector: String,
+    },
+    SkillsFiles {
+        server: String,
+        selector: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dir: Option<String>,
+    },
+    SkillsRead {
+        server: String,
+        selector: String,
+        path: String,
+        #[serde(default)]
+        inline_media: bool,
+    },
+    TasksGet {
+        server: String,
+        task_id: String,
+        #[serde(default)]
+        wait: bool,
+        #[serde(default)]
+        inline_media: bool,
+    },
+    TasksUpdate {
+        server: String,
+        task_id: String,
+        input_responses: Map<String, Value>,
+    },
+    TasksCancel {
+        server: String,
+        task_id: String,
     },
     EventsList {
         server: String,
@@ -108,6 +149,18 @@ impl Operation {
     }
     pub fn is_streaming(&self) -> bool {
         matches!(self, Self::EventsStream { .. })
+    }
+    pub fn uses_dual_clock(&self) -> bool {
+        matches!(
+            self,
+            Self::Call { detach: false, .. } | Self::TasksGet { wait: true, .. }
+        )
+    }
+    pub fn has_side_effects(&self) -> bool {
+        matches!(
+            self,
+            Self::Call { .. } | Self::TasksUpdate { .. } | Self::TasksCancel { .. }
+        )
     }
 }
 
@@ -501,8 +554,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipc_v5_stream_frames_round_trip_and_operation_classification() {
-        assert_eq!(PROTOCOL, 5);
+    async fn ipc_v6_stream_frames_round_trip_and_operation_classification() {
+        assert_eq!(PROTOCOL, 6);
         assert!(
             Operation::EventsStream {
                 server: "s".into(),
@@ -579,5 +632,127 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn ipc_v6_operations_round_trip_and_dual_clock_rules() {
+        let call_wait = Operation::Call {
+            server: "srv".into(),
+            tool: "run".into(),
+            arguments: Map::new(),
+            inline_media: false,
+            detach: false,
+            expected_schema: Some(crate::schema::ExpectedSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: None,
+                has_tool_envelope: false,
+                mode: crate::schema::SchemaMode::Compatible,
+            }),
+        };
+        let call_detach = Operation::Call {
+            server: "srv".into(),
+            tool: "run".into(),
+            arguments: Map::new(),
+            inline_media: false,
+            detach: true,
+            expected_schema: None,
+        };
+        let tasks_wait = Operation::TasksGet {
+            server: "srv".into(),
+            task_id: "t-1".into(),
+            wait: true,
+            inline_media: false,
+        };
+        let tasks_poll = Operation::TasksGet {
+            server: "srv".into(),
+            task_id: "t-1".into(),
+            wait: false,
+            inline_media: true,
+        };
+        let mut responses = Map::new();
+        responses.insert("ok".into(), Value::Bool(true));
+
+        assert!(call_wait.uses_dual_clock());
+        assert!(!call_detach.uses_dual_clock());
+        assert!(tasks_wait.uses_dual_clock());
+        assert!(!tasks_poll.uses_dual_clock());
+        assert!(call_wait.has_side_effects());
+        assert!(call_detach.has_side_effects());
+        assert!(!tasks_wait.has_side_effects());
+        assert!(!tasks_poll.has_side_effects());
+        assert!(
+            Operation::TasksUpdate {
+                server: "srv".into(),
+                task_id: "t-1".into(),
+                input_responses: responses.clone(),
+            }
+            .has_side_effects()
+        );
+        assert!(
+            Operation::TasksCancel {
+                server: "srv".into(),
+                task_id: "t-1".into(),
+            }
+            .has_side_effects()
+        );
+        assert!(
+            !Operation::SkillsList {
+                server: "srv".into()
+            }
+            .has_side_effects()
+        );
+
+        let ops = [
+            call_wait,
+            call_detach,
+            Operation::SkillsList {
+                server: "srv".into(),
+            },
+            Operation::SkillsGet {
+                server: "srv".into(),
+                selector: "my-skill".into(),
+            },
+            Operation::SkillsFiles {
+                server: "srv".into(),
+                selector: "my-skill".into(),
+                dir: Some("refs".into()),
+            },
+            Operation::SkillsRead {
+                server: "srv".into(),
+                selector: "my-skill".into(),
+                path: "refs/guide.md".into(),
+                inline_media: true,
+            },
+            tasks_wait.clone(),
+            tasks_poll,
+            Operation::TasksUpdate {
+                server: "srv".into(),
+                task_id: "t-1".into(),
+                input_responses: responses,
+            },
+            Operation::TasksCancel {
+                server: "srv".into(),
+                task_id: "t-1".into(),
+            },
+        ];
+
+        for op in &ops {
+            let encoded = serde_json::to_vec(op).unwrap();
+            let decoded: Operation = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded.uses_dual_clock(), op.uses_dual_clock());
+        }
+
+        let req_wait = Request {
+            protocol: PROTOCOL,
+            namespace: "ns".into(),
+            build: "b".into(),
+            digest: "d".into(),
+            timeout_ms: 2_000,
+            max_timeout_ms: Some(10_000),
+            deadline_ms: 15_000,
+            explicit_deadline_ms: Some(15_000),
+            operation: tasks_wait,
+        };
+        assert_eq!(req_wait.admission_deadline_ms(), 7_000);
     }
 }

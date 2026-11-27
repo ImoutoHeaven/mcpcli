@@ -315,7 +315,14 @@ impl App {
         | Operation::Reset { server, .. }
         | Operation::EventsList { server }
         | Operation::EventsPoll { server, .. }
-        | Operation::EventsStream { server, .. } = &request.operation
+        | Operation::EventsStream { server, .. }
+        | Operation::SkillsList { server }
+        | Operation::SkillsGet { server, .. }
+        | Operation::SkillsFiles { server, .. }
+        | Operation::SkillsRead { server, .. }
+        | Operation::TasksGet { server, .. }
+        | Operation::TasksUpdate { server, .. }
+        | Operation::TasksCancel { server, .. } = &request.operation
             && let Some(cfg) = self.config.config.servers.get(server)
             && !cfg.enabled()
         {
@@ -470,6 +477,19 @@ impl App {
         match operation {
             Operation::Status => return Ok((self.status(), empty(), None)),
             Operation::Stop => return Ok((json!({"stopping":true}), empty(), None)),
+            Operation::SkillsList { .. }
+            | Operation::SkillsGet { .. }
+            | Operation::SkillsFiles { .. }
+            | Operation::SkillsRead { .. }
+            | Operation::TasksGet { .. }
+            | Operation::TasksUpdate { .. }
+            | Operation::TasksCancel { .. } => {
+                return Err(Failure::new(
+                    4,
+                    "not_implemented",
+                    "operation not yet wired in daemon",
+                ));
+            }
             Operation::EventsList { server } => {
                 let (client, _) = self.ensure_events_client(server, deadline).await?;
                 let work = self
@@ -2133,6 +2153,8 @@ mod tests {
                     tool: "t".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_secs(10),
                 Some(Duration::from_secs(5)),
@@ -2444,6 +2466,8 @@ mod tests {
                     tool: "progress_ok".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_millis(600),
                 None,
@@ -2470,6 +2494,8 @@ mod tests {
                             .unwrap()
                             .clone(),
                         inline_media: false,
+                        detach: false,
+                        expected_schema: None,
                     },
                     Duration::from_secs(1),
                     hard,
@@ -2493,6 +2519,8 @@ mod tests {
                     tool: "progress_silent".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_millis(500),
                 None,
@@ -2516,6 +2544,8 @@ mod tests {
                     tool: "progress_forever".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_millis(500),
                 Some(Duration::from_millis(900)),
@@ -2542,6 +2572,8 @@ mod tests {
                         tool: "progress_forever".into(),
                         arguments: serde_json::Map::new(),
                         inline_media: false,
+                        detach: false,
+                        expected_schema: None,
                     },
                     Duration::from_millis(800),
                     None,
@@ -2561,6 +2593,8 @@ mod tests {
                     tool: "progress_ok".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_millis(350),
                 None,
@@ -2662,6 +2696,8 @@ mod tests {
             tool: "progress_forever".into(),
             arguments: serde_json::Map::new(),
             inline_media: true,
+            detach: false,
+            expected_schema: None,
         };
         let active_dispatched = AtomicBool::new(false);
         let active = app.execute(&operation, deadlines, &active_dispatched);
@@ -2715,6 +2751,8 @@ mod tests {
                 .unwrap()
                 .clone(),
             inline_media: true,
+            detach: false,
+            expected_schema: None,
         };
         let fresh_dispatched = AtomicBool::new(false);
         let (value, _, _) = app
@@ -2783,6 +2821,8 @@ mod tests {
                 tool: "ping".into(),
                 arguments: serde_json::Map::new(),
                 inline_media: false,
+                detach: false,
+                expected_schema: None,
             },
             Operation::Reset {
                 server: "off".into(),

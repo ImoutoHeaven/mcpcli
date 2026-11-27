@@ -16,10 +16,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::time::{Instant, sleep, timeout_at};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::time::{Instant, sleep, timeout, timeout_at};
+use tokio_util::sync::CancellationToken;
 
 pub const START_WAIT: Duration = Duration::from_secs(10);
 pub const STOP_WAIT: Duration = Duration::from_secs(20);
+pub const DUAL_CLOCK_GRACE: Duration = Duration::from_secs(5);
+pub const CANCEL_SENTINEL_WAIT: Duration = Duration::from_millis(2_500);
 
 #[derive(Clone)]
 pub struct Paths {
@@ -290,10 +294,68 @@ pub async fn exchange_tracked_with_options(
     idle_timeout: Duration,
     budget: &Arc<ByteBudget>,
 ) -> Result<(Response, ByteLease)> {
-    let is_call = request.operation.is_call();
-    let unbounded_call = is_call && request.max_timeout_ms.is_none();
+    exchange_cancellable_with_options(paths, request, dispatched, idle_timeout, budget, None).await
+}
+
+pub async fn exchange_cancellable(
+    paths: &Paths,
+    request: &Request,
+    dispatched: &AtomicBool,
+    interrupt: &CancellationToken,
+) -> Result<(Response, ByteLease)> {
+    exchange_cancellable_with_options(
+        paths,
+        request,
+        dispatched,
+        ipc::TRANSFER_IDLE_TIMEOUT,
+        ByteBudget::global(),
+        Some(interrupt),
+    )
+    .await
+}
+
+async fn read_header_resumable<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    header: &mut [u8; 4],
+    filled: &mut usize,
+    max: usize,
+) -> io::Result<Option<usize>> {
+    while *filled < 4 {
+        let n = reader.read(&mut header[*filled..]).await?;
+        if n == 0 {
+            if *filled == 0 {
+                return Ok(None);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "IPC frame header truncated",
+            ));
+        }
+        *filled += n;
+    }
+    let len = u32::from_le_bytes(*header) as usize;
+    if len == 0 || len > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC frame exceeds limit or is empty",
+        ));
+    }
+    Ok(Some(len))
+}
+
+pub async fn exchange_cancellable_with_options(
+    paths: &Paths,
+    request: &Request,
+    dispatched: &AtomicBool,
+    idle_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+    interrupt: Option<&CancellationToken>,
+) -> Result<(Response, ByteLease)> {
+    let has_side_effects = request.operation.has_side_effects();
+    let uses_dual_clock = request.operation.uses_dual_clock();
+    let unbounded_dual_clock = uses_dual_clock && request.max_timeout_ms.is_none();
     let now_ms = platform::monotonic_millis()?;
-    let total_budget_cap_ms = if is_call {
+    let total_budget_cap_ms = if uses_dual_clock {
         request.max_timeout_ms.unwrap_or(request.timeout_ms)
     } else {
         request.timeout_ms
@@ -311,24 +373,56 @@ pub async fn exchange_tracked_with_options(
             Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
         );
     }
-    let started = Instant::now();
-    let admission_deadline = started + Duration::from_millis(remaining_admission);
-    let stage1b_deadline = if unbounded_call {
-        None
-    } else {
-        Some(started + Duration::from_millis(remaining_total))
-    };
-    let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        started + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms))
-    });
-    if hard_deadline.is_some_and(|dl| Instant::now() >= dl) {
+    if request
+        .explicit_deadline_ms
+        .is_some_and(|exp_ms| exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms) == 0)
+    {
         return Err(
             Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
         );
     }
+    if interrupt.is_some_and(CancellationToken::is_cancelled) {
+        return Err(Failure::new(
+            130,
+            "cancelled",
+            "interrupted; cancellation is not rollback",
+        )
+        .into());
+    }
+
+    let grace = if uses_dual_clock && request.max_timeout_ms.is_some() {
+        DUAL_CLOCK_GRACE
+    } else {
+        Duration::ZERO
+    };
+    let started = Instant::now();
+    let admission_deadline = started + Duration::from_millis(remaining_admission);
+    let stage1b_deadline = if unbounded_dual_clock {
+        None
+    } else {
+        Some(started + Duration::from_millis(remaining_total) + grace)
+    };
+    let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
+        started
+            + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms))
+            + grace
+    });
 
     let ignored = AtomicBool::new(false);
-    let write_tracker = if is_call { dispatched } else { &ignored };
+    let write_tracker = if has_side_effects {
+        dispatched
+    } else {
+        &ignored
+    };
+    let local_cancelled = || -> anyhow::Error {
+        Failure::new(
+            130,
+            "cancelled",
+            "interrupted; cancellation is not rollback",
+        )
+        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
+        .into()
+    };
 
     // Stage 1a: connect and write the request frame under the admission deadline.
     let stage1a = async {
@@ -389,7 +483,7 @@ pub async fn exchange_tracked_with_options(
                 "timeout",
                 "daemon deadline exceeded; cancellation is not rollback",
             )
-            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
             .into();
         }
         Failure::new(
@@ -397,34 +491,33 @@ pub async fn exchange_tracked_with_options(
             "daemon_transport",
             "daemon communication failed; tool calls are never replayed",
         )
-        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
         .into()
     };
 
-    let mut stream = match timeout_at(admission_deadline, stage1a).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return Err(map_stage1_err(error)),
-        Err(_) => {
-            return Err(Failure::new(
-                5,
-                "timeout",
-                "daemon deadline exceeded; cancellation is not rollback",
-            )
-            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-            .into());
+    let mut stream = match interrupt {
+        Some(token) => {
+            let connect_fut = timeout_at(admission_deadline, stage1a);
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => return Err(local_cancelled()),
+                outcome = connect_fut => match outcome {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(error)) => return Err(map_stage1_err(error)),
+                    Err(_) => {
+                        return Err(Failure::new(
+                            5,
+                            "timeout",
+                            "daemon deadline exceeded; cancellation is not rollback",
+                        )
+                        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
+                        .into());
+                    }
+                },
+            }
         }
-    };
-
-    // Stage 1b: await the 4-byte response frame header. Unbounded tool calls wait
-    // without a client-side wall-clock cap until the daemon replies, closes, or errors.
-    let read_header = async {
-        ipc::read_frame_header(&mut stream, ipc::RESPONSE_LIMIT)
-            .await?
-            .context("daemon disconnected before returning a result")
-    };
-    let response_len = match stage1b_deadline {
-        Some(deadline) => match timeout_at(deadline, read_header).await {
-            Ok(Ok(len)) => len,
+        None => match timeout_at(admission_deadline, stage1a).await {
+            Ok(Ok(stream)) => stream,
             Ok(Err(error)) => return Err(map_stage1_err(error)),
             Err(_) => {
                 return Err(Failure::new(
@@ -432,33 +525,163 @@ pub async fn exchange_tracked_with_options(
                     "timeout",
                     "daemon deadline exceeded; cancellation is not rollback",
                 )
-                .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+                .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
                 .into());
             }
         },
-        None => read_header.await.map_err(map_stage1_err)?,
+    };
+
+    // Stage 1b: await the 4-byte response frame header. Unbounded dual-clock requests wait
+    // without a client-side wall-clock cap until the daemon replies, closes, or errors.
+    let mut header = [0u8; 4];
+    let mut header_read = 0usize;
+    let mut cancelled_after_sentinel = false;
+    let mut stage2_deadline = hard_deadline;
+
+    let response_len = match interrupt {
+        Some(token) => {
+            let interrupted = {
+                let read_header = async {
+                    read_header_resumable(
+                        &mut stream,
+                        &mut header,
+                        &mut header_read,
+                        ipc::RESPONSE_LIMIT,
+                    )
+                    .await?
+                    .context("daemon disconnected before returning a result")
+                };
+                match stage1b_deadline {
+                    Some(deadline) => {
+                        let timed = timeout_at(deadline, read_header);
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => Err(true),
+                            outcome = timed => match outcome {
+                                Ok(Ok(len)) => Ok(len),
+                                Ok(Err(error)) => return Err(map_stage1_err(error)),
+                                Err(_) => {
+                                    return Err(Failure::new(
+                                        5,
+                                        "timeout",
+                                        "daemon deadline exceeded; cancellation is not rollback",
+                                    )
+                                    .uncertain(
+                                        has_side_effects && write_tracker.load(Ordering::Acquire),
+                                    )
+                                    .into());
+                                }
+                            },
+                        }
+                    }
+                    None => {
+                        tokio::select! {
+                            biased;
+                            _ = token.cancelled() => Err(true),
+                            outcome = read_header => match outcome {
+                                Ok(len) => Ok(len),
+                                Err(error) => return Err(map_stage1_err(error)),
+                            },
+                        }
+                    }
+                }
+            };
+            match interrupted {
+                Ok(len) => len,
+                Err(true) => {
+                    cancelled_after_sentinel = true;
+                    let cancel_deadline = Instant::now() + CANCEL_SENTINEL_WAIT;
+                    stage2_deadline = Some(cancel_deadline);
+                    let _ = timeout_at(cancel_deadline, async {
+                        stream.write_all(&[0u8]).await?;
+                        stream.flush().await
+                    })
+                    .await;
+                    match timeout_at(
+                        cancel_deadline,
+                        read_header_resumable(
+                            &mut stream,
+                            &mut header,
+                            &mut header_read,
+                            ipc::RESPONSE_LIMIT,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(Ok(Some(len))) => len,
+                        _ => return Err(local_cancelled()),
+                    }
+                }
+                Err(false) => unreachable!(),
+            }
+        }
+        None => {
+            let read_header = async {
+                read_header_resumable(
+                    &mut stream,
+                    &mut header,
+                    &mut header_read,
+                    ipc::RESPONSE_LIMIT,
+                )
+                .await?
+                .context("daemon disconnected before returning a result")
+            };
+            match stage1b_deadline {
+                Some(deadline) => match timeout_at(deadline, read_header).await {
+                    Ok(Ok(len)) => len,
+                    Ok(Err(error)) => return Err(map_stage1_err(error)),
+                    Err(_) => {
+                        return Err(Failure::new(
+                            5,
+                            "timeout",
+                            "daemon deadline exceeded; cancellation is not rollback",
+                        )
+                        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
+                        .into());
+                    }
+                },
+                None => read_header.await.map_err(map_stage1_err)?,
+            }
+        }
     };
 
     // Stage 2: read validated response body using local 60s idle clock capped by explicit deadline.
-    let (response_lease, mut response): (ByteLease, Response) = match ipc::read_frame_body_idle(
-        &mut stream,
-        response_len,
-        idle_timeout,
-        hard_deadline,
-        budget,
-    )
-    .await
+    let body_result: io::Result<(Response, ByteLease)> = match (cancelled_after_sentinel, interrupt)
     {
-        Ok((response, lease)) => (lease, response),
-        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
-            return Err(Failure::new(
-                5,
-                "timeout",
-                "daemon deadline exceeded; cancellation is not rollback",
-            )
-            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-            .into());
+        (false, Some(token)) => {
+            let read_body = ipc::read_frame_body_idle(
+                &mut stream,
+                response_len,
+                idle_timeout,
+                stage2_deadline,
+                budget,
+            );
+            tokio::pin!(read_body);
+            tokio::select! {
+                biased;
+                res = &mut read_body => res,
+                _ = token.cancelled() => {
+                    cancelled_after_sentinel = true;
+                    match timeout(CANCEL_SENTINEL_WAIT, &mut read_body).await {
+                        Ok(res) => res,
+                        Err(_) => Err(io::Error::new(io::ErrorKind::TimedOut, "IPC cancel wait timed out")),
+                    }
+                }
+            }
         }
+        _ => {
+            ipc::read_frame_body_idle(
+                &mut stream,
+                response_len,
+                idle_timeout,
+                stage2_deadline,
+                budget,
+            )
+            .await
+        }
+    };
+    let (response_lease, mut response): (ByteLease, Response) = match body_result {
+        Ok((response, lease)) => (lease, response),
         Err(error) if error.kind() == io::ErrorKind::OutOfMemory => {
             return Err(Failure::new(
                 1,
@@ -468,7 +691,17 @@ pub async fn exchange_tracked_with_options(
                     format_bytes(budget.limit())
                 ),
             )
-            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
+            .into());
+        }
+        Err(_) if cancelled_after_sentinel => return Err(local_cancelled()),
+        Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+            return Err(Failure::new(
+                5,
+                "timeout",
+                "daemon deadline exceeded; cancellation is not rollback",
+            )
+            .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
             .into());
         }
         Err(_) => {
@@ -477,7 +710,7 @@ pub async fn exchange_tracked_with_options(
                 "daemon_transport",
                 "daemon communication failed; tool calls are never replayed",
             )
-            .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+            .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
             .into());
         }
     };
@@ -488,7 +721,7 @@ pub async fn exchange_tracked_with_options(
             "daemon_mismatch",
             "daemon protocol does not match; use the matching mcpcli version to run daemon stop, then use the current version to run daemon start",
         )
-        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
         .into());
     }
     if response.namespace != paths.namespace {
@@ -497,7 +730,7 @@ pub async fn exchange_tracked_with_options(
             "daemon_transport",
             "daemon IPC identity does not match; tool calls are never replayed",
         )
-        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
         .into());
     }
     if !request.operation.management() && response.build != paths.build {
@@ -513,12 +746,15 @@ pub async fn exchange_tracked_with_options(
         return Err(error.into());
     }
     if response.result.is_none() {
+        if cancelled_after_sentinel {
+            return Err(local_cancelled());
+        }
         return Err(Failure::new(
             4,
             "daemon_transport",
             "daemon response has no result; tool calls are never replayed",
         )
-        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
         .into());
     }
     Ok((response, response_lease))
@@ -844,6 +1080,8 @@ mod tests {
                         tool: "tool".into(),
                         arguments: serde_json::Map::new(),
                         inline_media: false,
+                        detach: false,
+                        expected_schema: None,
                     },
                     Duration::from_millis(1_000),
                     hard_ms.map(Duration::from_millis),
@@ -881,6 +1119,8 @@ mod tests {
                     tool: "tool".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_secs(1),
                 Some(Duration::from_secs(5)),
@@ -914,6 +1154,8 @@ mod tests {
                     tool: "tool".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_secs(1),
             )
@@ -946,6 +1188,8 @@ mod tests {
                     tool: "t".into(),
                     arguments: serde_json::Map::new(),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
                 Duration::from_secs(2),
             )
@@ -954,5 +1198,344 @@ mod tests {
         let failure = err.downcast_ref::<Failure>().unwrap();
         assert_eq!(failure.kind, "daemon_transport");
         assert!(!failure.outcome_unknown);
+    }
+
+    #[tokio::test]
+    async fn dual_clock_max_timeout_allows_grace_window_for_final_response() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap().join("runtime");
+        let paths = Paths::with_root(root.join("config.json"), "grace", &root).unwrap();
+        let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+        platform::secure_endpoint(&paths.socket).unwrap();
+        let expected_ns = paths.namespace.clone();
+        let expected_build = paths.build.clone();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let (_req, _lease) = ipc::read_frame_with_budget::<_, Request>(
+                &mut conn,
+                ipc::REQUEST_LIMIT,
+                ByteBudget::global(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // Reply after remaining_total (150ms) has elapsed, inside the +5s grace window.
+            sleep(Duration::from_millis(300)).await;
+            let resp = Response {
+                protocol: ipc::PROTOCOL,
+                namespace: expected_ns,
+                build: expected_build,
+                epoch: "e1".into(),
+                result: Some(serde_json::json!({"ok": true})),
+                error: None,
+            };
+            let (frame, _lease) =
+                ipc::encode_frame_leased(&resp, ipc::RESPONSE_LIMIT, ByteBudget::global()).unwrap();
+            conn.write_all(&frame).await.unwrap();
+            conn.flush().await.unwrap();
+        });
+
+        let req = paths
+            .request_call_with_budgets(
+                "digest",
+                Operation::TasksGet {
+                    server: "s".into(),
+                    task_id: "t-1".into(),
+                    wait: true,
+                    inline_media: false,
+                },
+                Duration::from_millis(150),
+                Some(Duration::from_millis(150)),
+                Duration::ZERO,
+            )
+            .unwrap();
+        let (resp, _lease) = exchange(&paths, &req).await.unwrap();
+        assert_eq!(resp.result.unwrap()["ok"], true);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellable_exchange_sends_sentinel_and_preserves_cancelled_failure() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap().join("runtime");
+        let paths = Paths::with_root(root.join("config.json"), "cancel-err", &root).unwrap();
+        let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+        platform::secure_endpoint(&paths.socket).unwrap();
+        let expected_ns = paths.namespace.clone();
+        let expected_build = paths.build.clone();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let (_req, _lease) = ipc::read_frame_with_budget::<_, Request>(
+                &mut conn,
+                ipc::REQUEST_LIMIT,
+                ByteBudget::global(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut sentinel = [0xffu8; 1];
+            let n = conn.read(&mut sentinel).await.unwrap();
+            assert_eq!(n, 1);
+            assert_eq!(sentinel, [0u8]);
+            let mut failure = Failure::new(4, "cancelled", "cancelled on daemon").uncertain(true);
+            failure.data = Some(serde_json::json!({"taskId": "task-42"}));
+            let resp = Response {
+                protocol: ipc::PROTOCOL,
+                namespace: expected_ns,
+                build: expected_build,
+                epoch: "e1".into(),
+                result: None,
+                error: Some(failure),
+            };
+            let (frame, _lease) =
+                ipc::encode_frame_leased(&resp, ipc::RESPONSE_LIMIT, ByteBudget::global()).unwrap();
+            conn.write_all(&frame).await.unwrap();
+            conn.flush().await.unwrap();
+        });
+
+        let req = paths
+            .request_call_with_budgets(
+                "digest",
+                Operation::Call {
+                    server: "s".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                    detach: false,
+                    expected_schema: None,
+                },
+                Duration::from_secs(5),
+                None,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let dispatched = AtomicBool::new(false);
+        let interrupt = CancellationToken::new();
+        let trigger = interrupt.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let err = exchange_cancellable(&paths, &req, &dispatched, &interrupt)
+            .await
+            .unwrap_err();
+        let failure = err.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.kind, "cancelled");
+        assert!(failure.outcome_unknown);
+        assert_eq!(failure.data.as_ref().unwrap()["taskId"], "task-42");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellable_exchange_preserves_natural_completion_race() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap().join("runtime");
+        let paths = Paths::with_root(root.join("config.json"), "cancel-ok", &root).unwrap();
+        let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+        platform::secure_endpoint(&paths.socket).unwrap();
+        let expected_ns = paths.namespace.clone();
+        let expected_build = paths.build.clone();
+        let server = tokio::spawn(async move {
+            let mut conn = listener.accept().await.unwrap();
+            let (_req, _lease) = ipc::read_frame_with_budget::<_, Request>(
+                &mut conn,
+                ipc::REQUEST_LIMIT,
+                ByteBudget::global(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let mut sentinel = [0xffu8; 1];
+            let _ = conn.read(&mut sentinel).await.unwrap();
+            let resp = Response {
+                protocol: ipc::PROTOCOL,
+                namespace: expected_ns,
+                build: expected_build,
+                epoch: "e1".into(),
+                result: Some(serde_json::json!({"content": [{"type": "text", "text": "done"}]})),
+                error: None,
+            };
+            let (frame, _lease) =
+                ipc::encode_frame_leased(&resp, ipc::RESPONSE_LIMIT, ByteBudget::global()).unwrap();
+            conn.write_all(&frame).await.unwrap();
+            conn.flush().await.unwrap();
+        });
+
+        let req = paths
+            .request_call_with_budgets(
+                "digest",
+                Operation::Call {
+                    server: "s".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                    detach: false,
+                    expected_schema: None,
+                },
+                Duration::from_secs(5),
+                None,
+                Duration::ZERO,
+            )
+            .unwrap();
+        let dispatched = AtomicBool::new(false);
+        let interrupt = CancellationToken::new();
+        let trigger = interrupt.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            trigger.cancel();
+        });
+        let (resp, _lease) = exchange_cancellable(&paths, &req, &dispatched, &interrupt)
+            .await
+            .unwrap();
+        assert_eq!(resp.result.unwrap()["content"][0]["text"], "done");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellable_exchange_falls_back_to_cancelled_on_eof_never_daemon_transport() {
+        for (is_call, op) in [
+            (
+                true,
+                Operation::Call {
+                    server: "s".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                    detach: false,
+                    expected_schema: None,
+                },
+            ),
+            (
+                false,
+                Operation::TasksGet {
+                    server: "s".into(),
+                    task_id: "t-1".into(),
+                    wait: true,
+                    inline_media: false,
+                },
+            ),
+        ] {
+            #[cfg(unix)]
+            let base = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(windows)]
+            let base = tempfile::tempdir().unwrap();
+            let root = base.path().canonicalize().unwrap().join("runtime");
+            let paths = Paths::with_root(root.join("config.json"), "cancel-eof", &root).unwrap();
+            let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+            platform::secure_endpoint(&paths.socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                let (_req, _lease) = ipc::read_frame_with_budget::<_, Request>(
+                    &mut conn,
+                    ipc::REQUEST_LIMIT,
+                    ByteBudget::global(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                let mut sentinel = [0xffu8; 1];
+                let _ = conn.read(&mut sentinel).await.unwrap();
+                // Drop connection immediately (EOF) without sending a response.
+            });
+
+            let req = paths
+                .request_call_with_budgets(
+                    "digest",
+                    op,
+                    Duration::from_secs(5),
+                    None,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            let dispatched = AtomicBool::new(false);
+            let interrupt = CancellationToken::new();
+            let trigger = interrupt.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(50)).await;
+                trigger.cancel();
+            });
+            let err = exchange_cancellable(&paths, &req, &dispatched, &interrupt)
+                .await
+                .unwrap_err();
+            let failure = err.downcast_ref::<Failure>().unwrap();
+            assert_eq!(failure.kind, "cancelled");
+            assert_eq!(failure.code, 130);
+            assert_eq!(failure.outcome_unknown, is_call);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn tasks_update_and_cancel_post_write_disconnect_marks_outcome_unknown() {
+        let mut responses = serde_json::Map::new();
+        responses.insert("answer".into(), serde_json::json!("yes"));
+
+        for op in [
+            Operation::TasksUpdate {
+                server: "s".into(),
+                task_id: "task-1".into(),
+                input_responses: responses,
+            },
+            Operation::TasksCancel {
+                server: "s".into(),
+                task_id: "task-1".into(),
+            },
+        ] {
+            #[cfg(unix)]
+            let base = tempfile::tempdir_in("/tmp").unwrap();
+            #[cfg(windows)]
+            let base = tempfile::tempdir().unwrap();
+            let root = base.path().canonicalize().unwrap().join("runtime");
+            let paths = Paths::with_root(root.join("config.json"), "side-fx", &root).unwrap();
+
+            // Pre-write transport failure (no listener): outcome_unknown stays false.
+            let pre_req = paths
+                .request("digest", op.clone(), Duration::from_secs(2))
+                .unwrap();
+            let pre_dispatched = AtomicBool::new(false);
+            let pre_err = exchange_tracked(&paths, &pre_req, &pre_dispatched)
+                .await
+                .unwrap_err();
+            let pre_failure = pre_err.downcast_ref::<Failure>().unwrap();
+            assert_eq!(pre_failure.kind, "daemon_transport");
+            assert!(!pre_failure.outcome_unknown);
+            assert!(!pre_dispatched.load(Ordering::Acquire));
+
+            // Post-write disconnect: outcome_unknown must be true.
+            let mut listener = platform::local::Listener::bind(paths.socket.as_os_str()).unwrap();
+            platform::secure_endpoint(&paths.socket).unwrap();
+            let server = tokio::spawn(async move {
+                let mut conn = listener.accept().await.unwrap();
+                let (_req, _lease) = ipc::read_frame_with_budget::<_, Request>(
+                    &mut conn,
+                    ipc::REQUEST_LIMIT,
+                    ByteBudget::global(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                // Drop connection immediately after receiving request.
+            });
+
+            let req = paths.request("digest", op, Duration::from_secs(2)).unwrap();
+            let dispatched = AtomicBool::new(false);
+            let err = exchange_tracked(&paths, &req, &dispatched)
+                .await
+                .unwrap_err();
+            let failure = err.downcast_ref::<Failure>().unwrap();
+            assert_eq!(failure.kind, "daemon_transport");
+            assert!(failure.outcome_unknown);
+            assert!(dispatched.load(Ordering::Acquire));
+            server.await.unwrap();
+        }
     }
 }

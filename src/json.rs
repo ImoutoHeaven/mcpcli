@@ -582,6 +582,8 @@ mod tests {
                 tool: "echo".into(),
                 arguments: arguments.clone(),
                 inline_media: false,
+                detach: false,
+                expected_schema: None,
             },
         };
         let wire = serde_json::to_vec(&request).unwrap();
@@ -627,6 +629,8 @@ mod tests {
                     tool: "echo".into(),
                     arguments: Map::from_iter([("value".into(), value.clone())]),
                     inline_media: false,
+                    detach: false,
+                    expected_schema: None,
                 },
             };
             let received: crate::ipc::Request =
