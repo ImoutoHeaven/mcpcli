@@ -316,9 +316,13 @@ Both IPC admission and daemon queueing use that shared deadline. Startup and
 queueing consume the pre-dispatch budget without shortening later progress gaps.
 
 `startup.lock` serializes concurrent starters and `daemon.lock` stays locked
-for the daemon's lifetime. Lock files are never unlinked, and stale Unix
-sockets are unlinked only while holding `daemon.lock` after verifying socket
-ownership. Unix peers are checked against the effective UID; Windows named
+for the daemon's lifetime. A daemon retries lifetime-lock contention for up to
+the existing 10-second startup budget, including brief locks held by
+running-status checks. A duplicate foreground `daemon run` also waits for
+the lock and fails if it stays occupied for the full budget. Lock files are
+never unlinked, and stale Unix sockets are unlinked only while holding
+`daemon.lock` after verifying socket ownership. Unix peers are checked
+against the effective UID; Windows named
 pipes block remote clients and check the peer token SID.
 
 JSON IPC frames use a 4-byte little-endian byte length followed by nonempty

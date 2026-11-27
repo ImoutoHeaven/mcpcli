@@ -11,7 +11,7 @@ use crate::platform::{
     self,
     local::{Conn, Listener},
 };
-use crate::runtime::{Lock, Paths, State};
+use crate::runtime::{Lock, Paths, START_WAIT, State};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -1903,8 +1903,9 @@ pub async fn run_with_options(
     config: LoadedConfig,
     options: DaemonOptions,
 ) -> Result<()> {
-    let _lifetime =
-        Lock::try_acquire(&paths.daemon_lock())?.context("daemon is already running")?;
+    let _lifetime = Lock::acquire(&paths.daemon_lock(), START_WAIT)
+        .await
+        .context("cannot acquire daemon lifetime lock")?;
     paths.remove_socket()?;
     let mut listener = Listener::bind(paths.socket.as_os_str())?;
     let mut control_listener = Listener::bind(paths.control_socket.as_os_str())?;
@@ -2175,6 +2176,83 @@ mod tests {
             }
         });
         (url, task)
+    }
+
+    #[tokio::test]
+    async fn daemon_waits_for_running_probe_and_preserves_the_active_owner() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let config_path = base_path.join("mcpcli.json");
+        std::fs::write(&config_path, r#"{"servers":{}}"#).unwrap();
+        let loaded = LoadedConfig::load(&config_path).unwrap();
+        let paths =
+            Paths::with_root(loaded.path.clone(), "startup-probe", &base_path.join("run")).unwrap();
+
+        let probe = Lock::try_acquire(&paths.daemon_lock()).unwrap().unwrap();
+        let mut daemon = Box::pin(run_with_options(
+            paths.clone(),
+            loaded.clone(),
+            DaemonOptions::default(),
+        ));
+        let first_poll = futures_util::poll!(&mut daemon);
+        assert!(
+            first_poll.is_pending(),
+            "daemon must wait for the running probe to release its lock: {first_poll:?}"
+        );
+        assert!(State::load(&paths).unwrap().is_none());
+        #[cfg(unix)]
+        assert!(!paths.socket.exists() && !paths.control_socket.exists());
+        drop(probe);
+
+        let daemon_task = tokio::spawn(daemon);
+        timeout(runtime::START_WAIT, async {
+            loop {
+                if runtime::exchange(
+                    &paths,
+                    &paths
+                        .request("", Operation::Status, Duration::from_millis(200))
+                        .unwrap(),
+                )
+                .await
+                .is_ok()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let state = State::load(&paths).unwrap().unwrap();
+
+        let duplicate = timeout(
+            runtime::START_WAIT + Duration::from_secs(2),
+            run_with_options(paths.clone(), loaded, DaemonOptions::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        let diagnostic = format!("{duplicate:#}");
+        assert!(diagnostic.contains("cannot acquire daemon lifetime lock"));
+        assert!(diagnostic.contains("timed out waiting for runtime lock"));
+        assert_eq!(State::load(&paths).unwrap().unwrap().epoch, state.epoch);
+        assert!(!daemon_task.is_finished());
+        let (status, _lease) = runtime::exchange(
+            &paths,
+            &paths
+                .request("", Operation::Status, Duration::from_secs(2))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        assert!(status.result.is_some());
+
+        runtime::stop(&paths).await.unwrap();
+        daemon_task.await.unwrap().unwrap();
+        assert!(State::load(&paths).unwrap().unwrap().clean_stop);
     }
 
     #[tokio::test]

@@ -969,9 +969,9 @@ pub async fn ensure(paths: &Paths, loaded: &LoadedConfig, explicit: bool) -> Res
         {
             return Ok(());
         }
-        if child.try_wait()?.is_some() {
+        if let Some(status) = child.try_wait()? {
             bail!(
-                "daemon exited during startup; inspect {}",
+                "daemon exited during startup; inspect {} (child {status})",
                 paths.directory.join("startup.log").display()
             );
         }
