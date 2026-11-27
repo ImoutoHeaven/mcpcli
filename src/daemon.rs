@@ -1137,7 +1137,10 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         request.timeout_ms
     };
     let remaining_total = request.deadline_ms.saturating_sub(now_ms).min(total_cap_ms);
-    let remaining_admission = remaining_total.min(request.timeout_ms);
+    let remaining_admission = request
+        .admission_deadline_ms()
+        .saturating_sub(now_ms)
+        .min(request.timeout_ms);
     if remaining_admission == 0 {
         send(
             &mut stream,
@@ -1965,6 +1968,7 @@ mod tests {
                 },
                 Duration::from_secs(10),
                 Some(Duration::from_secs(5)),
+                Duration::ZERO,
             )
             .unwrap();
         let err = app.validate(&call_req).unwrap_err();
@@ -2123,15 +2127,20 @@ mod tests {
                             let _ = write_half.write_all(header.as_bytes()).await;
                             match tool {
                                 "progress_ok" => {
-                                    for step in 1..=6 {
-                                        tokio::time::sleep(Duration::from_millis(220)).await;
+                                    let interval = req["params"]["arguments"]["interval_ms"]
+                                        .as_u64()
+                                        .unwrap_or(220);
+                                    let steps =
+                                        req["params"]["arguments"]["steps"].as_u64().unwrap_or(6);
+                                    for step in 1..=steps {
+                                        tokio::time::sleep(Duration::from_millis(interval)).await;
                                         let notif = json!({
                                             "jsonrpc": "2.0",
                                             "method": "notifications/progress",
                                             "params": {
                                                 "progressToken": token,
                                                 "progress": step,
-                                                "total": 6
+                                                "total": steps
                                             }
                                         });
                                         let sse = format!(
@@ -2270,6 +2279,7 @@ mod tests {
                 },
                 Duration::from_millis(600),
                 None,
+                Duration::ZERO,
             )
             .unwrap();
         let (resp_ok, _) = runtime::exchange(&paths, &req_ok).await.unwrap();
@@ -2278,6 +2288,32 @@ mod tests {
             val["result"]["content"][0]["text"], "completed",
             "got: {val}"
         );
+
+        // Startup consumes admission time without shortening later progress gaps.
+        for hard in [None, Some(Duration::from_millis(2_500))] {
+            let request = paths
+                .request_call_with_budgets(
+                    &loaded.digest,
+                    Operation::Call {
+                        server: "mock".into(),
+                        tool: "progress_ok".into(),
+                        arguments: json!({"interval_ms": 700, "steps": 2})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                        inline_media: false,
+                    },
+                    Duration::from_secs(1),
+                    hard,
+                    Duration::from_millis(400),
+                )
+                .unwrap();
+            let (response, _) = runtime::exchange(&paths, &request).await.unwrap();
+            assert_eq!(
+                response.result.unwrap()["result"]["content"][0]["text"],
+                "completed"
+            );
+        }
 
         // 2. Silent tool times out at ~500ms with exit 5 and outcome_unknown = true.
         let started = Instant::now();
@@ -2292,6 +2328,7 @@ mod tests {
                 },
                 Duration::from_millis(500),
                 None,
+                Duration::ZERO,
             )
             .unwrap();
         let err_silent = runtime::exchange(&paths, &req_silent).await.unwrap_err();
@@ -2314,6 +2351,7 @@ mod tests {
                 },
                 Duration::from_millis(500),
                 Some(Duration::from_millis(900)),
+                Duration::ZERO,
             )
             .unwrap();
         let err_capped = runtime::exchange(&paths, &req_capped).await.unwrap_err();
@@ -2339,6 +2377,7 @@ mod tests {
                     },
                     Duration::from_millis(800),
                     None,
+                    Duration::ZERO,
                 )
                 .unwrap();
             runtime::exchange(&long_paths, &req).await
@@ -2357,6 +2396,7 @@ mod tests {
                 },
                 Duration::from_millis(350),
                 None,
+                Duration::ZERO,
             )
             .unwrap();
         let err_queued = runtime::exchange(&paths, &req_queued).await.unwrap_err();

@@ -38,6 +38,18 @@ pub struct Request {
     pub operation: Operation,
 }
 
+impl Request {
+    pub fn admission_deadline_ms(&self) -> u64 {
+        let hard_extension = if self.operation.is_call() {
+            self.max_timeout_ms
+                .map_or(0, |hard| hard.saturating_sub(self.timeout_ms))
+        } else {
+            0
+        };
+        self.deadline_ms.saturating_sub(hard_extension)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {

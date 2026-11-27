@@ -837,13 +837,14 @@ async fn remote(
             "deadline elapsed while starting the daemon; tool was not dispatched",
         )
     })??;
-    let (remaining, remaining_hard) = check_dispatch_budgets(budget, hard, started.elapsed())?;
+    let elapsed = started.elapsed();
+    let (remaining, _) = check_dispatch_budgets(budget, hard, elapsed)?;
     let (input_lease, operation) = {
         let (operation, lease) = operation.into_parts();
         (lease, operation)
     };
     let request = if operation.is_call() {
-        paths.request_call_with_budgets(&loaded.digest, operation, remaining, remaining_hard)?
+        paths.request_call_with_budgets(&loaded.digest, operation, budget, hard, elapsed)?
     } else {
         paths.request_with_explicit(
             &loaded.digest,

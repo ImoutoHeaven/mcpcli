@@ -3,7 +3,7 @@ use crate::budget::{ByteBudget, ByteLease, format_bytes};
 use crate::config::{LoadedConfig, valid_name};
 use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
 use crate::platform;
-pub use crate::platform::{private_dir, secure_file};
+use crate::platform::{private_dir, secure_file};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -175,16 +175,18 @@ impl Paths {
         operation: Operation,
         timeout: Duration,
         max_timeout: Option<Duration>,
+        elapsed: Duration,
     ) -> Result<Request> {
         let timeout_ms = timeout.as_millis().min(3_600_000) as u64;
-        let now_ms = platform::monotonic_millis()?;
+        let started_ms = platform::monotonic_millis()?
+            .saturating_sub(elapsed.as_millis().min(u128::from(u64::MAX)) as u64);
         let (max_timeout_ms, deadline_ms, explicit_deadline_ms) = match max_timeout {
             Some(max) => {
                 let max_ms = max.as_millis().min(86_400_000) as u64;
-                let deadline_ms = now_ms.saturating_add(max_ms);
+                let deadline_ms = started_ms.saturating_add(max_ms);
                 (Some(max_ms), deadline_ms, Some(deadline_ms))
             }
-            None => (None, now_ms.saturating_add(timeout_ms), None),
+            None => (None, started_ms.saturating_add(timeout_ms), None),
         };
         Ok(Request {
             protocol: ipc::PROTOCOL,
@@ -300,7 +302,10 @@ pub async fn exchange_tracked_with_options(
         .deadline_ms
         .saturating_sub(now_ms)
         .min(total_budget_cap_ms);
-    let remaining_admission = remaining_total.min(request.timeout_ms);
+    let remaining_admission = request
+        .admission_deadline_ms()
+        .saturating_sub(now_ms)
+        .min(request.timeout_ms);
     if remaining_admission == 0 {
         return Err(
             Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
@@ -821,6 +826,78 @@ mod tests {
         assert_eq!(loaded.epoch, state.epoch);
         assert!(!paths.directory.join("state.json.tmp").exists());
     }
+    #[test]
+    fn call_request_keeps_idle_and_shared_deadlines_after_startup() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap().join("runtime");
+        let paths = Paths::with_root(root.join("config.json"), "budgets", &root).unwrap();
+        for hard_ms in [None, Some(1_000), Some(5_000)] {
+            let before = platform::monotonic_millis().unwrap();
+            let request = paths
+                .request_call_with_budgets(
+                    "digest",
+                    Operation::Call {
+                        server: "server".into(),
+                        tool: "tool".into(),
+                        arguments: serde_json::Map::new(),
+                        inline_media: false,
+                    },
+                    Duration::from_millis(1_000),
+                    hard_ms.map(Duration::from_millis),
+                    Duration::from_millis(700),
+                )
+                .unwrap();
+            let after = platform::monotonic_millis().unwrap();
+            assert_eq!(request.timeout_ms, 1_000);
+            assert_eq!(request.max_timeout_ms, hard_ms);
+            let remaining_total = hard_ms.unwrap_or(1_000) - 700;
+            assert!(
+                (before + remaining_total..=after + remaining_total).contains(&request.deadline_ms)
+            );
+            assert!((before + 300..=after + 300).contains(&request.admission_deadline_ms()));
+            assert_eq!(
+                request.explicit_deadline_ms,
+                hard_ms.map(|_| request.deadline_ms)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_call_admission_does_not_connect_with_hard_time_remaining() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().canonicalize().unwrap().join("runtime");
+        let paths = Paths::with_root(root.join("config.json"), "budgets", &root).unwrap();
+        let request = paths
+            .request_call_with_budgets(
+                "digest",
+                Operation::Call {
+                    server: "server".into(),
+                    tool: "tool".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_secs(1),
+                Some(Duration::from_secs(5)),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+        assert!(request.deadline_ms > platform::monotonic_millis().unwrap());
+        let dispatched = AtomicBool::new(false);
+        let error = exchange_tracked(&paths, &request, &dispatched)
+            .await
+            .unwrap_err();
+        let failure = error.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.kind, "timeout");
+        assert!(!failure.outcome_unknown);
+        assert!(!dispatched.load(Ordering::Acquire));
+    }
+
     #[tokio::test]
     async fn expired_request_never_connects_or_marks_dispatched() {
         #[cfg(unix)]
