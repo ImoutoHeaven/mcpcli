@@ -21,8 +21,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWrite};
-use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -623,6 +623,7 @@ impl App {
         cancel: CancellationToken,
         conn_permit: &mut Option<OwnedSemaphorePermit>,
         polling_started: &AtomicBool,
+        grace_notify: Option<&Notify>,
     ) -> std::result::Result<TaskSnapshot, Failure> {
         let _waiter_permit = self.task_waiters.try_acquire().map_err(|_| {
             let mut fail =
@@ -636,6 +637,9 @@ impl App {
         // Release the MAX_CONNECTIONS inbound permit once the task_waiters slot is held.
         drop(conn_permit.take());
         polling_started.store(true, Ordering::Release);
+        if let Some(notify) = grace_notify {
+            notify.notify_one();
+        }
 
         let server_state = self.servers[server].clone();
         let poll_budgets = TaskPollBudgets {
@@ -751,6 +755,7 @@ impl App {
         .map_err(|e| mcp_op_error(e, Some(server)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         operation: &Operation,
@@ -759,6 +764,7 @@ impl App {
         client_cancel: Option<&CancellationToken>,
         conn_permit: &mut Option<OwnedSemaphorePermit>,
         polling_started: &AtomicBool,
+        grace_notify: Option<&Notify>,
     ) -> ExecutionOutcome {
         let deadline = deadlines.pre_dispatch;
         let empty = || self.options.budget.empty_lease();
@@ -1142,6 +1148,7 @@ impl App {
                                 cancel,
                                 conn_permit,
                                 polling_started,
+                                grace_notify,
                             )
                             .await?;
                         let Some(mut result_val) = snapshot
@@ -1262,6 +1269,7 @@ impl App {
                             cancel,
                             conn_permit,
                             polling_started,
+                            grace_notify,
                         )
                         .await?;
                     let inflight = if !*inline_media {
@@ -1725,15 +1733,8 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         return;
     }
     let admitted = Instant::now();
-    let outer_grace = if uses_dual_clock && request.max_timeout_ms.is_some() {
-        DUAL_CLOCK_OUTER_GRACE
-    } else {
-        Duration::ZERO
-    };
-    let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        admitted
-            + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_cap_ms))
-            + outer_grace
+    let mut hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
+        admitted + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_cap_ms))
     });
     if matches!(request.operation, Operation::Stop) {
         send(
@@ -1769,44 +1770,23 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
     if uses_dual_clock {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let client_cancel = CancellationToken::new();
+        let grace_notify = Notify::new();
         let owns_task = request.operation.is_call();
         let mut sentinel_received = false;
+        let mut grace_granted = false;
+        let outer_deadline =
+            (!unbounded_dual_clock).then(|| admitted + Duration::from_millis(remaining_total));
+        let mut outer_sleep = outer_deadline.map(|d| Box::pin(tokio::time::sleep_until(d)));
 
-        let exec_fut = async {
-            if unbounded_dual_clock {
-                app.execute(
-                    &request.operation,
-                    deadlines,
-                    &dispatched,
-                    Some(&client_cancel),
-                    &mut conn_permit,
-                    &polling_started,
-                )
-                .await
-            } else {
-                match timeout(
-                    Duration::from_millis(remaining_total) + outer_grace,
-                    app.execute(
-                        &request.operation,
-                        deadlines,
-                        &dispatched,
-                        Some(&client_cancel),
-                        &mut conn_permit,
-                        &polling_started,
-                    ),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(Failure::new(
-                        5,
-                        "timeout",
-                        "request deadline exceeded, including queue and connection time; cancellation is not rollback",
-                    )
-                    .uncertain(dispatched.load(Ordering::Acquire))),
-                }
-            }
-        };
+        let exec_fut = app.execute(
+            &request.operation,
+            deadlines,
+            &dispatched,
+            Some(&client_cancel),
+            &mut conn_permit,
+            &polling_started,
+            (!unbounded_dual_clock).then_some(&grace_notify),
+        );
         tokio::pin!(exec_fut);
 
         let result = loop {
@@ -1821,6 +1801,31 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
                     .uncertain(dispatched.load(Ordering::Acquire)));
                 }
                 result = &mut exec_fut => break result,
+                () = grace_notify.notified(), if !unbounded_dual_clock && !grace_granted => {
+                    grace_granted = true;
+                    let _ = writer.write_all(&[0u8; 4]).await;
+                    let _ = writer.flush().await;
+                    if let Some(d) = outer_deadline {
+                        outer_sleep = Some(Box::pin(tokio::time::sleep_until(
+                            d + DUAL_CLOCK_OUTER_GRACE,
+                        )));
+                    }
+                    hard_deadline = hard_deadline.map(|d| d + DUAL_CLOCK_OUTER_GRACE);
+                }
+                () = async {
+                    if let Some(sleep) = outer_sleep.as_mut() {
+                        sleep.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    break Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded, including queue and connection time; cancellation is not rollback",
+                    )
+                    .uncertain(dispatched.load(Ordering::Acquire)));
+                }
                 read_res = reader.read(&mut extra), if !sentinel_received => {
                     match read_res {
                         Ok(1) => {
@@ -1863,6 +1868,7 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
             None,
             &mut conn_permit,
             &polling_started,
+            None,
         ),
     );
     let result = tokio::select! {
@@ -2508,6 +2514,7 @@ mod tests {
             None,
             &mut ordinary_permit,
             &polling,
+            None,
         ));
         assert!(futures_util::poll!(ordinary.as_mut()).is_pending());
         let operations: Vec<_> = (0..MAX_IN_FLIGHT)
@@ -2521,7 +2528,7 @@ mod tests {
             .iter()
             .zip(event_permits.iter_mut())
             .map(|(op, permit)| {
-                Box::pin(app.execute(op, deadlines, &dispatched, None, permit, &polling))
+                Box::pin(app.execute(op, deadlines, &dispatched, None, permit, &polling, None))
             })
             .collect();
         for event in &mut events {
@@ -2702,6 +2709,7 @@ mod tests {
                 None,
                 &mut permit,
                 &polling,
+                None,
             )
             .await
             .err()
@@ -2721,6 +2729,7 @@ mod tests {
                 None,
                 &mut permit,
                 &polling,
+                None,
             )
             .await
             .err()
@@ -3340,6 +3349,7 @@ mod tests {
             None,
             &mut active_permit,
             &polling,
+            None,
         );
         tokio::pin!(active);
         timeout(
@@ -3365,6 +3375,7 @@ mod tests {
             None,
             &mut queued_permit,
             &polling,
+            None,
         );
         tokio::pin!(queued);
         assert!(futures_util::poll!(&mut queued).is_pending());
@@ -3381,6 +3392,7 @@ mod tests {
             None,
             &mut reset_permit,
             &polling,
+            None,
         );
         tokio::pin!(reset);
         assert!(futures_util::poll!(&mut reset).is_pending());
@@ -3420,6 +3432,7 @@ mod tests {
                 None,
                 &mut fresh_permit,
                 &polling,
+                None,
             )
             .await
             .unwrap();

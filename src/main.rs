@@ -732,6 +732,17 @@ async fn arguments(
     budget: Duration,
     process_budget: &std::sync::Arc<ByteBudget>,
 ) -> Result<Leased<Map<String, Value>>> {
+    arguments_cancellable(args, file, stdin, budget, process_budget, None).await
+}
+
+async fn arguments_cancellable(
+    args: &Option<String>,
+    file: &Option<PathBuf>,
+    stdin: bool,
+    budget: Duration,
+    process_budget: &std::sync::Arc<ByteBudget>,
+    interrupt: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Leased<Map<String, Value>>> {
     let bytes = if let Some(args) = args {
         read_argument_bytes(args.as_bytes(), process_budget).await?
     } else if let Some(path) = file {
@@ -747,12 +758,29 @@ async fn arguments(
         }
         read_argument_bytes(tokio::fs::File::from_std(file), process_budget).await?
     } else if stdin {
-        timeout(
+        let read_fut = timeout(
             budget,
             read_argument_bytes(tokio::io::stdin(), process_budget),
-        )
-        .await
-        .map_err(|_| Failure::new(5, "timeout", "timed out reading JSON arguments from stdin"))??
+        );
+        if let Some(token) = interrupt {
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    return Err(Failure::new(
+                        130,
+                        "cancelled",
+                        "interrupted while reading JSON arguments from stdin",
+                    )
+                    .into());
+                }
+                res = read_fut => res
+                    .map_err(|_| Failure::new(5, "timeout", "timed out reading JSON arguments from stdin"))??,
+            }
+        } else {
+            read_fut.await.map_err(|_| {
+                Failure::new(5, "timeout", "timed out reading JSON arguments from stdin")
+            })??
+        }
     } else {
         read_argument_bytes(&b"{}"[..], process_budget).await?
     };
@@ -895,6 +923,25 @@ async fn close_after_error(connection: &mut McpConnection, error: &mut anyhow::E
 }
 
 async fn remote(
+    cli: &Cli,
+    loaded: &LoadedConfig,
+    operation: Leased<Operation>,
+    max_timeout: Option<u64>,
+    uncertain: &AtomicBool,
+    interrupt: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<RemoteOutput> {
+    Box::pin(remote_inner(
+        cli,
+        loaded,
+        operation,
+        max_timeout,
+        uncertain,
+        interrupt,
+    ))
+    .await
+}
+
+async fn remote_inner(
     cli: &Cli,
     loaded: &LoadedConfig,
     operation: Leased<Operation>,
@@ -1058,7 +1105,7 @@ async fn remote(
                                     let conn_ref = &connection;
                                     let poll_id = task_id.clone();
                                     let cancel_id = task_id.clone();
-                                    let mut snapshot = poll_task_to_completion(
+                                    let mut snapshot = Box::pin(poll_task_to_completion(
                                         Some(seed),
                                         task_id.clone(),
                                         true,
@@ -1074,7 +1121,7 @@ async fn remote(
                                                     .await;
                                             }
                                         },
-                                    )
+                                    ))
                                     .await
                                     .map_err(|e| {
                                         anyhow::Error::from(daemon::mcp_op_error(e, Some(server)))
@@ -1179,7 +1226,7 @@ async fn remote(
                                 hard_deadline: hard.map(|h| started + h),
                             };
                             let conn_ref = &connection;
-                            let mut snapshot = poll_task_to_completion(
+                            let mut snapshot = Box::pin(poll_task_to_completion(
                                 None,
                                 task_id.clone(),
                                 false,
@@ -1187,7 +1234,7 @@ async fn remote(
                                 cancel_token.clone(),
                                 |step_budget| conn_ref.get_task(task_id, step_budget),
                                 |_| async {},
-                            )
+                            ))
                             .await
                             .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
                             let inflight = if !*inline_media {
@@ -1273,6 +1320,7 @@ async fn remote(
                 }
             }
         };
+        let oneshot_fut = Box::pin(oneshot_fut);
         if uses_dual_clock {
             if let Some(h) = hard {
                 return timeout(h + Duration::from_secs(10), oneshot_fut)
@@ -1353,9 +1401,12 @@ async fn remote(
     };
     let request = Leased::new(request, input_lease);
     let (response_lease, response) = if let Some(token) = interrupt {
-        runtime::exchange_cancellable(&paths, &request, uncertain, token).await
+        Box::pin(runtime::exchange_cancellable(
+            &paths, &request, uncertain, token,
+        ))
+        .await
     } else {
-        runtime::exchange_tracked(&paths, &request, uncertain).await
+        Box::pin(runtime::exchange_tracked(&paths, &request, uncertain)).await
     }
     .map(|(response, lease)| (lease, response))?;
     Ok(RemoteOutput {
@@ -2038,12 +2089,13 @@ async fn run(
             let args = if !kv_args.is_empty() {
                 parse_kv_cli_arguments(kv_args, ByteBudget::global())?
             } else {
-                arguments(
+                arguments_cancellable(
                     args,
                     args_file,
                     *stdin,
                     Duration::from_secs(timeout_secs),
                     ByteBudget::global(),
+                    interrupt,
                 )
                 .await?
             };
@@ -2868,11 +2920,10 @@ async fn entry(cli: Cli) -> i32 {
     tokio::pin!(signal);
     let mut signal_consumed = false;
     let result = if foreground {
-        run(&cli, &uncertain, None).await
+        Box::pin(run(&cli, &uncertain, None)).await
     } else if is_event_stream {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let stream_fut = run_events_stream(&cli, cancel.clone());
-        tokio::pin!(stream_fut);
+        let mut stream_fut = Box::pin(run_events_stream(&cli, cancel.clone()));
         let mut interrupted_code: Option<i32> = None;
         let res = loop {
             tokio::select! {
@@ -2919,8 +2970,7 @@ async fn entry(cli: Cli) -> i32 {
         }
     } else if uses_dual_clock {
         let cancel = tokio_util::sync::CancellationToken::new();
-        let run_fut = run(&cli, &uncertain, Some(&cancel));
-        tokio::pin!(run_fut);
+        let mut run_fut = Box::pin(run(&cli, &uncertain, Some(&cancel)));
         let mut interrupted_code: Option<i32> = None;
         let mut fallback_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
         let res = loop {
@@ -2997,7 +3047,7 @@ async fn entry(cli: Cli) -> i32 {
     } else {
         tokio::select! {
             biased;
-            result = run(&cli, &uncertain, None) => result,
+            result = Box::pin(run(&cli, &uncertain, None)) => result,
             signal = &mut signal => {
                 signal_consumed = true;
                 match signal {
@@ -3235,7 +3285,7 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let code = runtime.block_on(entry(cli));
+    let code = runtime.block_on(Box::pin(entry(cli)));
     // Drop async transports before exit, while bounding an interrupted stdin blocking reader.
     runtime.shutdown_timeout(Duration::from_secs(3));
     std::process::ExitCode::from(code as u8)
@@ -4076,5 +4126,21 @@ mod tests {
         .unwrap();
         assert_eq!(rem, Duration::from_millis(1));
         assert_eq!(rem_hard, Some(Duration::from_millis(1001)));
+    }
+
+    #[test]
+    fn top_level_futures_stay_within_windows_stack_budget() {
+        let cli = Cli::try_parse_from(["mcpcli", "catalog"]).unwrap();
+        let uncertain = AtomicBool::new(false);
+        let run_size = std::mem::size_of_val(&run(&cli, &uncertain, None));
+        let entry_size = std::mem::size_of_val(&entry(cli));
+        assert!(
+            entry_size < 32 * 1024,
+            "entry future is {entry_size} bytes; keep under 32 KiB for Windows 1 MiB stacks"
+        );
+        assert!(
+            run_size < 64 * 1024,
+            "run future is {run_size} bytes; keep under 64 KiB for Windows 1 MiB stacks"
+        );
     }
 }

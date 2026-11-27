@@ -319,6 +319,7 @@ async fn read_header_resumable<R: AsyncRead + Unpin>(
     header: &mut [u8; 4],
     filled: &mut usize,
     max: usize,
+    allow_zero_marker: bool,
 ) -> io::Result<Option<usize>> {
     while *filled < 4 {
         let n = reader.read(&mut header[*filled..]).await?;
@@ -334,6 +335,10 @@ async fn read_header_resumable<R: AsyncRead + Unpin>(
         *filled += n;
     }
     let len = u32::from_le_bytes(*header) as usize;
+    if len == 0 && allow_zero_marker {
+        *filled = 0;
+        return Ok(Some(0));
+    }
     if len == 0 || len > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -390,22 +395,18 @@ pub async fn exchange_cancellable_with_options(
         .into());
     }
 
-    let grace = if uses_dual_clock && request.max_timeout_ms.is_some() {
-        DUAL_CLOCK_GRACE
-    } else {
-        Duration::ZERO
-    };
+    let allow_grace = uses_dual_clock && request.max_timeout_ms.is_some();
     let started = Instant::now();
     let admission_deadline = started + Duration::from_millis(remaining_admission);
-    let stage1b_deadline = if unbounded_dual_clock {
+    // Strict admission/pre-task deadline: +5s DUAL_CLOCK_GRACE is granted only after
+    // the daemon signals task polling with a 4-byte zero marker ([0u8; 4]).
+    let mut stage1b_deadline = if unbounded_dual_clock {
         None
     } else {
-        Some(started + Duration::from_millis(remaining_total) + grace)
+        Some(started + Duration::from_millis(remaining_total))
     };
     let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        started
-            + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms))
-            + grace
+        started + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms))
     });
 
     let ignored = AtomicBool::new(false);
@@ -536,17 +537,20 @@ pub async fn exchange_cancellable_with_options(
     let mut header = [0u8; 4];
     let mut header_read = 0usize;
     let mut cancelled_after_sentinel = false;
+    let mut grace_granted = false;
     let mut stage2_deadline = hard_deadline;
 
-    let response_len = match interrupt {
-        Some(token) => {
-            let interrupted = {
+    let response_len = loop {
+        let allow_zero = allow_grace && !grace_granted;
+        let step = match interrupt {
+            Some(token) => {
                 let read_header = async {
                     read_header_resumable(
                         &mut stream,
                         &mut header,
                         &mut header_read,
                         ipc::RESPONSE_LIMIT,
+                        allow_zero,
                     )
                     .await?
                     .context("daemon disconnected before returning a result")
@@ -585,18 +589,55 @@ pub async fn exchange_cancellable_with_options(
                         }
                     }
                 }
-            };
-            match interrupted {
-                Ok(len) => len,
-                Err(true) => {
-                    cancelled_after_sentinel = true;
-                    let cancel_deadline = Instant::now() + CANCEL_SENTINEL_WAIT;
-                    stage2_deadline = Some(cancel_deadline);
-                    let _ = timeout_at(cancel_deadline, async {
-                        stream.write_all(&[0u8]).await?;
-                        stream.flush().await
-                    })
-                    .await;
+            }
+            None => {
+                let read_header = async {
+                    read_header_resumable(
+                        &mut stream,
+                        &mut header,
+                        &mut header_read,
+                        ipc::RESPONSE_LIMIT,
+                        allow_zero,
+                    )
+                    .await?
+                    .context("daemon disconnected before returning a result")
+                };
+                match stage1b_deadline {
+                    Some(deadline) => match timeout_at(deadline, read_header).await {
+                        Ok(Ok(len)) => Ok(len),
+                        Ok(Err(error)) => return Err(map_stage1_err(error)),
+                        Err(_) => {
+                            return Err(Failure::new(
+                                5,
+                                "timeout",
+                                "daemon deadline exceeded; cancellation is not rollback",
+                            )
+                            .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
+                            .into());
+                        }
+                    },
+                    None => Ok(read_header.await.map_err(map_stage1_err)?),
+                }
+            }
+        };
+
+        match step {
+            Ok(0) => {
+                grace_granted = true;
+                stage1b_deadline = stage1b_deadline.map(|d| d + DUAL_CLOCK_GRACE);
+                stage2_deadline = stage2_deadline.map(|d| d + DUAL_CLOCK_GRACE);
+            }
+            Ok(len) => break len,
+            Err(true) => {
+                cancelled_after_sentinel = true;
+                let cancel_deadline = Instant::now() + CANCEL_SENTINEL_WAIT;
+                stage2_deadline = Some(cancel_deadline);
+                let _ = timeout_at(cancel_deadline, async {
+                    stream.write_all(&[0u8]).await?;
+                    stream.flush().await
+                })
+                .await;
+                let len = loop {
                     match timeout_at(
                         cancel_deadline,
                         read_header_resumable(
@@ -604,44 +645,21 @@ pub async fn exchange_cancellable_with_options(
                             &mut header,
                             &mut header_read,
                             ipc::RESPONSE_LIMIT,
+                            allow_grace && !grace_granted,
                         ),
                     )
                     .await
                     {
-                        Ok(Ok(Some(len))) => len,
+                        Ok(Ok(Some(0))) => {
+                            grace_granted = true;
+                        }
+                        Ok(Ok(Some(len))) => break len,
                         _ => return Err(local_cancelled()),
                     }
-                }
-                Err(false) => unreachable!(),
+                };
+                break len;
             }
-        }
-        None => {
-            let read_header = async {
-                read_header_resumable(
-                    &mut stream,
-                    &mut header,
-                    &mut header_read,
-                    ipc::RESPONSE_LIMIT,
-                )
-                .await?
-                .context("daemon disconnected before returning a result")
-            };
-            match stage1b_deadline {
-                Some(deadline) => match timeout_at(deadline, read_header).await {
-                    Ok(Ok(len)) => len,
-                    Ok(Err(error)) => return Err(map_stage1_err(error)),
-                    Err(_) => {
-                        return Err(Failure::new(
-                            5,
-                            "timeout",
-                            "daemon deadline exceeded; cancellation is not rollback",
-                        )
-                        .uncertain(has_side_effects && write_tracker.load(Ordering::Acquire))
-                        .into());
-                    }
-                },
-                None => read_header.await.map_err(map_stage1_err)?,
-            }
+            Err(false) => unreachable!(),
         }
     };
 
@@ -1222,7 +1240,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            // Reply after remaining_total (150ms) has elapsed, inside the +5s grace window.
+            // Signal task polling grace with [0u8; 4], then reply after remaining_total (150ms).
+            conn.write_all(&[0u8; 4]).await.unwrap();
+            conn.flush().await.unwrap();
             sleep(Duration::from_millis(300)).await;
             let resp = Response {
                 protocol: ipc::PROTOCOL,
