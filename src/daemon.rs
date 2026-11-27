@@ -663,6 +663,16 @@ impl App {
                 let server = server.to_owned();
                 async move {
                     let step_deadline = Instant::now() + step_budget;
+                    let mut state = tokio::select! {
+                        biased;
+                        () = poll_cancel.cancelled() => {
+                            return Err(McpOpError::new(4, "cancelled", "MCP task poll cancelled"));
+                        }
+                        res = timeout_at(step_deadline, server_state.lock()) => match res {
+                            Ok(guard) => guard,
+                            Err(_) => return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out waiting for server lock")),
+                        },
+                    };
                     let _work = tokio::select! {
                         biased;
                         () = poll_cancel.cancelled() => {
@@ -672,16 +682,6 @@ impl App {
                             Ok(Ok(permit)) => permit,
                             Ok(Err(_)) => return Err(McpOpError::new(1, "stopping", "daemon is stopping")),
                             Err(_) => return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out while queued")),
-                        },
-                    };
-                    let mut state = tokio::select! {
-                        biased;
-                        () = poll_cancel.cancelled() => {
-                            return Err(McpOpError::new(4, "cancelled", "MCP task poll cancelled"));
-                        }
-                        res = timeout_at(step_deadline, server_state.lock()) => match res {
-                            Ok(guard) => guard,
-                            Err(_) => return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out waiting for server lock")),
                         },
                     };
                     if state.conn_id != initial_conn_id || state.connection.is_none() {
@@ -722,11 +722,11 @@ impl App {
                 let cancel_task_id = cancel_task_id.clone();
                 async move {
                     let cancel_deadline = Instant::now() + cancel_budget;
-                    let Ok(Ok(_work)) = timeout_at(cancel_deadline, self.work.acquire()).await
+                    let Ok(mut state) = timeout_at(cancel_deadline, server_state.lock()).await
                     else {
                         return;
                     };
-                    let Ok(mut state) = timeout_at(cancel_deadline, server_state.lock()).await
+                    let Ok(Ok(_work)) = timeout_at(cancel_deadline, self.work.acquire()).await
                     else {
                         return;
                     };
@@ -3557,6 +3557,88 @@ mod tests {
             },
         };
         assert!(app.validate(&enabled_req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn waiting_task_poll_and_cancel_leave_work_for_the_server_lock_holder() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"servers":{"on":{"transport":"http","url":"http://127.0.0.1:9001/mcp"}}}"#,
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "tasklock", &base_path.join("run")).unwrap();
+        let server = Arc::new(Mutex::new(ServerState::default()));
+        let app = App {
+            paths,
+            config,
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([("on".into(), server.clone())]),
+            call_cancels: BTreeMap::from([("on".into(), CallCancelSlot::default())]),
+            work: Semaphore::new(1),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
+            shutdown: CancellationToken::new(),
+        };
+        let server_guard = server.lock().await;
+        let connections = Arc::new(Semaphore::new(1));
+        let mut conn_permit = Some(connections.clone().acquire_owned().await.unwrap());
+        let polling_started = AtomicBool::new(false);
+        let cancel = CancellationToken::new();
+        let mut polling = Box::pin(app.poll_task_in_daemon(
+            "on",
+            0,
+            None,
+            "task-1".into(),
+            true,
+            ExecuteDeadlines {
+                pre_dispatch: Instant::now() + Duration::from_secs(5),
+                call_idle: Duration::from_secs(5),
+                call_hard: None,
+            },
+            cancel.clone(),
+            &mut conn_permit,
+            &polling_started,
+            None,
+        ));
+        assert!(poll_fn(|cx| Poll::Ready(polling.as_mut().poll(cx).is_pending())).await);
+        assert!(polling_started.load(Ordering::Acquire));
+        assert_eq!(connections.available_permits(), 1);
+        let work = app
+            .work
+            .try_acquire()
+            .expect("the server lock holder must still be able to dispatch work");
+        drop(work);
+
+        cancel.cancel();
+        assert!(poll_fn(|cx| Poll::Ready(polling.as_mut().poll(cx).is_pending())).await);
+        let work = app
+            .work
+            .try_acquire()
+            .expect("automatic cancellation must also wait for the server before taking work");
+        drop(work);
+        drop(server_guard);
+        let error = timeout(Duration::from_secs(1), polling)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.kind, "cancelled");
+        assert!(error.outcome_unknown);
+        assert_eq!(error.data.as_ref().unwrap()["taskId"], "task-1");
+        assert_eq!(app.task_waiters.available_permits(), MAX_TASK_WAITERS);
+        assert_eq!(app.work.available_permits(), 1);
+        assert!(!server.lock().await.lost);
     }
 
     #[test]
