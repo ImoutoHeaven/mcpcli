@@ -12,9 +12,13 @@ use mcpcli::{
     },
     ipc::{self, Failure, Operation},
     json as input,
-    mcp::{CallBudgets, McpConnection, PollEventsParams},
+    mcp::{
+        CallBudgets, CallOptions, CallOutcome, McpConnection, PollEventsParams,
+        tasks::{TaskPollBudgets, TaskStatusKind, poll_task_to_completion},
+    },
     media::{InflightBatch, MediaStore},
     runtime::{self, Paths},
+    schema::{ExpectedSchema, MAX_SCHEMA_DEPTH, SchemaMode},
     skills,
 };
 use serde_json::{Map, Value, json};
@@ -30,6 +34,7 @@ use tokio::time::{Instant, timeout, timeout_at};
 #[command(
     version,
     about = "Call MCP tools and read global AGENTS.md and local Agent Skills",
+    after_help = "Agent skill guide: mcpcli --text skills builtin",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -88,6 +93,31 @@ impl Cli {
 
     fn has_explicit_timeout(&self) -> bool {
         self.timeout.is_some()
+    }
+
+    fn uses_dual_clock(&self) -> bool {
+        matches!(
+            self.command,
+            Command::Call { detach: false, .. }
+                | Command::Tasks {
+                    command: TasksCommand::Get { wait: true, .. }
+                }
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+enum CliSchemaMode {
+    Compatible,
+    Exact,
+}
+
+impl From<CliSchemaMode> for SchemaMode {
+    fn from(mode: CliSchemaMode) -> Self {
+        match mode {
+            CliSchemaMode::Compatible => Self::Compatible,
+            CliSchemaMode::Exact => Self::Exact,
+        }
     }
 }
 
@@ -161,17 +191,53 @@ enum Command {
         summary: bool,
     },
     /// Read complete tool metadata and JSON schemas.
-    Inspect { server: String, tool: String },
-    /// Invoke one tool. Arguments must be a JSON object.
+    Inspect {
+        server: String,
+        tool: String,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Verify live tool schema against expected JSON schema file"
+        )]
+        schema: Option<PathBuf>,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliSchemaMode::Compatible,
+            requires = "schema",
+            help = "Schema verification mode (compatible or exact)"
+        )]
+        schema_mode: CliSchemaMode,
+    },
+    /// Invoke one tool. Arguments must be a JSON object or KEY:=VALUE pairs.
     Call {
         server: String,
         tool: String,
-        #[arg(long, conflicts_with_all = ["args_file", "stdin"])]
+        #[arg(long, conflicts_with_all = ["args_file", "stdin", "kv_args"])]
         args: Option<String>,
-        #[arg(long, conflicts_with_all = ["args", "stdin"])]
+        #[arg(long, conflicts_with_all = ["args", "stdin", "kv_args"])]
         args_file: Option<PathBuf>,
-        #[arg(long, conflicts_with_all = ["args", "args_file"])]
+        #[arg(long, conflicts_with_all = ["args", "args_file", "kv_args"])]
         stdin: bool,
+        #[arg(
+            long,
+            help = "Return asynchronous task handles immediately instead of waiting for completion"
+        )]
+        detach: bool,
+        #[arg(
+            long,
+            value_name = "FILE",
+            help = "Verify live tool schema against expected JSON schema file before invoking"
+        )]
+        schema: Option<PathBuf>,
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = CliSchemaMode::Compatible,
+            requires = "schema",
+            help = "Schema verification mode (compatible or exact)"
+        )]
+        schema_mode: CliSchemaMode,
         #[arg(
             long,
             help = "Keep base64 media inline instead of saving to the local media cache"
@@ -183,6 +249,17 @@ enum Command {
             help = "Optional hard wall-clock limit in seconds (1-86400; default unbounded while progress continues)"
         )]
         max_timeout: Option<u64>,
+        #[arg(
+            value_name = "KEY:=VALUE",
+            conflicts_with_all = ["args", "args_file", "stdin"]
+        )]
+        kv_args: Vec<String>,
+    },
+    /// Inspect, update, or cancel asynchronous MCP tasks.
+    #[command(visible_alias = "task")]
+    Tasks {
+        #[command(subcommand)]
+        command: TasksCommand,
     },
     /// Close a server connection and discard its session state.
     Reset {
@@ -312,11 +389,74 @@ enum EventsCommand {
 }
 
 #[derive(Subcommand)]
+enum TasksCommand {
+    /// Fetch current status or wait for completion of an MCP task.
+    Get {
+        server: String,
+        task_id: String,
+        #[arg(
+            long,
+            help = "Wait until the task reaches a terminal state or requires input"
+        )]
+        wait: bool,
+        #[arg(
+            long,
+            help = "Keep base64 media inline instead of saving to the local media cache"
+        )]
+        inline_media: bool,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Optional hard wall-clock limit in seconds (requires --wait)"
+        )]
+        max_timeout: Option<u64>,
+    },
+    /// Submit input responses to an input_required MCP task.
+    Update {
+        server: String,
+        task_id: String,
+        #[arg(long, conflicts_with_all = ["args_file", "stdin"])]
+        args: Option<String>,
+        #[arg(long, conflicts_with_all = ["args", "stdin"])]
+        args_file: Option<PathBuf>,
+        #[arg(long, conflicts_with_all = ["args", "args_file"])]
+        stdin: bool,
+    },
+    /// Request cancellation of an MCP task.
+    Cancel { server: String, task_id: String },
+}
+
+#[derive(Subcommand)]
 enum SkillCommand {
-    List,
-    Show { name: String },
-    Files { name: String },
-    Read { name: String, path: PathBuf },
+    List {
+        #[arg(long, help = "List skills exposed by a remote MCP server")]
+        server: Option<String>,
+    },
+    Show {
+        #[arg(long, help = "Read a skill from a remote MCP server")]
+        server: Option<String>,
+        name: String,
+    },
+    Files {
+        #[arg(long, help = "List files of a skill on a remote MCP server")]
+        server: Option<String>,
+        #[arg(long, help = "Relative directory to read on a remote MCP server")]
+        dir: Option<String>,
+        name: String,
+    },
+    Read {
+        #[arg(long, help = "Read a skill file from a remote MCP server")]
+        server: Option<String>,
+        #[arg(
+            long,
+            help = "Keep base64 binary media inline instead of saving to the local media cache"
+        )]
+        inline_media: bool,
+        name: String,
+        path: std::ffi::OsString,
+    },
+    /// Print the built-in mcpcli agent skill guide offline.
+    Builtin,
 }
 
 #[derive(Subcommand)]
@@ -631,6 +771,118 @@ async fn arguments(
     }
 }
 
+const MAX_SCHEMA_FILE_BYTES: usize = 1 << 20;
+
+fn validate_task_id(task_id: &str) -> Result<()> {
+    if task_id.is_empty() || task_id.len() > 512 || task_id.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(usage(
+            "invalid_task_id",
+            "task_id must be 1..=512 bytes without ASCII control characters",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_expected_schema(
+    path: &Path,
+    mode: SchemaMode,
+    process_budget: &std::sync::Arc<ByteBudget>,
+) -> Result<Leased<ExpectedSchema>> {
+    let file = mcpcli::platform::open_input(path)
+        .with_context(|| format!("cannot read schema file {}", path.display()))
+        .map_err(|error| usage("schema", error))?;
+    if !file
+        .metadata()
+        .map_err(|error| usage("schema", error))?
+        .is_file()
+    {
+        return Err(usage("schema", "schema input must be a regular file"));
+    }
+    let mut reader = tokio::fs::File::from_std(file);
+    let mut lease = process_budget.empty_lease();
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let count = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|error| usage("schema", error))?;
+        if count == 0 {
+            break;
+        }
+        let needed = bytes.len().saturating_add(count);
+        if needed > MAX_SCHEMA_FILE_BYTES {
+            return Err(usage("schema", "schema file exceeds the 1 MiB limit"));
+        }
+        if !lease.reserve_vec(&mut bytes, needed, MAX_SCHEMA_FILE_BYTES) {
+            return Err(Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "Schema file exceeds the active memory limit",
+            )
+            .into());
+        }
+        bytes.extend_from_slice(&chunk[..count]);
+    }
+    let value_lease = process_budget.try_acquire(bytes.len()).ok_or_else(|| {
+        Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "Schema file exceeds the active memory limit",
+        )
+    })?;
+    let scratch = process_budget
+        .try_acquire(input::scratch_bytes(&bytes))
+        .ok_or_else(|| {
+            Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "Schema file exceeds the active memory limit",
+            )
+        })?;
+    let value = input::parse(&bytes).map_err(|error| usage("schema", format!("{error:#}")))?;
+    drop(scratch);
+    drop(bytes);
+    let parsed =
+        mcpcli::schema::parse_expected_schema(value, mode).map_err(|err| usage("schema", err))?;
+    if !mcpcli::schema::schema_depth_ok(&parsed.input_schema, MAX_SCHEMA_DEPTH)
+        || parsed
+            .output_schema
+            .as_ref()
+            .is_some_and(|s| !mcpcli::schema::schema_depth_ok(s, MAX_SCHEMA_DEPTH))
+    {
+        return Err(usage(
+            "schema",
+            format!("schema exceeds maximum nesting depth of {MAX_SCHEMA_DEPTH}"),
+        ));
+    }
+    Ok(Leased::new(parsed, value_lease))
+}
+
+fn parse_kv_cli_arguments(
+    items: &[String],
+    process_budget: &std::sync::Arc<ByteBudget>,
+) -> Result<Leased<Map<String, Value>>> {
+    match input::parse_kv_arguments(items, process_budget) {
+        Ok(map) => {
+            let encoded = input::serialized_len(&*map)
+                .map_err(|error| usage("arguments", format!("{error:#}")))?;
+            if encoded > ipc::ARGUMENT_LIMIT {
+                return Err(usage("arguments", "arguments exceed the 1 MiB limit"));
+            }
+            Ok(map)
+        }
+        Err(error) => {
+            if let Some(io_err) = error.downcast_ref::<std::io::Error>()
+                && io_err.kind() == std::io::ErrorKind::OutOfMemory
+            {
+                return Err(argument_memory_failure());
+            }
+            Err(usage("arguments", format!("{error:#}")))
+        }
+    }
+}
+
 async fn close_after_error(connection: &mut McpConnection, error: &mut anyhow::Error) {
     if let Err(cleanup) = connection.close().await
         && let Some(failure) = error.downcast_mut::<Failure>()
@@ -648,6 +900,7 @@ async fn remote(
     operation: Leased<Operation>,
     max_timeout: Option<u64>,
     uncertain: &AtomicBool,
+    interrupt: Option<&tokio_util::sync::CancellationToken>,
 ) -> Result<RemoteOutput> {
     let server = match &*operation {
         Operation::Server { server }
@@ -655,7 +908,14 @@ async fn remote(
         | Operation::Call { server, .. }
         | Operation::Reset { server, .. }
         | Operation::EventsList { server }
-        | Operation::EventsPoll { server, .. } => server,
+        | Operation::EventsPoll { server, .. }
+        | Operation::SkillsList { server }
+        | Operation::SkillsGet { server, .. }
+        | Operation::SkillsFiles { server, .. }
+        | Operation::SkillsRead { server, .. }
+        | Operation::TasksGet { server, .. }
+        | Operation::TasksUpdate { server, .. }
+        | Operation::TasksCancel { server, .. } => server,
         _ => unreachable!(),
     };
     let config = loaded
@@ -671,7 +931,8 @@ async fn remote(
     }
     cli.validate_request_timeout()?;
     let timeout_secs = cli.timeout_secs_for(config);
-    let hard = if operation.is_call() {
+    let uses_dual_clock = operation.uses_dual_clock();
+    let hard = if uses_dual_clock {
         validate_call_max_timeout(timeout_secs, max_timeout)?
     } else {
         None
@@ -679,32 +940,66 @@ async fn remote(
     let budget = Duration::from_secs(timeout_secs);
     let started = Instant::now();
     if cli.oneshot {
+        let cancel_token = interrupt.cloned().unwrap_or_default();
         let oneshot_fut = async {
             if matches!(&*operation, Operation::Reset { .. }) {
                 return Err(usage("mode", "reset cannot be used with --oneshot"));
             }
-            let mut connection =
-                McpConnection::connect(config, budget.min(Duration::from_secs(30)))
+            let connect_fut = McpConnection::connect(config, budget.min(Duration::from_secs(30)));
+            let mut connection = if interrupt.is_some() {
+                tokio::select! {
+                    biased;
+                    () = cancel_token.cancelled() => {
+                        return Err(Failure::new(
+                            130,
+                            "cancelled",
+                            "interrupted before connecting to MCP server",
+                        )
+                        .into());
+                    }
+                    res = connect_fut => res.map_err(|error| daemon::mcp_error_for_server(error, false, Some(server)))?,
+                }
+            } else {
+                connect_fut
                     .await
-                    .map_err(|error| daemon::mcp_error_for_server(error, false, Some(server)))?;
+                    .map_err(|error| daemon::mcp_error_for_server(error, false, Some(server)))?
+            };
             let remaining = budget.saturating_sub(started.elapsed());
             let process_budget = ByteBudget::global();
-            let result: std::result::Result<(Value, mcpcli::budget::ByteLease), anyhow::Error> =
+            let media_store = MediaStore::default();
+
+            let exec_result: Result<(Value, mcpcli::budget::ByteLease, Option<InflightBatch>)> =
                 match &*operation {
-                    Operation::Server { .. } => {
-                        connection.server_info().map(|value| value.into_parts())
-                    }
-                    Operation::Tools { .. } => {
-                        connection.list_tool_pages(remaining).await.map(|pages| {
+                    Operation::Server { .. } => connection
+                        .server_info()
+                        .map(|value| {
+                            let (v, l) = value.into_parts();
+                            (v, l, None)
+                        })
+                        .map_err(|e| daemon::mcp_error_for_server(e, false, Some(server)).into()),
+                    Operation::Tools { .. } => connection
+                        .list_tool_pages(remaining)
+                        .await
+                        .map(|pages| {
                             let (pages, lease) = pages.into_parts();
                             let mut value = Map::new();
                             value.insert("pages".into(), Value::Array(pages));
-                            (Value::Object(value), lease)
+                            (Value::Object(value), lease, None)
                         })
-                    }
+                        .map_err(|e| daemon::mcp_error_for_server(e, false, Some(server)).into()),
                     Operation::Call {
-                        tool, arguments, ..
+                        tool,
+                        arguments,
+                        inline_media,
+                        detach,
+                        expected_schema,
+                        ..
                     } => {
+                        if *detach {
+                            connection
+                                .check_tasks_support()
+                                .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                        }
                         let remaining_hard = hard.map(|h| h.saturating_sub(started.elapsed()));
                         if remaining_hard.is_some_and(|d| d.is_zero()) {
                             return Err(Failure::new(
@@ -719,24 +1014,221 @@ async fn remote(
                             idle: budget,
                             hard: remaining_hard,
                         };
-                        connection
-                            .call_with_dispatch_leased(
+                        let outcome = connection
+                            .call_with_options_leased(
                                 tool,
                                 arguments,
+                                CallOptions {
+                                    expected_schema: expected_schema.as_ref(),
+                                },
                                 budgets,
                                 uncertain,
-                                tokio_util::sync::CancellationToken::new(),
+                                cancel_token.clone(),
                             )
                             .await
+                            .map_err(|e| {
+                                anyhow::Error::from(daemon::mcp_op_error(e, Some(server)))
+                            });
+                        match outcome {
+                            Ok(CallOutcome::Complete {
+                                mut value,
+                                mut lease,
+                            }) => {
+                                let inflight = if *inline_media {
+                                    None
+                                } else {
+                                    media_store
+                                        .extract_and_save(&mut value, &mut lease, process_budget)
+                                        .await
+                                        .map_err(anyhow::Error::from)?
+                                };
+                                Ok((value, lease, inflight))
+                            }
+                            Ok(CallOutcome::Task { seed, value, lease }) => {
+                                if *detach {
+                                    Ok((value, lease, None))
+                                } else {
+                                    let task_id = seed.task_id.clone();
+                                    drop(value);
+                                    drop(lease);
+                                    let poll_budgets = TaskPollBudgets {
+                                        step_idle: budget,
+                                        hard_deadline: hard.map(|h| started + h),
+                                    };
+                                    let conn_ref = &connection;
+                                    let poll_id = task_id.clone();
+                                    let cancel_id = task_id.clone();
+                                    let mut snapshot = poll_task_to_completion(
+                                        Some(seed),
+                                        task_id.clone(),
+                                        true,
+                                        poll_budgets,
+                                        cancel_token.clone(),
+                                        |step_budget| conn_ref.get_task(&poll_id, step_budget),
+                                        |cancel_budget| {
+                                            let cancel_id = cancel_id.clone();
+                                            async move {
+                                                let d = AtomicBool::new(false);
+                                                let _ = conn_ref
+                                                    .cancel_task(&cancel_id, cancel_budget, &d)
+                                                    .await;
+                                            }
+                                        },
+                                    )
+                                    .await
+                                    .map_err(|e| {
+                                        anyhow::Error::from(daemon::mcp_op_error(e, Some(server)))
+                                    })?;
+                                    let Some(mut result_val) = snapshot
+                                        .value
+                                        .as_object_mut()
+                                        .and_then(|o| o.remove("result"))
+                                    else {
+                                        let mut fail = Failure::new(
+                                            4,
+                                            "mcp_protocol",
+                                            format!(
+                                                "completed task {task_id:?} response missing 'result'"
+                                            ),
+                                        )
+                                        .uncertain(true);
+                                        fail.data = Some(json!({"taskId": task_id}));
+                                        return Err(fail.into());
+                                    };
+                                    let mut lease = snapshot.lease;
+                                    let inflight = if *inline_media {
+                                        None
+                                    } else {
+                                        media_store
+                                            .extract_and_save(
+                                                &mut result_val,
+                                                &mut lease,
+                                                process_budget,
+                                            )
+                                            .await
+                                            .map_err(anyhow::Error::from)?
+                                    };
+                                    Ok((result_val, lease, inflight))
+                                }
+                            }
+                            Err(err) => Err(err),
+                        }
                     }
-                    Operation::EventsList { .. } => {
-                        connection.list_events(remaining).await.map(|events| {
+                    Operation::SkillsList { .. } => connection
+                        .skills_list(server, remaining)
+                        .await
+                        .map(|(v, l)| (v, l, None))
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::SkillsGet { selector, .. } => connection
+                        .skills_show(server, selector, remaining)
+                        .await
+                        .map(|(v, l)| (v, l, None))
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::SkillsFiles { selector, dir, .. } => connection
+                        .skills_files(server, selector, dir.as_deref(), remaining)
+                        .await
+                        .map(|(v, l)| (v, l, None))
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::SkillsRead {
+                        selector,
+                        path,
+                        inline_media,
+                        ..
+                    } => connection
+                        .skills_read(
+                            server,
+                            selector,
+                            path,
+                            *inline_media,
+                            &media_store,
+                            remaining,
+                        )
+                        .await
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::TasksGet {
+                        task_id,
+                        wait,
+                        inline_media,
+                        ..
+                    } => {
+                        if !*wait {
+                            let mut snapshot = connection
+                                .get_task(task_id, remaining)
+                                .await
+                                .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                            let inflight =
+                                if snapshot.status == TaskStatusKind::Completed && !*inline_media {
+                                    media_store
+                                        .extract_task_result_media(
+                                            &mut snapshot.value,
+                                            &mut snapshot.lease,
+                                            process_budget,
+                                        )
+                                        .await
+                                        .map_err(anyhow::Error::from)?
+                                } else {
+                                    None
+                                };
+                            Ok((snapshot.value, snapshot.lease, inflight))
+                        } else {
+                            connection
+                                .check_tasks_support()
+                                .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                            let poll_budgets = TaskPollBudgets {
+                                step_idle: budget,
+                                hard_deadline: hard.map(|h| started + h),
+                            };
+                            let conn_ref = &connection;
+                            let mut snapshot = poll_task_to_completion(
+                                None,
+                                task_id.clone(),
+                                false,
+                                poll_budgets,
+                                cancel_token.clone(),
+                                |step_budget| conn_ref.get_task(task_id, step_budget),
+                                |_| async {},
+                            )
+                            .await
+                            .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                            let inflight = if !*inline_media {
+                                media_store
+                                    .extract_task_result_media(
+                                        &mut snapshot.value,
+                                        &mut snapshot.lease,
+                                        process_budget,
+                                    )
+                                    .await
+                                    .map_err(anyhow::Error::from)?
+                            } else {
+                                None
+                            };
+                            Ok((snapshot.value, snapshot.lease, inflight))
+                        }
+                    }
+                    Operation::TasksUpdate {
+                        task_id,
+                        input_responses,
+                        ..
+                    } => connection
+                        .update_task(task_id, input_responses.clone(), remaining, uncertain)
+                        .await
+                        .map(|v| (v, process_budget.empty_lease(), None))
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::TasksCancel { task_id, .. } => connection
+                        .cancel_task(task_id, remaining, uncertain)
+                        .await
+                        .map(|v| (v, process_budget.empty_lease(), None))
+                        .map_err(|e| daemon::mcp_op_error(e, Some(server)).into()),
+                    Operation::EventsList { .. } => connection
+                        .list_events(remaining)
+                        .await
+                        .map(|events| {
                             let (events, lease) = events.into_parts();
                             let mut value = Map::new();
                             value.insert("events".into(), Value::Array(events));
-                            (Value::Object(value), lease)
+                            (Value::Object(value), lease, None)
                         })
-                    }
+                        .map_err(|e| daemon::mcp_error_for_server(e, false, Some(server)).into()),
                     Operation::EventsPoll {
                         event,
                         arguments,
@@ -755,39 +1247,19 @@ async fn remote(
                         connection
                             .poll_events(params, remaining)
                             .await
-                            .map(|value| value.into_parts())
+                            .map(|value| {
+                                let (v, l) = value.into_parts();
+                                (v, l, None)
+                            })
+                            .map_err(|e| {
+                                daemon::mcp_error_for_server(e, false, Some(server)).into()
+                            })
                     }
                     _ => unreachable!(),
-                }
-                .map_err(|error| {
-                    anyhow::Error::from(daemon::mcp_error_for_server(
-                        error,
-                        uncertain.load(Ordering::Acquire),
-                        Some(server),
-                    ))
-                });
-            match result.map(|(value, lease)| (lease, value)) {
-                Ok((mut lease, mut value)) => {
+                };
+            match exec_result {
+                Ok((value, lease, inflight)) => {
                     uncertain.store(false, Ordering::Release);
-                    let inflight = match &*operation {
-                        Operation::Call {
-                            inline_media: false,
-                            ..
-                        } => match MediaStore::default()
-                            .extract_and_save(&mut value, &mut lease, process_budget)
-                            .await
-                        {
-                            Ok(batch) => batch,
-                            Err(failure) => {
-                                drop(value);
-                                drop(lease);
-                                let mut error = anyhow::Error::from(failure);
-                                close_after_error(&mut connection, &mut error).await;
-                                return Err(error);
-                            }
-                        },
-                        _ => None,
-                    };
                     Ok(RemoteOutput {
                         value,
                         connection: Some(connection),
@@ -801,7 +1273,7 @@ async fn remote(
                 }
             }
         };
-        if operation.is_call() {
+        if uses_dual_clock {
             if let Some(h) = hard {
                 return timeout(h + Duration::from_secs(10), oneshot_fut)
                     .await
@@ -829,25 +1301,47 @@ async fn remote(
     }
 
     let paths = Paths::new(loaded.path.clone(), &cli.session)?;
-    timeout(
+    let ensure_fut = timeout(
         budget.saturating_sub(started.elapsed()),
         runtime::ensure(&paths, loaded, false),
-    )
-    .await
-    .map_err(|_| {
-        Failure::new(
-            5,
-            "timeout",
-            "deadline elapsed while starting the daemon; tool was not dispatched",
-        )
-    })??;
+    );
+    if let Some(token) = interrupt {
+        tokio::select! {
+            biased;
+            () = token.cancelled() => {
+                return Err(Failure::new(
+                    130,
+                    "cancelled",
+                    "interrupted while starting the daemon; tool was not dispatched",
+                )
+                .into());
+            }
+            res = ensure_fut => {
+                res.map_err(|_| {
+                    Failure::new(
+                        5,
+                        "timeout",
+                        "deadline elapsed while starting the daemon; tool was not dispatched",
+                    )
+                })??;
+            }
+        }
+    } else {
+        ensure_fut.await.map_err(|_| {
+            Failure::new(
+                5,
+                "timeout",
+                "deadline elapsed while starting the daemon; tool was not dispatched",
+            )
+        })??;
+    }
     let elapsed = started.elapsed();
     let (remaining, _) = check_dispatch_budgets(budget, hard, elapsed)?;
     let (input_lease, operation) = {
         let (operation, lease) = operation.into_parts();
         (lease, operation)
     };
-    let request = if operation.is_call() {
+    let request = if uses_dual_clock {
         paths.request_call_with_budgets(&loaded.digest, operation, budget, hard, elapsed)?
     } else {
         paths.request_with_explicit(
@@ -858,9 +1352,12 @@ async fn remote(
         )?
     };
     let request = Leased::new(request, input_lease);
-    let (response_lease, response) = runtime::exchange_tracked(&paths, &request, uncertain)
-        .await
-        .map(|(response, lease)| (lease, response))?;
+    let (response_lease, response) = if let Some(token) = interrupt {
+        runtime::exchange_cancellable(&paths, &request, uncertain, token).await
+    } else {
+        runtime::exchange_tracked(&paths, &request, uncertain).await
+    }
+    .map(|(response, lease)| (lease, response))?;
     Ok(RemoteOutput {
         value: response.result.context("daemon did not return a result")?,
         connection: None,
@@ -1244,7 +1741,26 @@ fn write_tool_text(
     Ok(())
 }
 
-async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
+async fn run(
+    cli: &Cli,
+    uncertain: &AtomicBool,
+    interrupt: Option<&tokio_util::sync::CancellationToken>,
+) -> Result<Output> {
+    if matches!(
+        &cli.command,
+        Command::Skills {
+            command: SkillCommand::Builtin
+        }
+    ) {
+        return Ok(Output::with_text(
+            json!({
+                "name": discovery::BUILTIN_SKILL_NAME,
+                "version": discovery::BUILTIN_SKILL_VERSION,
+                "content": discovery::BUILTIN_SKILL_MD,
+            }),
+            discovery::BUILTIN_SKILL_MD.to_owned(),
+        ));
+    }
     if let Command::Daemon { command } = &cli.command {
         if cli.oneshot {
             return Err(usage(
@@ -1384,6 +1900,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 ),
                 None,
                 uncertain,
+                interrupt,
             )
             .await?;
             Ok(remote.into_output(|value| {
@@ -1414,6 +1931,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 ),
                 None,
                 uncertain,
+                interrupt,
             )
             .await?;
             Ok(remote.into_output(|value| {
@@ -1430,7 +1948,17 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 }
             }))
         }
-        Command::Inspect { server, tool } => {
+        Command::Inspect {
+            server,
+            tool,
+            schema,
+            schema_mode,
+        } => {
+            let expected = if let Some(path) = schema {
+                Some(load_expected_schema(path, (*schema_mode).into(), ByteBudget::global()).await?)
+            } else {
+                None
+            };
             let remote = remote(
                 cli,
                 &loaded,
@@ -1442,10 +1970,27 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 ),
                 None,
                 uncertain,
+                interrupt,
             )
             .await?;
-            Ok(remote
-                .into_output(|mut value| Ok(Output::json(take_listed_tool(&mut value, tool)?))))
+            Ok(remote.into_output(|mut value| {
+                let live_tool = take_listed_tool(&mut value, tool)?;
+                if let Some(expected) = &expected {
+                    let live_input = live_tool.get("inputSchema").unwrap_or(&Value::Null);
+                    let live_output = live_tool.get("outputSchema").filter(|v| !v.is_null());
+                    if let Err(reason) =
+                        mcpcli::schema::verify_tool_schema(expected, live_input, live_output)
+                    {
+                        return Err(Failure::new(
+                            2,
+                            "schema_mismatch",
+                            format!("Tool {tool:?} schema mismatch: {reason}"),
+                        )
+                        .into());
+                    }
+                }
+                Ok(Output::json(live_tool))
+            }))
         }
         Command::Call {
             server,
@@ -1453,9 +1998,16 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             args,
             args_file,
             stdin,
+            detach,
+            schema,
+            schema_mode,
             inline_media,
             max_timeout,
+            kv_args,
         } => {
+            if *detach && max_timeout.is_some() {
+                return Err(usage("usage", "--max-timeout cannot be used with --detach"));
+            }
             if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
                 return Err(usage("tool", "invalid tool name"));
             }
@@ -1472,19 +2024,36 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             }
             cli.validate_request_timeout()?;
             let timeout_secs = cli.timeout_secs_for(server_config);
-            let _ = validate_call_max_timeout(timeout_secs, *max_timeout)?;
-            let args = arguments(
-                args,
-                args_file,
-                *stdin,
-                Duration::from_secs(timeout_secs),
-                ByteBudget::global(),
-            )
-            .await?;
-            let (input_lease, args) = {
+            if !*detach {
+                let _ = validate_call_max_timeout(timeout_secs, *max_timeout)?;
+            }
+            let (expected_schema, schema_lease) = if let Some(path) = schema {
+                let leased =
+                    load_expected_schema(path, (*schema_mode).into(), ByteBudget::global()).await?;
+                let (s, l) = leased.into_parts();
+                (Some(s), Some(l))
+            } else {
+                (None, None)
+            };
+            let args = if !kv_args.is_empty() {
+                parse_kv_cli_arguments(kv_args, ByteBudget::global())?
+            } else {
+                arguments(
+                    args,
+                    args_file,
+                    *stdin,
+                    Duration::from_secs(timeout_secs),
+                    ByteBudget::global(),
+                )
+                .await?
+            };
+            let (mut input_lease, args) = {
                 let (args, lease) = args.into_parts();
                 (lease, args)
             };
+            if let Some(lease) = schema_lease {
+                input_lease.merge(lease);
+            }
             let remote = remote(
                 cli,
                 &loaded,
@@ -1494,24 +2063,31 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         tool: tool.clone(),
                         arguments: args,
                         inline_media: *inline_media,
-                        detach: false,
-                        expected_schema: None,
+                        detach: *detach,
+                        expected_schema,
                     },
                     input_lease,
                 ),
-                *max_timeout,
+                if *detach { None } else { *max_timeout },
                 uncertain,
+                interrupt,
             )
             .await?;
-            let result = if *inline_media {
-                &remote.value
-            } else {
-                &remote.value["result"]
-            };
-            let code = if result["isError"].as_bool() == Some(true) {
-                3
-            } else {
+            let is_detached_task =
+                remote.value.get("resultType").and_then(Value::as_str) == Some("task");
+            let code = if is_detached_task {
                 0
+            } else {
+                let result = if *inline_media {
+                    &remote.value
+                } else {
+                    &remote.value["result"]
+                };
+                if result["isError"].as_bool() == Some(true) {
+                    3
+                } else {
+                    0
+                }
             };
             Ok(Output {
                 value: Some(remote.value),
@@ -1526,6 +2102,139 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             .with_inflight(remote.inflight)
             .with_lease(remote.lease))
         }
+        Command::Tasks { command } => match command {
+            TasksCommand::Get {
+                server,
+                task_id,
+                wait,
+                inline_media,
+                max_timeout,
+            } => {
+                if !*wait && max_timeout.is_some() {
+                    return Err(usage("usage", "--max-timeout requires --wait on tasks get"));
+                }
+                validate_task_id(task_id)?;
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(
+                        Operation::TasksGet {
+                            server: server.clone(),
+                            task_id: task_id.clone(),
+                            wait: *wait,
+                            inline_media: *inline_media,
+                        },
+                        ByteBudget::global().empty_lease(),
+                    ),
+                    if *wait { *max_timeout } else { None },
+                    uncertain,
+                    interrupt,
+                )
+                .await?;
+                let code = if *wait
+                    && remote
+                        .value
+                        .get("result")
+                        .and_then(|r| r.get("isError"))
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                {
+                    3
+                } else {
+                    0
+                };
+                Ok(Output {
+                    value: Some(remote.value),
+                    text: None,
+                    code,
+                    diagnostic: None,
+                    connection: None,
+                    inflight: None,
+                    lease: None,
+                }
+                .with_connection(remote.connection)
+                .with_inflight(remote.inflight)
+                .with_lease(remote.lease))
+            }
+            TasksCommand::Update {
+                server,
+                task_id,
+                args,
+                args_file,
+                stdin,
+            } => {
+                validate_task_id(task_id)?;
+                if args.is_none() && args_file.is_none() && !*stdin {
+                    return Err(usage(
+                        "arguments",
+                        "tasks update requires one of --args, --args-file, or --stdin",
+                    ));
+                }
+                let server_config =
+                    loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                if !server_config.enabled() {
+                    return Err(usage(
+                        "server_disabled",
+                        format!("server {server:?} is disabled"),
+                    ));
+                }
+                cli.validate_request_timeout()?;
+                let timeout_secs = cli.timeout_secs_for(server_config);
+                let parsed = arguments(
+                    args,
+                    args_file,
+                    *stdin,
+                    Duration::from_secs(timeout_secs),
+                    ByteBudget::global(),
+                )
+                .await?;
+                let (input_responses, input_lease) = parsed.into_parts();
+                if input_responses.is_empty() {
+                    return Err(usage(
+                        "arguments",
+                        "tasks update requires a non-empty JSON object",
+                    ));
+                }
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(
+                        Operation::TasksUpdate {
+                            server: server.clone(),
+                            task_id: task_id.clone(),
+                            input_responses,
+                        },
+                        input_lease,
+                    ),
+                    None,
+                    uncertain,
+                    interrupt,
+                )
+                .await?;
+                Ok(remote.into_output(|value| Ok(Output::json(value))))
+            }
+            TasksCommand::Cancel { server, task_id } => {
+                validate_task_id(task_id)?;
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(
+                        Operation::TasksCancel {
+                            server: server.clone(),
+                            task_id: task_id.clone(),
+                        },
+                        ByteBudget::global().empty_lease(),
+                    ),
+                    None,
+                    uncertain,
+                    interrupt,
+                )
+                .await?;
+                Ok(remote.into_output(|value| Ok(Output::json(value))))
+            }
+        },
         Command::Reset { server, force } => {
             let remote = remote(
                 cli,
@@ -1539,6 +2248,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 ),
                 None,
                 uncertain,
+                interrupt,
             )
             .await?;
             if let Some(warning) = remote.value.get("cleanup_warning").and_then(Value::as_str) {
@@ -1550,12 +2260,101 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 .with_lease(remote.lease))
         }
         Command::Skills { command } => {
+            let remote_server = match command {
+                SkillCommand::List { server }
+                | SkillCommand::Show { server, .. }
+                | SkillCommand::Files { server, .. }
+                | SkillCommand::Read { server, .. } => server.as_deref(),
+                SkillCommand::Builtin => unreachable!("handled before config load"),
+            };
+            if let Some(server) = remote_server {
+                let op = match command {
+                    SkillCommand::List { .. } => Operation::SkillsList {
+                        server: server.to_owned(),
+                    },
+                    SkillCommand::Show { name, .. } => {
+                        mcpcli::mcp::skills::validate_selector(name)
+                            .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                        Operation::SkillsGet {
+                            server: server.to_owned(),
+                            selector: name.clone(),
+                        }
+                    }
+                    SkillCommand::Files { name, dir, .. } => {
+                        mcpcli::mcp::skills::validate_selector(name)
+                            .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                        if let Some(d) = dir
+                            && !d.is_empty()
+                            && d != "."
+                        {
+                            skills::validate_clean_skill_rel_path(d)
+                                .map_err(|err| usage("invalid_skill_path", err))?;
+                        }
+                        Operation::SkillsFiles {
+                            server: server.to_owned(),
+                            selector: name.clone(),
+                            dir: dir.clone(),
+                        }
+                    }
+                    SkillCommand::Read {
+                        name,
+                        path,
+                        inline_media,
+                        ..
+                    } => {
+                        mcpcli::mcp::skills::validate_selector(name)
+                            .map_err(|e| daemon::mcp_op_error(e, Some(server)))?;
+                        let rel_path = path.clone().into_string().map_err(|_| {
+                            usage(
+                                "invalid_skill_path",
+                                "remote skill path must be valid UTF-8",
+                            )
+                        })?;
+                        if rel_path.contains('\\') {
+                            return Err(usage(
+                                "invalid_skill_path",
+                                "remote skill path must use '/' separators",
+                            ));
+                        }
+                        skills::validate_clean_skill_rel_path(&rel_path)
+                            .map_err(|err| usage("invalid_skill_path", err))?;
+                        Operation::SkillsRead {
+                            server: server.to_owned(),
+                            selector: name.clone(),
+                            path: rel_path,
+                            inline_media: *inline_media,
+                        }
+                    }
+                    SkillCommand::Builtin => unreachable!(),
+                };
+                let remote = remote(
+                    cli,
+                    &loaded,
+                    Leased::new(op, ByteBudget::global().empty_lease()),
+                    None,
+                    uncertain,
+                    interrupt,
+                )
+                .await?;
+                return Ok(remote.into_output(|value| Ok(Output::json(value))));
+            }
+            match command {
+                SkillCommand::Files { dir: Some(_), .. } => {
+                    return Err(usage("usage", "--dir requires --server"));
+                }
+                SkillCommand::Read {
+                    inline_media: true, ..
+                } => {
+                    return Err(usage("usage", "--inline-media requires --server"));
+                }
+                _ => {}
+            }
             let catalog = skills::discover(&loaded.config.skills)
                 .map_err(|e| usage("skills", format!("{e:#}")))?;
             for warning in &catalog.warnings {
                 eprintln!("mcpcli: {}", safe_text(warning));
             }
-            if matches!(command, SkillCommand::List) {
+            if matches!(command, SkillCommand::List { .. }) {
                 let text = catalog
                     .skills
                     .iter()
@@ -1565,8 +2364,8 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 return Ok(Output::with_text(json!(catalog), text));
             }
             let name = match command {
-                SkillCommand::Show { name }
-                | SkillCommand::Files { name }
+                SkillCommand::Show { name, .. }
+                | SkillCommand::Files { name, .. }
                 | SkillCommand::Read { name, .. } => name,
                 _ => unreachable!(),
             };
@@ -1600,10 +2399,11 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     ))
                 }
                 SkillCommand::Read { path, .. } => {
-                    let content = skills::read(skill, Path::new(path))
+                    let local_path = PathBuf::from(path);
+                    let content = skills::read(skill, &local_path)
                         .map_err(|e| usage("skill_read", format!("{e:#}")))?;
                     Ok(Output::with_text(
-                        json!({"name":name,"root":skill.root,"path":path,"content":content}),
+                        json!({"name":name,"root":skill.root,"path":local_path,"content":content}),
                         content,
                     ))
                 }
@@ -1623,6 +2423,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     ),
                     None,
                     uncertain,
+                    interrupt,
                 )
                 .await?;
                 Ok(remote.into_output(|value| Ok(Output::json(value))))
@@ -1683,6 +2484,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     ),
                     None,
                     uncertain,
+                    interrupt,
                 )
                 .await?;
                 Ok(remote.into_output(|value| Ok(Output::json(value))))
@@ -1838,6 +2640,11 @@ fn retain_cli_input(
         Command::Call {
             args: Some(args), ..
         }
+        | Command::Tasks {
+            command: TasksCommand::Update {
+                args: Some(args), ..
+            },
+        }
         | Command::Events {
             command:
                 EventsCommand::Poll {
@@ -1855,6 +2662,22 @@ fn retain_cli_input(
                 ));
             }
             args.capacity()
+        }
+        Command::Call { kv_args, .. } if !kv_args.is_empty() => {
+            let mut total_len = 0usize;
+            let mut total_cap = 0usize;
+            for item in kv_args {
+                total_len = total_len.saturating_add(item.len());
+                total_cap = total_cap.saturating_add(item.capacity());
+            }
+            if total_len > ipc::ARGUMENT_LIMIT {
+                return Err(Failure::new(
+                    2,
+                    "arguments",
+                    "arguments exceed the 1 MiB limit",
+                ));
+            }
+            total_len.saturating_add(total_cap)
         }
         _ => 0,
     };
@@ -2039,12 +2862,13 @@ async fn entry(cli: Cli) -> i32 {
             command: EventsCommand::Stream { .. }
         }
     );
+    let uses_dual_clock = cli.uses_dual_clock();
     let uncertain = AtomicBool::new(false);
     let signal = mcpcli::platform::interrupted();
     tokio::pin!(signal);
     let mut signal_consumed = false;
     let result = if foreground {
-        run(&cli, &uncertain).await
+        run(&cli, &uncertain, None).await
     } else if is_event_stream {
         let cancel = tokio_util::sync::CancellationToken::new();
         let stream_fut = run_events_stream(&cli, cancel.clone());
@@ -2093,10 +2917,87 @@ async fn entry(cli: Cli) -> i32 {
             }
             (other, _) => other,
         }
+    } else if uses_dual_clock {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let run_fut = run(&cli, &uncertain, Some(&cancel));
+        tokio::pin!(run_fut);
+        let mut interrupted_code: Option<i32> = None;
+        let mut fallback_sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let res = loop {
+            tokio::select! {
+                biased;
+                res = &mut run_fut => break res,
+                () = async {
+                    if let Some(sleep) = fallback_sleep.as_mut() {
+                        sleep.await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    let code = interrupted_code.unwrap_or(130);
+                    break Err(Failure::new(
+                        code,
+                        "cancelled",
+                        "interrupted; cancellation is not rollback",
+                    )
+                    .uncertain(uncertain.load(Ordering::Acquire))
+                    .into());
+                }
+                sig = &mut signal => {
+                    signal_consumed = true;
+                    match sig {
+                        Ok(code) => {
+                            if interrupted_code.is_none() {
+                                interrupted_code = Some(code);
+                                cancel.cancel();
+                                fallback_sleep = Some(Box::pin(tokio::time::sleep(Duration::from_secs(3))));
+                                signal.set(mcpcli::platform::interrupted());
+                            } else {
+                                break Err(Failure::new(
+                                    code,
+                                    "cancelled",
+                                    "interrupted; cancellation is not rollback",
+                                )
+                                .uncertain(uncertain.load(Ordering::Acquire))
+                                .into());
+                            }
+                        }
+                        Err(error) => {
+                            cancel.cancel();
+                            break Err(error.into());
+                        }
+                    }
+                }
+            }
+        };
+        match (res, interrupted_code) {
+            (Ok(mut out), Some(code))
+                if out
+                    .diagnostic
+                    .as_ref()
+                    .is_some_and(|d| d.kind == "cancelled") =>
+            {
+                out.code = code;
+                if let Some(diag) = out.diagnostic.as_mut() {
+                    diag.code = code;
+                }
+                Ok(out)
+            }
+            (Err(mut err), Some(code)) => {
+                if let Some(failure) = err.downcast_mut::<Failure>()
+                    && failure.kind == "cancelled"
+                {
+                    failure.code = code;
+                }
+                Err(err)
+            }
+            // Natural completion during sentinel race preserves its 0/3 exit code.
+            (other, _) => other,
+        }
     } else {
         tokio::select! {
             biased;
-            result = run(&cli, &uncertain) => result,
+            result = run(&cli, &uncertain, None) => result,
             signal = &mut signal => {
                 signal_consumed = true;
                 match signal {
@@ -2152,8 +3053,94 @@ async fn entry(cli: Cli) -> i32 {
         let res = if cli.text {
             match &cli.command {
                 Command::Call { inline_media, .. } => {
-                    write_tool_text(&mut stdout, &value, *inline_media)
+                    if value.get("resultType").and_then(Value::as_str) == Some("task") {
+                        let task = value.get("task").unwrap_or(&value);
+                        let task_id = task.get("taskId").and_then(Value::as_str).unwrap_or("");
+                        let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+                        let msg = task.get("statusMessage").and_then(Value::as_str);
+                        discovery::write_task_status(&mut stdout, task_id, status, msg)
+                    } else {
+                        write_tool_text(&mut stdout, &value, *inline_media)
+                    }
                 }
+                Command::Tasks { command } => match command {
+                    TasksCommand::Get { .. } => discovery::write_task_get(&mut stdout, &value),
+                    TasksCommand::Update { task_id, .. } => {
+                        discovery::write_task_ack(&mut stdout, task_id)
+                    }
+                    TasksCommand::Cancel { task_id, .. } => {
+                        discovery::write_task_cancelled(&mut stdout, task_id)
+                    }
+                },
+                Command::Skills { command } => match command {
+                    SkillCommand::List { server: Some(_) } => {
+                        let items = value
+                            .get("skills")
+                            .and_then(Value::as_array)
+                            .map_or(&[][..], Vec::as_slice);
+                        discovery::write_remote_skills_list(&mut stdout, items)
+                    }
+                    SkillCommand::Show {
+                        server: Some(_), ..
+                    } => {
+                        let srv = value.get("server").and_then(Value::as_str).unwrap_or("");
+                        let uri = value.get("uri").and_then(Value::as_str).unwrap_or("");
+                        let dynamic = value
+                            .get("dynamic")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let content = value.get("content").and_then(Value::as_str).unwrap_or("");
+                        discovery::write_remote_skill_show(&mut stdout, srv, uri, dynamic, content)
+                    }
+                    SkillCommand::Files {
+                        server: Some(_), ..
+                    } => {
+                        let entries = value
+                            .get("resources")
+                            .and_then(Value::as_array)
+                            .map_or(&[][..], Vec::as_slice);
+                        discovery::write_remote_skill_files(&mut stdout, entries)
+                    }
+                    SkillCommand::Read {
+                        server: Some(_), ..
+                    } => {
+                        if let Some(content) = value.get("content").and_then(Value::as_str) {
+                            write_text(&mut stdout, content)
+                        } else if let Some(saved) = value
+                            .get("savedMedia")
+                            .and_then(Value::as_array)
+                            .and_then(|arr| arr.first())
+                        {
+                            (|| -> std::io::Result<()> {
+                                let kind = saved["kind"].as_str().unwrap_or("media");
+                                let mime = saved["mimeType"]
+                                    .as_str()
+                                    .unwrap_or("application/octet-stream");
+                                let bytes = saved["bytes"].as_u64().unwrap_or(0);
+                                let path = saved["savedPath"].as_str().unwrap_or("");
+                                stdout.write_all(b"Saved ")?;
+                                write_safe_text(&mut stdout, kind)?;
+                                stdout.write_all(b" [")?;
+                                write_safe_text(&mut stdout, mime)?;
+                                write!(stdout, "] ({bytes} B): ")?;
+                                write_safe_text(&mut stdout, path)?;
+                                stdout.write_all(b"\n")
+                            })()
+                        } else {
+                            write_text_json(&mut stdout, &value).and_then(|_| writeln!(stdout))
+                        }
+                    }
+                    SkillCommand::Builtin => {
+                        stdout.write_all(discovery::BUILTIN_SKILL_MD.as_bytes())
+                    }
+                    _ => {
+                        if let Some(text) = output.text {
+                            write_text(&mut stdout, &text)
+                        } else {
+                            write_text_json(&mut stdout, &value).and_then(|_| writeln!(stdout))
+                        }
+                    }
+                },
                 Command::Server { .. } => write_server_text(&mut stdout, &value),
                 Command::Tools { .. } => write_tools_text(&mut stdout, &value),
                 Command::Inspect { .. } => discovery::write_tool(&mut stdout, &value),

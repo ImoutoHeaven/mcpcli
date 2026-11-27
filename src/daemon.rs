@@ -2,8 +2,9 @@ use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
 use crate::mcp::{
-    CallBudgets, FailureKind, MAX_CONNECT, McpConnection, McpEventsClient, McpFailure, McpLimits,
-    PollEventsParams, StreamEventsParams,
+    CallBudgets, CallOptions, CallOutcome, FailureKind, MAX_CONNECT, McpConnection,
+    McpEventsClient, McpFailure, McpLimits, McpOpError, PollEventsParams, StreamEventsParams,
+    tasks::{TaskPollBudgets, TaskSeed, TaskSnapshot, TaskStatusKind, poll_task_to_completion},
 };
 use crate::media::{InflightBatch, MediaStore};
 use crate::platform::{
@@ -13,14 +14,14 @@ use crate::platform::{
 use crate::runtime::{Lock, Paths, State};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, timeout, timeout_at};
@@ -30,6 +31,8 @@ const MAX_CONNECTIONS: usize = 32;
 const MAX_CONTROL_CONNECTIONS: usize = 8;
 const MAX_IN_FLIGHT: usize = 8;
 const MAX_EVENT_STREAMS: usize = 32;
+const MAX_TASK_WAITERS: usize = 24;
+const DUAL_CLOCK_OUTER_GRACE: Duration = Duration::from_secs(3);
 const FRAME_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
@@ -57,6 +60,7 @@ impl Default for DaemonOptions {
 
 struct ServerState {
     connection: Option<McpConnection>,
+    conn_id: u64,
     lost: bool,
     calls: u64,
     streams_cancel: CancellationToken,
@@ -91,6 +95,7 @@ impl Default for ServerState {
     fn default() -> Self {
         Self {
             connection: None,
+            conn_id: 0,
             lost: false,
             calls: 0,
             streams_cancel: CancellationToken::new(),
@@ -100,7 +105,8 @@ impl Default for ServerState {
 
 #[derive(Default)]
 struct CallCancelState {
-    active: Option<CancellationToken>,
+    next_id: u64,
+    active: HashMap<u64, CancellationToken>,
     force_resets: usize,
 }
 
@@ -108,23 +114,35 @@ type CallCancelSlot = Arc<std::sync::Mutex<CallCancelState>>;
 
 struct CallCancelRegistration {
     slot: CallCancelSlot,
+    id: u64,
 }
 
 impl CallCancelRegistration {
-    fn register(slot: &CallCancelSlot) -> (Self, CancellationToken) {
-        let token = CancellationToken::new();
+    fn register(slot: &CallCancelSlot, token: CancellationToken) -> (Self, CancellationToken) {
         let mut state = slot.lock().unwrap_or_else(|p| p.into_inner());
+        state.next_id = state.next_id.wrapping_add(1);
+        let id = state.next_id;
         if state.force_resets > 0 {
             token.cancel();
         }
-        state.active = Some(token.clone());
-        (Self { slot: slot.clone() }, token)
+        state.active.insert(id, token.clone());
+        (
+            Self {
+                slot: slot.clone(),
+                id,
+            },
+            token,
+        )
     }
 }
 
 impl Drop for CallCancelRegistration {
     fn drop(&mut self) {
-        self.slot.lock().unwrap_or_else(|p| p.into_inner()).active = None;
+        self.slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active
+            .remove(&self.id);
     }
 }
 
@@ -136,7 +154,7 @@ impl ForceResetCancellation {
     fn begin(slot: &CallCancelSlot) -> Self {
         let mut state = slot.lock().unwrap_or_else(|p| p.into_inner());
         state.force_resets += 1;
-        if let Some(token) = &state.active {
+        for token in state.active.values() {
             token.cancel();
         }
         Self { slot: slot.clone() }
@@ -168,7 +186,44 @@ struct App {
     call_cancels: BTreeMap<String, CallCancelSlot>,
     work: Semaphore,
     event_streams: Semaphore,
+    task_waiters: Arc<Semaphore>,
     shutdown: CancellationToken,
+}
+
+pub fn mcp_op_error(error: McpOpError, server: Option<&str>) -> Failure {
+    let message = if let Some(auth) = &error.auth {
+        let mut msg = auth.format_message(server);
+        if error.outcome_unknown {
+            msg.push_str("; outcome unknown, the call was not retried");
+        }
+        msg
+    } else {
+        error.message
+    };
+    let mut failure =
+        Failure::new(error.code, &error.kind, message).uncertain(error.outcome_unknown);
+    failure.rpc_error = error.rpc_error;
+    let mut data_map = match error.data.map(|b| *b) {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    if let Some(auth) = &error.auth
+        && let Value::Object(auth_map) = auth.to_data_value(server)
+    {
+        for (k, v) in auth_map {
+            data_map.entry(k).or_insert(v);
+        }
+    }
+    if let Some(stderr_tail) = error.stderr_tail {
+        data_map
+            .entry("stderr_tail")
+            .or_insert_with(|| Value::String(stderr_tail.into_string()));
+    }
+    if !data_map.is_empty() {
+        failure.data = Some(Value::Object(data_map));
+    }
+    failure.lease = error.lease;
+    failure
 }
 
 pub fn mcp_error(error: anyhow::Error, calling: bool) -> Failure {
@@ -294,11 +349,11 @@ impl App {
             ));
         }
         if let Some(max_timeout_ms) = request.max_timeout_ms {
-            if !request.operation.is_call() {
+            if !request.operation.uses_dual_clock() {
                 return Err(Failure::new(
                     2,
                     "invalid_timeout",
-                    "max_timeout_ms is only valid for tool calls",
+                    "max_timeout_ms is only valid for non-detached tool calls and waiting task queries",
                 ));
             }
             if max_timeout_ms < request.timeout_ms || max_timeout_ms > 86_400_000 {
@@ -323,17 +378,27 @@ impl App {
         | Operation::TasksGet { server, .. }
         | Operation::TasksUpdate { server, .. }
         | Operation::TasksCancel { server, .. } = &request.operation
-            && let Some(cfg) = self.config.config.servers.get(server)
-            && !cfg.enabled()
         {
-            return Err(Failure::new(
-                2,
-                "server_disabled",
-                format!("server {server:?} is disabled"),
-            ));
+            let Some(cfg) = self.config.config.servers.get(server) else {
+                return Err(Failure::new(
+                    2,
+                    "unknown_server",
+                    format!("unknown server {server:?}"),
+                ));
+            };
+            if !cfg.enabled() {
+                return Err(Failure::new(
+                    2,
+                    "server_disabled",
+                    format!("server {server:?} is disabled"),
+                ));
+            }
         }
         if let Operation::Call {
-            tool, arguments, ..
+            tool,
+            arguments,
+            expected_schema,
+            ..
         } = &request.operation
         {
             if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
@@ -346,6 +411,85 @@ impl App {
                     2,
                     "invalid_arguments",
                     "arguments exceed the 1 MiB limit",
+                ));
+            }
+            if let Some(schema) = expected_schema
+                && (!crate::schema::schema_depth_ok(
+                    &schema.input_schema,
+                    crate::schema::MAX_SCHEMA_DEPTH,
+                ) || schema.output_schema.as_ref().is_some_and(|s| {
+                    !crate::schema::schema_depth_ok(s, crate::schema::MAX_SCHEMA_DEPTH)
+                }))
+            {
+                return Err(Failure::new(
+                    2,
+                    "schema",
+                    format!(
+                        "expected schema exceeds maximum nesting depth of {}",
+                        crate::schema::MAX_SCHEMA_DEPTH
+                    ),
+                ));
+            }
+        }
+        if let Operation::SkillsGet { selector, .. }
+        | Operation::SkillsFiles { selector, .. }
+        | Operation::SkillsRead { selector, .. } = &request.operation
+            && (selector.is_empty()
+                || selector.len() > 2048
+                || selector.bytes().any(|b| b < 0x20 || b == 0x7f))
+        {
+            return Err(Failure::new(
+                2,
+                "invalid_skill_uri",
+                "invalid remote skill selector",
+            ));
+        }
+        if let Operation::SkillsFiles { dir: Some(dir), .. } = &request.operation
+            && (dir.len() > 2048 || dir.bytes().any(|b| b < 0x20 || b == 0x7f))
+        {
+            return Err(Failure::new(
+                2,
+                "invalid_skill_path",
+                "invalid remote skill directory",
+            ));
+        }
+        if let Operation::SkillsRead { path, .. } = &request.operation
+            && (path.is_empty() || path.len() > 2048 || path.bytes().any(|b| b < 0x20 || b == 0x7f))
+        {
+            return Err(Failure::new(
+                2,
+                "invalid_skill_path",
+                "invalid remote skill path",
+            ));
+        }
+        if let Operation::TasksGet { task_id, .. }
+        | Operation::TasksUpdate { task_id, .. }
+        | Operation::TasksCancel { task_id, .. } = &request.operation
+            && (task_id.is_empty()
+                || task_id.len() > 512
+                || task_id.bytes().any(|b| b < 0x20 || b == 0x7f))
+        {
+            return Err(Failure::new(2, "invalid_task_id", "invalid task_id"));
+        }
+        if let Operation::TasksUpdate {
+            input_responses, ..
+        } = &request.operation
+        {
+            if input_responses.is_empty() {
+                return Err(Failure::new(
+                    2,
+                    "invalid_arguments",
+                    "input_responses must be a non-empty JSON object",
+                ));
+            }
+            let size = crate::json::serialized_len(input_responses).map_err(|_| {
+                Failure::new(2, "invalid_arguments", "cannot encode input_responses")
+            })?;
+            if size > ipc::ARGUMENT_LIMIT {
+                return Err(Failure::new(
+                    2,
+                    "invalid_arguments",
+                    "input_responses exceed the 1 MiB limit",
                 ));
             }
         }
@@ -444,6 +588,7 @@ impl App {
                     .await
                     .map_err(|e| mcp_error_for_server(e, false, Some(server)))?,
             );
+            state.conn_id = state.conn_id.wrapping_add(1);
         }
         let client = state
             .connection
@@ -466,30 +611,160 @@ impl App {
             }
         }
     }
+    #[allow(clippy::too_many_arguments)]
+    async fn poll_task_in_daemon(
+        &self,
+        server: &str,
+        initial_conn_id: u64,
+        seed: Option<TaskSeed>,
+        task_id: String,
+        owns_task: bool,
+        deadlines: ExecuteDeadlines,
+        cancel: CancellationToken,
+        conn_permit: &mut Option<OwnedSemaphorePermit>,
+        polling_started: &AtomicBool,
+    ) -> std::result::Result<TaskSnapshot, Failure> {
+        let _waiter_permit = self.task_waiters.try_acquire().map_err(|_| {
+            let mut fail =
+                Failure::new(4, "overload", "too many concurrent waiting tasks on daemon")
+                    .uncertain(owns_task);
+            if owns_task {
+                fail.data = Some(json!({"taskId": task_id}));
+            }
+            fail
+        })?;
+        // Release the MAX_CONNECTIONS inbound permit once the task_waiters slot is held.
+        drop(conn_permit.take());
+        polling_started.store(true, Ordering::Release);
+
+        let server_state = self.servers[server].clone();
+        let poll_budgets = TaskPollBudgets {
+            step_idle: deadlines.call_idle,
+            hard_deadline: deadlines.call_hard,
+        };
+        let poll_cancel = cancel.clone();
+        let poll_task_id = task_id.clone();
+        let cancel_task_id = task_id.clone();
+
+        poll_task_to_completion(
+            seed,
+            task_id,
+            owns_task,
+            poll_budgets,
+            cancel,
+            |step_budget| {
+                let server_state = server_state.clone();
+                let poll_cancel = poll_cancel.clone();
+                let poll_task_id = poll_task_id.clone();
+                let server = server.to_owned();
+                async move {
+                    let step_deadline = Instant::now() + step_budget;
+                    let _work = tokio::select! {
+                        biased;
+                        () = poll_cancel.cancelled() => {
+                            return Err(McpOpError::new(4, "cancelled", "MCP task poll cancelled"));
+                        }
+                        res = timeout_at(step_deadline, self.work.acquire()) => match res {
+                            Ok(Ok(permit)) => permit,
+                            Ok(Err(_)) => return Err(McpOpError::new(1, "stopping", "daemon is stopping")),
+                            Err(_) => return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out while queued")),
+                        },
+                    };
+                    let mut state = tokio::select! {
+                        biased;
+                        () = poll_cancel.cancelled() => {
+                            return Err(McpOpError::new(4, "cancelled", "MCP task poll cancelled"));
+                        }
+                        res = timeout_at(step_deadline, server_state.lock()) => match res {
+                            Ok(guard) => guard,
+                            Err(_) => return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out waiting for server lock")),
+                        },
+                    };
+                    if state.conn_id != initial_conn_id || state.connection.is_none() {
+                        // Zero pollution: never mark_lost() or mutate state after a reset/reconnect.
+                        return Err(McpOpError::new(
+                            6,
+                            "session_lost",
+                            format!("server {server:?} was reset while polling task {poll_task_id:?}"),
+                        ));
+                    }
+                    if state.lost
+                        || state
+                            .connection
+                            .as_ref()
+                            .is_some_and(McpConnection::is_closed)
+                    {
+                        state.mark_lost();
+                        return Err(McpOpError::new(
+                            6,
+                            "session_lost",
+                            format!("server {server:?} disconnected while polling task {poll_task_id:?}"),
+                        ));
+                    }
+                    let remaining = step_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(McpOpError::new(5, "timeout", "MCP tasks/get timed out"));
+                    }
+                    let conn = state.connection.as_ref().expect("checked Some");
+                    let res = conn.get_task(&poll_task_id, remaining).await;
+                    if conn.is_closed() {
+                        state.mark_lost();
+                    }
+                    res
+                }
+            },
+            |cancel_budget| {
+                let server_state = server_state.clone();
+                let cancel_task_id = cancel_task_id.clone();
+                async move {
+                    let cancel_deadline = Instant::now() + cancel_budget;
+                    let Ok(Ok(_work)) = timeout_at(cancel_deadline, self.work.acquire()).await
+                    else {
+                        return;
+                    };
+                    let Ok(mut state) = timeout_at(cancel_deadline, server_state.lock()).await
+                    else {
+                        return;
+                    };
+                    if state.conn_id != initial_conn_id || state.lost {
+                        return;
+                    }
+                    let remaining = cancel_deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return;
+                    }
+                    if let Some(conn) = state.connection.as_ref()
+                        && !conn.is_closed()
+                    {
+                        let cancel_dispatched = AtomicBool::new(false);
+                        let _ = conn
+                            .cancel_task(&cancel_task_id, remaining, &cancel_dispatched)
+                            .await;
+                        if conn.is_closed() {
+                            state.mark_lost();
+                        }
+                    }
+                }
+            },
+        )
+        .await
+        .map_err(|e| mcp_op_error(e, Some(server)))
+    }
+
     async fn execute(
         &self,
         operation: &Operation,
         deadlines: ExecuteDeadlines,
         dispatched: &AtomicBool,
+        client_cancel: Option<&CancellationToken>,
+        conn_permit: &mut Option<OwnedSemaphorePermit>,
+        polling_started: &AtomicBool,
     ) -> ExecutionOutcome {
         let deadline = deadlines.pre_dispatch;
         let empty = || self.options.budget.empty_lease();
         match operation {
             Operation::Status => return Ok((self.status(), empty(), None)),
             Operation::Stop => return Ok((json!({"stopping":true}), empty(), None)),
-            Operation::SkillsList { .. }
-            | Operation::SkillsGet { .. }
-            | Operation::SkillsFiles { .. }
-            | Operation::SkillsRead { .. }
-            | Operation::TasksGet { .. }
-            | Operation::TasksUpdate { .. }
-            | Operation::TasksCancel { .. } => {
-                return Err(Failure::new(
-                    4,
-                    "not_implemented",
-                    "operation not yet wired in daemon",
-                ));
-            }
             Operation::EventsList { server } => {
                 let (client, _) = self.ensure_events_client(server, deadline).await?;
                 let work = self
@@ -561,7 +836,14 @@ impl App {
             Operation::Server { server }
             | Operation::Tools { server }
             | Operation::Call { server, .. }
-            | Operation::Reset { server, .. } => server,
+            | Operation::Reset { server, .. }
+            | Operation::SkillsList { server }
+            | Operation::SkillsGet { server, .. }
+            | Operation::SkillsFiles { server, .. }
+            | Operation::SkillsRead { server, .. }
+            | Operation::TasksGet { server, .. }
+            | Operation::TasksUpdate { server, .. }
+            | Operation::TasksCancel { server, .. } => server,
             _ => unreachable!(),
         };
         let state = self.servers.get(server).ok_or_else(|| {
@@ -572,19 +854,46 @@ impl App {
         } else {
             None
         };
-        let mut state = match timeout_at(deadline, state.lock()).await {
-            Ok(guard) => guard,
-            Err(_) => {
-                return Err(Failure::new(
-                    5,
-                    "timeout",
-                    "request deadline exceeded while queued",
-                ));
+        let mut state = if let Some(cancel) = client_cancel {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(Failure::new(
+                        4,
+                        "cancelled",
+                        "MCP operation cancelled while queued",
+                    ));
+                }
+                res = timeout_at(deadline, state.lock()) => match res {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Err(Failure::new(
+                            5,
+                            "timeout",
+                            "request deadline exceeded while queued",
+                        ));
+                    }
+                },
+            }
+        } else {
+            match timeout_at(deadline, state.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded while queued",
+                    ));
+                }
             }
         };
         let _call_cancel_reg;
-        let call_cancel = if operation.is_call() {
-            let (reg, token) = CallCancelRegistration::register(&self.call_cancels[server]);
+        let call_cancel = if operation.is_call() || operation.uses_dual_clock() {
+            let base_token = client_cancel
+                .map(CancellationToken::child_token)
+                .unwrap_or_default();
+            let (reg, token) =
+                CallCancelRegistration::register(&self.call_cancels[server], base_token);
             _call_cancel_reg = Some(reg);
             Some(token)
         } else {
@@ -705,6 +1014,7 @@ impl App {
                     .map_err(|e| mcp_error_for_server(e, false, Some(server)))?
             };
             state.connection = Some(connection);
+            state.conn_id = state.conn_id.wrapping_add(1);
         }
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
@@ -717,6 +1027,7 @@ impl App {
         if operation.is_call() {
             state.calls += 1;
         }
+        let initial_conn_id = state.conn_id;
         let connection = state
             .connection
             .as_ref()
@@ -754,8 +1065,15 @@ impl App {
                 tool,
                 arguments,
                 inline_media,
+                detach,
+                expected_schema,
                 ..
             } => {
+                if *detach {
+                    connection
+                        .check_tasks_support()
+                        .map_err(|e| mcp_op_error(e, Some(server)))?;
+                }
                 let remaining_hard = deadlines
                     .call_hard
                     .map(|hard| hard.saturating_duration_since(Instant::now()));
@@ -773,33 +1091,223 @@ impl App {
                 };
                 let cancel = call_cancel.expect("call cancellation token registered");
                 let result = connection
-                    .call_with_dispatch_leased(tool, arguments, budgets, dispatched, cancel)
+                    .call_with_options_leased(
+                        tool,
+                        arguments,
+                        CallOptions {
+                            expected_schema: expected_schema.as_ref(),
+                        },
+                        budgets,
+                        dispatched,
+                        cancel.clone(),
+                    )
                     .await;
                 let closed = connection.is_closed();
                 if closed {
                     state.mark_lost();
                 }
-                let (mut lease, mut value) =
-                    result.map(|(value, lease)| (lease, value)).map_err(|e| {
-                        mcp_error_for_server(e, dispatched.load(Ordering::Acquire), Some(server))
-                    })?;
-                let inflight = if *inline_media {
-                    None
+                let outcome = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                match outcome {
+                    CallOutcome::Complete {
+                        mut value,
+                        mut lease,
+                    } => {
+                        let inflight = if *inline_media {
+                            None
+                        } else {
+                            self.options
+                                .media
+                                .extract_and_save(&mut value, &mut lease, &self.options.budget)
+                                .await?
+                        };
+                        Ok((value, lease, inflight))
+                    }
+                    CallOutcome::Task { seed, value, lease } => {
+                        if *detach {
+                            return Ok((value, lease, None));
+                        }
+                        let task_id = seed.task_id.clone();
+                        drop(value);
+                        drop(lease);
+                        drop(_work);
+                        drop(state);
+                        let mut snapshot = self
+                            .poll_task_in_daemon(
+                                server,
+                                initial_conn_id,
+                                Some(seed),
+                                task_id.clone(),
+                                true,
+                                deadlines,
+                                cancel,
+                                conn_permit,
+                                polling_started,
+                            )
+                            .await?;
+                        let Some(mut result_val) = snapshot
+                            .value
+                            .as_object_mut()
+                            .and_then(|o| o.remove("result"))
+                        else {
+                            let mut fail = Failure::new(
+                                4,
+                                "mcp_protocol",
+                                format!("completed task {task_id:?} response missing 'result'"),
+                            )
+                            .uncertain(true);
+                            fail.data = Some(json!({"taskId": task_id}));
+                            return Err(fail);
+                        };
+                        let mut lease = snapshot.lease;
+                        let inflight = if *inline_media {
+                            None
+                        } else {
+                            self.options
+                                .media
+                                .extract_and_save(&mut result_val, &mut lease, &self.options.budget)
+                                .await?
+                        };
+                        Ok((result_val, lease, inflight))
+                    }
+                }
+            }
+            Operation::SkillsList { .. } => {
+                let result = connection.skills_list(server, budget).await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                let (value, lease) = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                Ok((value, lease, None))
+            }
+            Operation::SkillsGet { selector, .. } => {
+                let result = connection.skills_show(server, selector, budget).await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                let (value, lease) = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                Ok((value, lease, None))
+            }
+            Operation::SkillsFiles { selector, dir, .. } => {
+                let result = connection
+                    .skills_files(server, selector, dir.as_deref(), budget)
+                    .await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                let (value, lease) = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                Ok((value, lease, None))
+            }
+            Operation::SkillsRead {
+                selector,
+                path,
+                inline_media,
+                ..
+            } => {
+                let result = connection
+                    .skills_read(
+                        server,
+                        selector,
+                        path,
+                        *inline_media,
+                        &self.options.media,
+                        budget,
+                    )
+                    .await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                result.map_err(|e| mcp_op_error(e, Some(server)))
+            }
+            Operation::TasksGet {
+                task_id,
+                wait,
+                inline_media,
+                ..
+            } => {
+                if !*wait {
+                    let result = connection.get_task(task_id, budget).await;
+                    if connection.is_closed() {
+                        state.mark_lost();
+                    }
+                    let mut snapshot = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                    let inflight = if snapshot.status == TaskStatusKind::Completed && !*inline_media
+                    {
+                        self.options
+                            .media
+                            .extract_task_result_media(
+                                &mut snapshot.value,
+                                &mut snapshot.lease,
+                                &self.options.budget,
+                            )
+                            .await?
+                    } else {
+                        None
+                    };
+                    Ok((snapshot.value, snapshot.lease, inflight))
                 } else {
-                    self.options
-                        .media
-                        .extract_and_save(&mut value, &mut lease, &self.options.budget)
-                        .await?
-                };
-                Ok((value, lease, inflight))
+                    connection
+                        .check_tasks_support()
+                        .map_err(|e| mcp_op_error(e, Some(server)))?;
+                    drop(_work);
+                    drop(state);
+                    let cancel = call_cancel.expect("task wait cancellation token registered");
+                    let mut snapshot = self
+                        .poll_task_in_daemon(
+                            server,
+                            initial_conn_id,
+                            None,
+                            task_id.clone(),
+                            false,
+                            deadlines,
+                            cancel,
+                            conn_permit,
+                            polling_started,
+                        )
+                        .await?;
+                    let inflight = if !*inline_media {
+                        self.options
+                            .media
+                            .extract_task_result_media(
+                                &mut snapshot.value,
+                                &mut snapshot.lease,
+                                &self.options.budget,
+                            )
+                            .await?
+                    } else {
+                        None
+                    };
+                    Ok((snapshot.value, snapshot.lease, inflight))
+                }
+            }
+            Operation::TasksUpdate {
+                task_id,
+                input_responses,
+                ..
+            } => {
+                let result = connection
+                    .update_task(task_id, input_responses.clone(), budget, dispatched)
+                    .await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                let value = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                Ok((value, empty(), None))
+            }
+            Operation::TasksCancel { task_id, .. } => {
+                let result = connection.cancel_task(task_id, budget, dispatched).await;
+                if connection.is_closed() {
+                    state.mark_lost();
+                }
+                let value = result.map_err(|e| mcp_op_error(e, Some(server)))?;
+                Ok((value, empty(), None))
             }
             _ => unreachable!(),
         }
     }
 }
 
-async fn send(
-    stream: &mut Conn,
+async fn send<W: AsyncWrite + Unpin>(
+    stream: &mut W,
     app: &App,
     outcome: ExecutionOutcome,
     dispatched: bool,
@@ -1165,7 +1673,7 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         handle_events_stream(stream, app, request, control, conn_permit).await;
         return;
     }
-    let _conn_permit = conn_permit;
+    let mut conn_permit = Some(conn_permit);
     if control && !request.operation.management() {
         send(
             &mut stream,
@@ -1189,9 +1697,9 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         Ok(now) => now,
         Err(_) => return,
     };
-    let is_call = request.operation.is_call();
-    let unbounded_call = is_call && request.max_timeout_ms.is_none();
-    let total_cap_ms = if is_call {
+    let uses_dual_clock = request.operation.uses_dual_clock();
+    let unbounded_dual_clock = uses_dual_clock && request.max_timeout_ms.is_none();
+    let total_cap_ms = if uses_dual_clock {
         request.max_timeout_ms.unwrap_or(request.timeout_ms)
     } else {
         request.timeout_ms
@@ -1217,8 +1725,15 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         return;
     }
     let admitted = Instant::now();
+    let outer_grace = if uses_dual_clock && request.max_timeout_ms.is_some() {
+        DUAL_CLOCK_OUTER_GRACE
+    } else {
+        Duration::ZERO
+    };
     let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        admitted + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_cap_ms))
+        admitted
+            + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_cap_ms))
+            + outer_grace
     });
     if matches!(request.operation, Operation::Stop) {
         send(
@@ -1239,7 +1754,7 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
     let deadlines = ExecuteDeadlines {
         pre_dispatch: admitted + Duration::from_millis(remaining_admission),
         call_idle: Duration::from_millis(request.timeout_ms),
-        call_hard: if is_call {
+        call_hard: if uses_dual_clock {
             request
                 .max_timeout_ms
                 .map(|_| admitted + Duration::from_millis(remaining_total))
@@ -1248,34 +1763,119 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         },
     };
     let dispatched = AtomicBool::new(false);
+    let polling_started = AtomicBool::new(false);
     let mut extra = [0u8; 1];
-    let result = if unbounded_call {
-        let execute = app.execute(&request.operation, deadlines, &dispatched);
-        tokio::select! {
-            biased;
-            _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
-                .uncertain(dispatched.load(Ordering::Acquire))),
-            // One request per connection; EOF or extra input abandons the in-flight operation.
-            _ = stream.read(&mut extra) => return,
-            result = execute => result,
-        }
-    } else {
-        let execute = timeout(
-            Duration::from_millis(remaining_total),
-            app.execute(&request.operation, deadlines, &dispatched),
-        );
-        tokio::select! {
-            biased;
-            _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
-                .uncertain(dispatched.load(Ordering::Acquire))),
-            // One request per connection; EOF or extra input abandons the in-flight operation.
-            _ = stream.read(&mut extra) => return,
-            result = execute => match result {
-                Ok(result)=>result,
-                Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
+
+    if uses_dual_clock {
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        let client_cancel = CancellationToken::new();
+        let owns_task = request.operation.is_call();
+        let mut sentinel_received = false;
+
+        let exec_fut = async {
+            if unbounded_dual_clock {
+                app.execute(
+                    &request.operation,
+                    deadlines,
+                    &dispatched,
+                    Some(&client_cancel),
+                    &mut conn_permit,
+                    &polling_started,
+                )
+                .await
+            } else {
+                match timeout(
+                    Duration::from_millis(remaining_total) + outer_grace,
+                    app.execute(
+                        &request.operation,
+                        deadlines,
+                        &dispatched,
+                        Some(&client_cancel),
+                        &mut conn_permit,
+                        &polling_started,
+                    ),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded, including queue and connection time; cancellation is not rollback",
+                    )
                     .uncertain(dispatched.load(Ordering::Acquire))),
-            },
-        }
+                }
+            }
+        };
+        tokio::pin!(exec_fut);
+
+        let result = loop {
+            tokio::select! {
+                biased;
+                _ = app.shutdown.cancelled() => {
+                    break Err(Failure::new(
+                        4,
+                        "stopping",
+                        "daemon is stopping; interrupted calls are not replayed",
+                    )
+                    .uncertain(dispatched.load(Ordering::Acquire)));
+                }
+                result = &mut exec_fut => break result,
+                read_res = reader.read(&mut extra), if !sentinel_received => {
+                    match read_res {
+                        Ok(1) => {
+                            // 1-byte cancel sentinel from client: trigger cooperative cancellation
+                            // and wait for the structured cancelled response frame.
+                            sentinel_received = true;
+                            client_cancel.cancel();
+                        }
+                        Ok(0) | Err(_) => {
+                            // Real client disconnect: best-effort cancel if we own a running task.
+                            if owns_task && polling_started.load(Ordering::Acquire) {
+                                client_cancel.cancel();
+                                let _ = timeout(Duration::from_millis(2_500), &mut exec_fut).await;
+                            }
+                            return;
+                        }
+                        Ok(_) => unreachable!(),
+                    }
+                }
+            }
+        };
+        let send_deadline = hard_deadline.filter(|_| result.is_ok());
+        send(
+            &mut writer,
+            &app,
+            result,
+            dispatched.load(Ordering::Acquire),
+            send_deadline,
+        )
+        .await;
+        return;
+    }
+
+    let execute = timeout(
+        Duration::from_millis(remaining_total),
+        app.execute(
+            &request.operation,
+            deadlines,
+            &dispatched,
+            None,
+            &mut conn_permit,
+            &polling_started,
+        ),
+    );
+    let result = tokio::select! {
+        biased;
+        _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
+            .uncertain(dispatched.load(Ordering::Acquire))),
+        // One request per connection; EOF or extra input abandons the in-flight operation.
+        _ = stream.read(&mut extra) => return,
+        result = execute => match result {
+            Ok(result)=>result,
+            Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
+                .uncertain(dispatched.load(Ordering::Acquire))),
+        },
     };
     let send_deadline = hard_deadline.filter(|_| result.is_ok());
     send(
@@ -1328,6 +1928,7 @@ pub async fn run_with_options(
         call_cancels,
         work: Semaphore::new(MAX_IN_FLIGHT),
         event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+        task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
         shutdown: CancellationToken::new(),
     });
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -1882,6 +2483,7 @@ mod tests {
             call_cancels: BTreeMap::from([("srv".into(), CallCancelSlot::default())]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
             shutdown: CancellationToken::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -1897,16 +2499,30 @@ mod tests {
             server: "srv".into(),
         };
         let dispatched = AtomicBool::new(false);
-        let mut ordinary = Box::pin(app.execute(&operation, deadlines, &dispatched));
+        let polling = AtomicBool::new(false);
+        let mut ordinary_permit = None;
+        let mut ordinary = Box::pin(app.execute(
+            &operation,
+            deadlines,
+            &dispatched,
+            None,
+            &mut ordinary_permit,
+            &polling,
+        ));
         assert!(futures_util::poll!(ordinary.as_mut()).is_pending());
         let operations: Vec<_> = (0..MAX_IN_FLIGHT)
             .map(|_| Operation::EventsList {
                 server: "srv".into(),
             })
             .collect();
+        let mut event_permits: Vec<Option<OwnedSemaphorePermit>> =
+            (0..MAX_IN_FLIGHT).map(|_| None).collect();
         let mut events: Vec<_> = operations
             .iter()
-            .map(|op| Box::pin(app.execute(op, deadlines, &dispatched)))
+            .zip(event_permits.iter_mut())
+            .map(|(op, permit)| {
+                Box::pin(app.execute(op, deadlines, &dispatched, None, permit, &polling))
+            })
             .collect();
         for event in &mut events {
             assert!(futures_util::poll!(event.as_mut()).is_pending());
@@ -2061,6 +2677,7 @@ mod tests {
             call_cancels: BTreeMap::from([("srv".into(), CallCancelSlot::default())]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
             shutdown: CancellationToken::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2073,6 +2690,8 @@ mod tests {
         assert!(!stream_cancel.is_cancelled());
 
         let dispatched = AtomicBool::new(false);
+        let polling = AtomicBool::new(false);
+        let mut permit = None;
         let err = app
             .execute(
                 &Operation::Tools {
@@ -2080,6 +2699,9 @@ mod tests {
                 },
                 deadlines,
                 &dispatched,
+                None,
+                &mut permit,
+                &polling,
             )
             .await
             .err()
@@ -2096,6 +2718,9 @@ mod tests {
                 },
                 deadlines,
                 &dispatched,
+                None,
+                &mut permit,
+                &polling,
             )
             .await
             .err()
@@ -2113,7 +2738,11 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let base_path = base.path().canonicalize().unwrap();
         let cfg_path = base_path.join("mcpcli.json");
-        std::fs::write(&cfg_path, r#"{"servers":{}}"#).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"{"servers":{"srv":{"transport":"http","url":"http://127.0.0.1:9001/mcp"}}}"#,
+        )
+        .unwrap();
         let config = LoadedConfig::load(&cfg_path).unwrap();
         let paths =
             Paths::with_root(config.path.clone(), "valtest", &base_path.join("run")).unwrap();
@@ -2126,6 +2755,7 @@ mod tests {
             call_cancels: BTreeMap::new(),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
             shutdown: CancellationToken::new(),
         };
 
@@ -2638,17 +3268,17 @@ mod tests {
     #[test]
     fn force_reset_cancellation_survives_another_reset_finishing() {
         let slot = CallCancelSlot::default();
-        let (active, token) = CallCancelRegistration::register(&slot);
+        let (active, token) = CallCancelRegistration::register(&slot, CancellationToken::new());
         let first = ForceResetCancellation::begin(&slot);
         let second = ForceResetCancellation::begin(&slot);
         assert!(token.is_cancelled());
         drop(active);
         drop(first);
-        let (queued, token) = CallCancelRegistration::register(&slot);
+        let (queued, token) = CallCancelRegistration::register(&slot, CancellationToken::new());
         assert!(token.is_cancelled());
         drop(queued);
         drop(second);
-        let (_fresh, token) = CallCancelRegistration::register(&slot);
+        let (_fresh, token) = CallCancelRegistration::register(&slot, CancellationToken::new());
         assert!(!token.is_cancelled());
     }
 
@@ -2684,6 +3314,7 @@ mod tests {
             call_cancels: BTreeMap::from([("mock".into(), CallCancelSlot::default())]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
             shutdown: CancellationToken::new(),
         };
         let deadlines = ExecuteDeadlines {
@@ -2700,7 +3331,16 @@ mod tests {
             expected_schema: None,
         };
         let active_dispatched = AtomicBool::new(false);
-        let active = app.execute(&operation, deadlines, &active_dispatched);
+        let polling = AtomicBool::new(false);
+        let mut active_permit = None;
+        let active = app.execute(
+            &operation,
+            deadlines,
+            &active_dispatched,
+            None,
+            &mut active_permit,
+            &polling,
+        );
         tokio::pin!(active);
         timeout(
             Duration::from_secs(5),
@@ -2717,7 +3357,15 @@ mod tests {
         .unwrap();
 
         let queued_dispatched = AtomicBool::new(false);
-        let queued = app.execute(&operation, deadlines, &queued_dispatched);
+        let mut queued_permit = None;
+        let queued = app.execute(
+            &operation,
+            deadlines,
+            &queued_dispatched,
+            None,
+            &mut queued_permit,
+            &polling,
+        );
         tokio::pin!(queued);
         assert!(futures_util::poll!(&mut queued).is_pending());
         let reset_operation = Operation::Reset {
@@ -2725,7 +3373,15 @@ mod tests {
             force: true,
         };
         let reset_dispatched = AtomicBool::new(false);
-        let reset = app.execute(&reset_operation, deadlines, &reset_dispatched);
+        let mut reset_permit = None;
+        let reset = app.execute(
+            &reset_operation,
+            deadlines,
+            &reset_dispatched,
+            None,
+            &mut reset_permit,
+            &polling,
+        );
         tokio::pin!(reset);
         assert!(futures_util::poll!(&mut reset).is_pending());
 
@@ -2755,8 +3411,16 @@ mod tests {
             expected_schema: None,
         };
         let fresh_dispatched = AtomicBool::new(false);
+        let mut fresh_permit = None;
         let (value, _, _) = app
-            .execute(&fresh_operation, deadlines, &fresh_dispatched)
+            .execute(
+                &fresh_operation,
+                deadlines,
+                &fresh_dispatched,
+                None,
+                &mut fresh_permit,
+                &polling,
+            )
             .await
             .unwrap();
         assert_eq!(value["content"][0]["text"], "completed");
@@ -2802,6 +3466,7 @@ mod tests {
             ]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
             shutdown: CancellationToken::new(),
         };
 
@@ -2879,5 +3544,175 @@ mod tests {
             },
         };
         assert!(app.validate(&enabled_req).is_ok());
+    }
+
+    #[test]
+    fn validate_new_skills_tasks_and_multi_slot_cancel() {
+        let slot = CallCancelSlot::default();
+        let (_r1, t1) = CallCancelRegistration::register(&slot, CancellationToken::new());
+        let (_r2, t2) = CallCancelRegistration::register(&slot, CancellationToken::new());
+        assert!(!t1.is_cancelled() && !t2.is_cancelled());
+        let _fr = ForceResetCancellation::begin(&slot);
+        assert!(t1.is_cancelled() && t2.is_cancelled());
+
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            r#"{"servers":{"on":{"transport":"http","url":"http://127.0.0.1:9001/mcp"}}}"#,
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "valnew", &base_path.join("run")).unwrap();
+        let app = App {
+            paths: paths.clone(),
+            config: config.clone(),
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([("on".into(), Arc::new(Mutex::new(ServerState::default())))]),
+            call_cancels: BTreeMap::from([("on".into(), CallCancelSlot::default())]),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            task_waiters: Arc::new(Semaphore::new(MAX_TASK_WAITERS)),
+            shutdown: CancellationToken::new(),
+        };
+        let make_req = |op: Operation, max_timeout_ms: Option<u64>| Request {
+            protocol: ipc::PROTOCOL,
+            namespace: app.paths.namespace.clone(),
+            build: app.paths.build.clone(),
+            digest: app.config.digest.clone(),
+            timeout_ms: 5_000,
+            max_timeout_ms,
+            deadline_ms: 10_000,
+            explicit_deadline_ms: None,
+            operation: op,
+        };
+
+        // max_timeout_ms allowed on TasksGet { wait: true }, rejected on wait: false & Call { detach: true }
+        assert!(
+            app.validate(&make_req(
+                Operation::TasksGet {
+                    server: "on".into(),
+                    task_id: "t-1".into(),
+                    wait: true,
+                    inline_media: false,
+                },
+                Some(10_000)
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::TasksGet {
+                    server: "on".into(),
+                    task_id: "t-1".into(),
+                    wait: false,
+                    inline_media: false,
+                },
+                Some(10_000)
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_timeout"
+        );
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::Call {
+                    server: "on".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                    detach: true,
+                    expected_schema: None,
+                },
+                Some(10_000)
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_timeout"
+        );
+
+        // Selector, path, dir, task_id, empty input_responses, and deep expected_schema
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::SkillsGet {
+                    server: "on".into(),
+                    selector: "a\nb".into(),
+                },
+                None
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_skill_uri"
+        );
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::SkillsRead {
+                    server: "on".into(),
+                    selector: "demo".into(),
+                    path: "".into(),
+                    inline_media: false,
+                },
+                None
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_skill_path"
+        );
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::TasksCancel {
+                    server: "on".into(),
+                    task_id: "x".repeat(513),
+                },
+                None
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_task_id"
+        );
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::TasksUpdate {
+                    server: "on".into(),
+                    task_id: "t-1".into(),
+                    input_responses: serde_json::Map::new(),
+                },
+                None
+            ))
+            .unwrap_err()
+            .kind,
+            "invalid_arguments"
+        );
+        let mut deep = json!({});
+        for _ in 0..70 {
+            deep = json!({"a": deep});
+        }
+        assert_eq!(
+            app.validate(&make_req(
+                Operation::Call {
+                    server: "on".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                    detach: false,
+                    expected_schema: Some(crate::schema::ExpectedSchema {
+                        input_schema: deep,
+                        output_schema: None,
+                        has_tool_envelope: false,
+                        mode: crate::schema::SchemaMode::Compatible,
+                    }),
+                },
+                None
+            ))
+            .unwrap_err()
+            .kind,
+            "schema"
+        );
     }
 }
