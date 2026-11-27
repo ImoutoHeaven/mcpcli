@@ -3687,7 +3687,27 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn xdg_state_path_selection_is_consistent_for_reads_and_writes() {
-        let _env_guard = test_env_lock().lock().await;
+        const CHILD_MARKER: &str = "MCPCLI_TEST_XDG_STATE_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::tests::xdg_state_path_selection_is_consistent_for_reads_and_writes",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated XDG state test failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let home_dir = tempfile::tempdir_in("/tmp").unwrap();
         let canon_home = home_dir.path().canonicalize().unwrap();
 
@@ -3696,7 +3716,7 @@ mod tests {
         let prev_xdg = std::env::var_os("XDG_STATE_HOME");
         let prev_home = std::env::var_os("HOME");
 
-        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        // SAFETY: this test runs alone in a child process with its own environment.
         unsafe {
             std::env::remove_var("MCPCLI_CREDENTIALS");
             std::env::remove_var("MCPCLI_RUNTIME_DIR");
@@ -3739,7 +3759,7 @@ mod tests {
         let unusable_state = canon_home.join("state-file");
         std::fs::write(&unusable_state, b"regular file").unwrap();
         let original = std::fs::read(&expected).unwrap();
-        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        // SAFETY: this test runs alone in a child process with its own environment.
         unsafe {
             std::env::set_var("XDG_STATE_HOME", &unusable_state);
         }
@@ -3754,7 +3774,7 @@ mod tests {
         assert_eq!(std::fs::read(&expected).unwrap(), original);
         assert!(read_store_readonly().unwrap().resources.is_empty());
 
-        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        // SAFETY: this test runs alone in a child process with its own environment.
         unsafe {
             match prev_creds {
                 Some(v) => std::env::set_var("MCPCLI_CREDENTIALS", v),

@@ -1360,13 +1360,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn tilde_expansion_resolves_paths_and_rejects_bad_home() {
-        let _guard = config_env_lock().lock().unwrap();
+        const CHILD_MARKER: &str = "MCPCLI_TEST_TILDE_HOME_CHILD";
+        if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::tilde_expansion_resolves_paths_and_rejects_bad_home",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated tilde expansion test failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         let canon_home = home_dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(canon_home.join("work")).unwrap();
         let path = dir.path().join("mcpcli.json");
         let prev_home = std::env::var_os("HOME");
+        // SAFETY: this test runs alone in a child process with its own environment.
         unsafe {
             std::env::set_var("HOME", &canon_home);
         }
@@ -1446,6 +1466,7 @@ mod tests {
 
         // Relative or empty HOME fails when tilde expansion is requested.
         for bad_home in ["", "relative/home"] {
+            // SAFETY: this test runs alone in a child process with its own environment.
             unsafe {
                 std::env::set_var("HOME", bad_home);
             }
@@ -1456,6 +1477,7 @@ mod tests {
             );
         }
 
+        // SAFETY: this test runs alone in a child process with its own environment.
         unsafe {
             match prev_home {
                 Some(v) => std::env::set_var("HOME", v),
