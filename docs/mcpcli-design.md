@@ -689,9 +689,12 @@ and a `MAX_STDERR_BYTES = 64 KiB` rolling `stderr` capture buffer:
 - `--exec-mode stream` keeps a persistent worker process across events, writing
   one NDJSON line to `stdin` concurrently with reading one bounded
   (`MAX_ACK_LINE_BYTES = 64 KiB`) JSON acknowledgment line from `stdout`.
-  `{"ok":true}` commits the event cursor; `{"ok":false,"error":"..."}`,
-  invalid JSON, premature `stdout` EOF, or timeout shuts down and reaps the
-  worker tree before surfacing the failure.
+  `{"ok":true}` waits for the pending `stdin` write and flush before committing
+  the event cursor. An acknowledgment still takes precedence over a broken pipe
+  from a callback that has already exited. `{"ok":false,"error":"..."}`, invalid
+  JSON, premature `stdout` EOF, or a read error cancels an unfinished `stdin`
+  write. These outcomes and timeouts shut down and reap the worker tree before
+  surfacing the failure.
 
 ## 8. OAuth 2.1 authentication
 

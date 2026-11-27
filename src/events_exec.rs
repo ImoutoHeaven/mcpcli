@@ -526,6 +526,13 @@ struct StreamAck {
     error: Option<String>,
 }
 
+enum StreamReply {
+    Ack(StreamAck),
+    Invalid(String),
+    Closed,
+    Io(io::Error),
+}
+
 fn is_broken_pipe(err: &io::Error) -> bool {
     if err.kind() == io::ErrorKind::BrokenPipe {
         return true;
@@ -733,53 +740,72 @@ impl CallbackExecutor {
                 stdin.write_all(line.as_bytes()).await?;
                 stdin.flush().await
             };
-            let read_fut = read_bounded_line(stdout);
-            tokio::join!(write_fut, read_fut)
+            let read_fut = async {
+                match read_bounded_line(stdout).await {
+                    Ok(Some(line)) => match serde_json::from_str::<StreamAck>(&line) {
+                        Ok(ack) => StreamReply::Ack(ack),
+                        Err(_) => StreamReply::Invalid(line),
+                    },
+                    Ok(None) => StreamReply::Closed,
+                    Err(source) => StreamReply::Io(source),
+                }
+            };
+            tokio::pin!(write_fut, read_fut);
+            // Poll stdin first so an already-ready write error keeps its precedence.
+            tokio::select! {
+                biased;
+                write_res = &mut write_fut => (Some(write_res), read_fut.await),
+                read_res = &mut read_fut => {
+                    let write_res = if matches!(&read_res, StreamReply::Ack(ack) if ack.ok) {
+                        Some(write_fut.await)
+                    } else {
+                        None
+                    };
+                    (write_res, read_res)
+                }
+            }
         })
         .await;
 
         match exchange {
             Ok((write_res, read_res)) => {
-                let write_broken_pipe = write_res.as_ref().is_err_and(is_broken_pipe);
-                if let Err(source) = write_res
-                    && !(write_broken_pipe && matches!(read_res, Ok(Some(_))))
+                let write_broken_pipe =
+                    matches!(&write_res, Some(Err(error)) if is_broken_pipe(error));
+                if let Some(Err(source)) = write_res
+                    && !(write_broken_pipe
+                        && matches!(&read_res, StreamReply::Ack(_) | StreamReply::Invalid(_)))
                 {
                     let worker = self.worker.take().expect("worker present");
                     let stderr = worker.shutdown(self.shutdown_grace).await;
                     return Err(ExecError::Io { source, stderr });
                 }
                 match read_res {
-                    Ok(Some(ack_line)) => match serde_json::from_str::<StreamAck>(&ack_line) {
-                        Ok(ack) if ack.ok => {
-                            if write_broken_pipe {
-                                let worker = self.worker.take().expect("worker present");
-                                let _ = worker.shutdown(self.shutdown_grace).await;
-                            }
-                            Ok(())
-                        }
-                        Ok(ack) => {
+                    StreamReply::Ack(ack) if ack.ok => {
+                        if write_broken_pipe {
                             let worker = self.worker.take().expect("worker present");
-                            let stderr = worker.shutdown(self.shutdown_grace).await;
-                            Err(ExecError::Rejected {
-                                message: ack.error.unwrap_or_else(|| "ok=false".to_owned()),
-                                stderr,
-                            })
+                            let _ = worker.shutdown(self.shutdown_grace).await;
                         }
-                        Err(_) => {
-                            let worker = self.worker.take().expect("worker present");
-                            let stderr = worker.shutdown(self.shutdown_grace).await;
-                            Err(ExecError::InvalidAck {
-                                line: ack_line,
-                                stderr,
-                            })
-                        }
-                    },
-                    Ok(None) => {
+                        Ok(())
+                    }
+                    StreamReply::Ack(ack) => {
+                        let worker = self.worker.take().expect("worker present");
+                        let stderr = worker.shutdown(self.shutdown_grace).await;
+                        Err(ExecError::Rejected {
+                            message: ack.error.unwrap_or_else(|| "ok=false".to_owned()),
+                            stderr,
+                        })
+                    }
+                    StreamReply::Invalid(line) => {
+                        let worker = self.worker.take().expect("worker present");
+                        let stderr = worker.shutdown(self.shutdown_grace).await;
+                        Err(ExecError::InvalidAck { line, stderr })
+                    }
+                    StreamReply::Closed => {
                         let worker = self.worker.take().expect("worker present");
                         let stderr = worker.shutdown(self.shutdown_grace).await;
                         Err(ExecError::StreamClosed { stderr })
                     }
-                    Err(source) => {
+                    StreamReply::Io(source) => {
                         let worker = self.worker.take().expect("worker present");
                         let stderr = worker.shutdown(self.shutdown_grace).await;
                         Err(ExecError::Io { source, stderr })
@@ -1104,6 +1130,97 @@ done
             !alive,
             "stream grandchild pid {grandchild_pid} survived timeout kill"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_rejection_does_not_wait_for_unread_stdin() {
+        let script = r#"printf '{"ok":false,"error":"callback unavailable"}\n'; exec sleep 60"#;
+        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(200));
+
+        let event = format!(r#"{{"data":"{}"}}"#, "x".repeat(256 * 1024));
+        let err = exec.deliver(&event).await.unwrap_err();
+        match err {
+            ExecError::Rejected { message, .. } => assert_eq!(message, "callback unavailable"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+        assert_eq!(exec.worker_pid(), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_invalid_reply_and_eof_do_not_wait_for_unread_stdin() {
+        for (script, expected_line) in [
+            (
+                r#"printf 'callback starting\n'; exec sleep 60"#,
+                Some("callback starting"),
+            ),
+            ("exec 1>&-; exec sleep 60", None),
+        ] {
+            let mut exec =
+                CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
+                    .unwrap()
+                    .with_shutdown_grace(Duration::from_millis(200));
+            let event = format!(r#"{{"data":"{}"}}"#, "x".repeat(256 * 1024));
+            let err = exec.deliver(&event).await.unwrap_err();
+            match (err, expected_line) {
+                (ExecError::InvalidAck { line, .. }, Some(expected)) => assert_eq!(line, expected),
+                (ExecError::StreamClosed { .. }, None) => {}
+                other => panic!("unexpected terminal reply: {other:?}"),
+            }
+            assert_eq!(exec.worker_pid(), None);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_positive_ack_still_waits_for_pending_stdin() {
+        let script = r#"printf '{"ok":true}\n'; exec sleep 60"#;
+        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(200));
+
+        let event = format!(r#"{{"data":"{}"}}"#, "x".repeat(256 * 1024));
+        let err = exec.deliver(&event).await.unwrap_err();
+        assert!(matches!(err, ExecError::Timeout { .. }), "got {err:?}");
+        assert_eq!(exec.worker_pid(), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_retains_partial_ack_while_stdin_finishes() {
+        let script = r#"
+printf '{"ok":'
+sleep 0.05
+head -n 1 >/dev/null
+printf 'true}\n'
+while IFS= read -r _line; do
+  printf '{"ok":true}\n'
+done
+"#;
+        let mut exec =
+            CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5)).unwrap();
+        let event = format!(r#"{{"data":"{}"}}"#, "x".repeat(256 * 1024));
+        exec.deliver(&event).await.unwrap();
+        let worker = exec.worker_pid().expect("worker running");
+        exec.deliver(r#"{"data":"next"}"#).await.unwrap();
+        assert_eq!(exec.worker_pid(), Some(worker));
+        exec.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_positive_ack_accepts_broken_pipe_and_reaps_worker() {
+        let script = r#"printf '{"ok":true}\n'; exit 0"#;
+        let mut exec = CallbackExecutor::new(sh(script), ExecMode::Stream, Duration::from_secs(5))
+            .unwrap()
+            .with_shutdown_grace(Duration::from_millis(200));
+
+        let event = format!(r#"{{"data":"{}"}}"#, "x".repeat(256 * 1024));
+        exec.deliver(&event).await.unwrap();
+        assert_eq!(exec.worker_pid(), None);
     }
 
     #[cfg(unix)]
