@@ -1942,6 +1942,7 @@ async fn accept_loopback_callback(
     expected_state: &str,
     canonical_issuer: &str,
 ) -> Result<String> {
+    let callback_url = reqwest::Url::parse(&format!("http://127.0.0.1{callback_path}"))?;
     loop {
         let (mut socket, _) = listener
             .accept()
@@ -1982,7 +1983,7 @@ async fn accept_loopback_callback(
             write_loopback_http(&mut socket, "400 Bad Request", "Bad Request\n").await;
             continue;
         };
-        if parsed.path() != callback_path {
+        if parsed.path() != callback_url.path() {
             write_loopback_http(&mut socket, "404 Not Found", "Not Found\n").await;
             continue;
         }
@@ -2233,10 +2234,7 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
 
     let cli_client_id = opts.client_id.map(str::trim).filter(|s| !s.is_empty());
-    let cfg_client_id = opts
-        .configured_client_id
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let cfg_client_id = opts.configured_client_id.filter(|s| !s.trim().is_empty());
     if let Some(cli_name) = opts.client_name {
         validate_client_name(cli_name).map_err(|e| Failure::new(2, "arguments", e.to_string()))?;
         if cli_client_id.is_some() || cfg_client_id.is_some() {
@@ -3809,7 +3807,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confidential_login_helper_entry() {
+        let Ok(metadata_url) = std::env::var("MCPCLI_TEST_AUTH_METADATA_URL") else {
+            return;
+        };
+        let (result, _) = login(LoginOptions {
+            server_name: "conf-srv",
+            server_url: "http://127.0.0.1:9999/mcp",
+            scopes: &["mcp:tools".into(), "mcp:write".into()],
+            configured_scopes: &["mcp:read".into(), "mcp:tools".into()],
+            client_id: None,
+            configured_client_id: Some(" cid-conf "),
+            client_secret: Some("sec:ret+1"),
+            client_name: None,
+            configured_client_name: None,
+            callback_port: None,
+            callback_path: Some("/oauth/./callback"),
+            auth_server_metadata_url: Some(&metadata_url),
+            account: Some("acct1"),
+            no_browser: true,
+            budget: Duration::from_secs(10),
+        })
+        .await
+        .unwrap();
+        assert_eq!(result["authenticated"], true);
+    }
+
+    #[tokio::test]
     async fn confidential_client_basic_and_post_across_login_refresh_and_logout() {
+        use tokio::io::AsyncBufReadExt;
         let _env_guard = test_env_lock().lock().await;
         #[cfg(unix)]
         let dir = tempfile::tempdir_in("/tmp").unwrap();
@@ -3828,12 +3854,13 @@ mod tests {
             let as_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let as_port = as_listener.local_addr().unwrap().port();
             let issuer = format!("http://127.0.0.1:{as_port}/tenant");
+            let client_id = " cid-conf ";
             let expected_basic = format!(
                 "Basic {}",
                 base64_standard(
                     format!(
                         "{}:{}",
-                        form_urlencode_component("cid-conf"),
+                        form_urlencode_component(client_id),
                         form_urlencode_component("sec:ret+1")
                     )
                     .as_bytes()
@@ -3844,9 +3871,12 @@ mod tests {
                     Vec::<(String, Option<String>, String)>::new(),
                 ));
             let seen_clone = seen_token_auth.clone();
+            let server_issuer = issuer.clone();
             let as_srv = tokio::spawn(async move {
                 while let Ok((mut sock, _)) = as_listener.accept().await {
                     let seen_clone = seen_clone.clone();
+                    let issuer = server_issuer.clone();
+                    let supported_methods = supported_methods.clone();
                     tokio::spawn(async move {
                         let (req_line, headers, body) = read_http_request(&mut sock).await;
                         let auth_hdr = headers
@@ -3854,7 +3884,21 @@ mod tests {
                             .find(|(k, _)| k == "authorization")
                             .map(|(_, v)| v.clone());
                         let body_str = String::from_utf8_lossy(&body).into_owned();
-                        let (status, resp_body) = if req_line.starts_with("POST /tenant/token") {
+                        let (status, resp_body) = if req_line
+                            .starts_with("GET /tenant/.well-known/openid-configuration ")
+                        {
+                            let mut metadata = json!({
+                                "issuer": issuer,
+                                "authorization_endpoint": format!("{issuer}/authorize"),
+                                "token_endpoint": format!("{issuer}/token"),
+                                "revocation_endpoint": format!("{issuer}/revoke"),
+                                "code_challenge_methods_supported": ["S256"]
+                            });
+                            if let Some(methods) = supported_methods {
+                                metadata["token_endpoint_auth_methods_supported"] = json!(methods);
+                            }
+                            ("200 OK", metadata.to_string())
+                        } else if req_line.starts_with("POST /tenant/token") {
                             seen_clone.lock().unwrap().push((
                                 "token".into(),
                                 auth_hdr,
@@ -3895,41 +3939,65 @@ mod tests {
 
             let resource = "http://127.0.0.1:9999/mcp";
 
-            // Verify method selection directly.
-            assert_eq!(
-                select_token_endpoint_auth_method(
-                    true,
-                    supported_methods
-                        .as_ref()
-                        .map(|v| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
-                        .as_deref(),
+            let mut login_child = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "auth::tests::confidential_login_helper_entry",
+                    "--nocapture",
+                ])
+                .env(
+                    "MCPCLI_TEST_AUTH_METADATA_URL",
+                    format!("{issuer}/.well-known/openid-configuration"),
                 )
-                .unwrap(),
-                auth_method
-            );
-
-            // Seed stored credential as produced by login (without client_secret on disk).
-            let storage_key = credential_storage_key(resource, Some("acct1"));
-            mutate_store(|store| {
-                store.resources.insert(
-                    storage_key.clone(),
-                    StoredCredential {
-                        resource: resource.into(),
-                        issuer: issuer.clone(),
-                        token_endpoint: format!("{issuer}/token"),
-                        revocation_endpoint: Some(format!("{issuer}/revoke")),
-                        client_id: "cid-conf".into(),
-                        token_endpoint_auth_method: Some(auth_method.into()),
-                        access_token: "initial_tok".into(),
-                        refresh_token: Some("rt_1".into()),
-                        expires_at: Some(now_unix_secs().saturating_add(5)),
-                        scopes: vec!["mcp:read".into(), "mcp:tools".into(), "mcp:write".into()],
-                    },
-                );
-                Ok(())
+                .env("MCPCLI_CREDENTIALS", &cred_path)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut lines = tokio::io::BufReader::new(login_child.stderr.take().unwrap()).lines();
+            let auth_url = timeout(Duration::from_secs(10), async {
+                while let Some(line) = lines.next_line().await.unwrap() {
+                    if line.starts_with("http://") {
+                        return reqwest::Url::parse(&line).unwrap();
+                    }
+                }
+                panic!("login exited without an authorization URL");
             })
             .await
             .unwrap();
+            let query: BTreeMap<_, _> = auth_url.query_pairs().into_owned().collect();
+            assert_eq!(query["client_id"], client_id);
+            assert_eq!(query["scope"], "mcp:read mcp:tools mcp:write");
+            assert!(query["redirect_uri"].ends_with("/oauth/./callback"));
+            let mut callback = reqwest::Url::parse(&query["redirect_uri"]).unwrap();
+            assert_eq!(callback.path(), "/oauth/callback");
+            callback
+                .query_pairs_mut()
+                .append_pair("code", "authorization_code_1")
+                .append_pair("state", &query["state"]);
+            let client = build_oauth_http_client(resource, true, Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                client.get(callback).send().await.unwrap().status(),
+                http::StatusCode::OK
+            );
+            assert!(
+                timeout(Duration::from_secs(10), login_child.wait())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .success()
+            );
+            let storage_key = credential_storage_key(resource, Some("acct1"));
+            let store = read_store_at(&cred_path).unwrap();
+            let stored = &store.resources[&storage_key];
+            assert_eq!(stored.client_id, client_id);
+            assert_eq!(
+                stored.token_endpoint_auth_method.as_deref(),
+                Some(auth_method)
+            );
+            assert_eq!(stored.scopes, ["mcp:read", "mcp:tools", "mcp:write"]);
 
             // Verify client_secret is never on disk.
             let raw_disk = std::fs::read_to_string(&cred_path).unwrap();
@@ -3944,15 +4012,14 @@ mod tests {
             };
             let mgr_mismatch =
                 HttpAuthManager::for_server(resource, Some(&mismatched_oauth)).unwrap();
-            let client = build_oauth_http_client(resource, true, Duration::from_secs(5)).unwrap();
             let (tok_mismatch, attempted_mismatch) = mgr_mismatch.prepare_token(&client).await;
             assert!(attempted_mismatch);
             assert_eq!(tok_mismatch.as_deref(), Some("initial_tok"));
-            assert!(seen_token_auth.lock().unwrap().is_empty());
+            assert_eq!(seen_token_auth.lock().unwrap().len(), 1);
 
             // Refresh uses runtime client_secret with matching Basic or Post auth.
             let oauth_cfg = OAuthConfig {
-                client_id: Some("cid-conf".into()),
+                client_id: Some(client_id.into()),
                 client_secret: Some("sec:ret+1".into()),
                 account: Some("acct1".into()),
                 ..OAuthConfig::default()
@@ -3976,7 +4043,13 @@ mod tests {
             assert!(read_store_at(&cred_path).unwrap().resources.is_empty());
 
             let recorded = seen_token_auth.lock().unwrap().clone();
-            assert!(recorded.iter().any(|(kind, _, _)| kind == "token"));
+            assert!(
+                recorded.iter().any(|(kind, _, body)| kind == "token"
+                    && body.contains("grant_type=authorization_code"))
+            );
+            assert!(recorded.iter().any(
+                |(kind, _, body)| kind == "token" && body.contains("grant_type=refresh_token")
+            ));
             assert!(recorded.iter().any(|(kind, _, _)| kind == "revoke"));
             for (_, hdr, body) in &recorded {
                 if auth_method == "client_secret_basic" {
@@ -3985,7 +4058,7 @@ mod tests {
                     assert!(!body.contains("client_id="));
                 } else {
                     assert!(hdr.is_none());
-                    assert!(body.contains("client_id=cid-conf"));
+                    assert!(body.contains("client_id=+cid-conf+"));
                     assert!(body.contains("client_secret=sec%3Aret%2B1"));
                 }
             }
@@ -4418,7 +4491,7 @@ mod tests {
             server_url: "http://127.0.0.1:9999/mcp",
             scopes: &[],
             configured_scopes: &[],
-            client_id: Some("cfg-cid"),
+            client_id: Some(" cfg-cid "),
             configured_client_id: Some("cfg-cid"),
             client_secret: Some("cfg-secret"),
             client_name: None,
@@ -4444,7 +4517,7 @@ mod tests {
             scopes: &[],
             configured_scopes: &[],
             client_id: Some("override-cid"),
-            configured_client_id: Some("cfg-cid"),
+            configured_client_id: Some(" override-cid "),
             client_secret: Some("cfg-secret"),
             client_name: None,
             configured_client_name: None,
