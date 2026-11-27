@@ -1147,6 +1147,47 @@ done
             },
         };
 
+        const PARENT_HELPER: &str =
+            "events_exec::tests::callback_tree_tests::windows_callback_parent_helper_entry";
+        const WORKER_HELPER: &str =
+            "events_exec::tests::callback_tree_tests::windows_callback_worker_helper_entry";
+        const WORKER_PID_PREFIX: &str = "mcpcli-callback-worker:";
+
+        fn selected_helper(name: &str) -> bool {
+            std::env::args_os().any(|arg| arg == "--exact")
+                && std::env::args_os().any(|arg| arg == name)
+        }
+
+        #[test]
+        fn windows_callback_parent_helper_entry() {
+            if !selected_helper(PARENT_HELPER) {
+                return;
+            }
+            // The worker starts before the parent reports readiness.
+            let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", WORKER_HELPER, "--nocapture", "--test-threads=1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("cannot start native callback worker");
+            eprintln!("{WORKER_PID_PREFIX}{}", worker.id());
+            assert!(
+                worker
+                    .wait()
+                    .expect("cannot wait for callback worker")
+                    .success()
+            );
+        }
+
+        #[test]
+        fn windows_callback_worker_helper_entry() {
+            if !selected_helper(WORKER_HELPER) {
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(60));
+        }
+
         struct Worker(OwnedHandle);
 
         impl Worker {
@@ -1200,46 +1241,48 @@ done
             }
         }
 
-        async fn start_callback(mode: ExecMode) -> (tempfile::TempDir, ProcessTree, Worker) {
-            let dir = tempfile::tempdir().unwrap();
-            let pid_file = dir.path().join("worker.pid");
-            let quoted_path = pid_file.to_string_lossy().replace('\'', "''");
-            let script = format!(
-                r#"$ErrorActionPreference = 'Stop'
-$start = [System.Diagnostics.ProcessStartInfo]::new()
-$start.FileName = [System.IO.Path]::Combine($PSHOME, 'powershell.exe')
-$start.Arguments = '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 60"'
-$start.UseShellExecute = $false
-$start.CreateNoWindow = $true
-$worker = [System.Diagnostics.Process]::Start($start)
-[System.IO.File]::WriteAllText('{quoted_path}', $worker.Id.ToString())
-$worker.WaitForExit()
-"#
-            );
-            let mut tree = ProcessTree::spawn(&ps(&script), mode).unwrap();
+        async fn start_callback(mode: ExecMode) -> (ProcessTree, Worker) {
+            let argv = vec![
+                std::env::current_exe()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                "--exact".to_owned(),
+                PARENT_HELPER.to_owned(),
+                "--nocapture".to_owned(),
+                "--test-threads=1".to_owned(),
+            ];
+            let mut tree = ProcessTree::spawn(&argv, mode).unwrap();
+            let mut stderr =
+                BufReader::new(tree.take_stderr().expect("piped callback stderr")).lines();
+            let mut diagnostics = String::new();
             let worker = timeout(Duration::from_secs(15), async {
-                loop {
-                    if let Ok(text) = std::fs::read_to_string(&pid_file)
-                        && let Ok(pid) = text.parse::<u32>()
-                    {
-                        break Worker::open(pid);
+                while let Some(line) = stderr
+                    .next_line()
+                    .await
+                    .expect("cannot read callback stderr")
+                {
+                    if let Some(pid) = line.strip_prefix(WORKER_PID_PREFIX) {
+                        return Worker::open(pid.parse().expect("invalid callback worker PID"));
                     }
-                    assert!(
-                        tree.child.as_mut().unwrap().try_wait().unwrap().is_none(),
-                        "callback exited before reporting its worker"
-                    );
-                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    diagnostics.push_str(&line);
+                    diagnostics.push('\n');
                 }
+                panic!(
+                    "callback exited before reporting its worker: {:?}; stderr: {diagnostics}",
+                    tree.child.as_mut().unwrap().try_wait().unwrap()
+                );
             })
             .await
-            .expect("callback did not start its worker");
-            (dir, tree, worker)
+            .unwrap_or_else(|_| panic!("callback did not start its worker; stderr: {diagnostics}"));
+            (tree, worker)
         }
 
         #[tokio::test]
         async fn windows_callback_timeout_reaps_immediately_spawned_worker() {
             for mode in [ExecMode::Oneshot, ExecMode::Stream] {
-                let (_dir, mut tree, worker) = start_callback(mode).await;
+                let (mut tree, worker) = start_callback(mode).await;
                 assert!(
                     timeout(Duration::from_millis(50), tree.wait_exit())
                         .await
@@ -1253,7 +1296,7 @@ $worker.WaitForExit()
         #[tokio::test]
         async fn windows_callback_drop_reaps_immediately_spawned_worker() {
             for mode in [ExecMode::Oneshot, ExecMode::Stream] {
-                let (_dir, tree, worker) = start_callback(mode).await;
+                let (tree, worker) = start_callback(mode).await;
                 drop(tree);
                 worker.assert_stopped().await;
             }
