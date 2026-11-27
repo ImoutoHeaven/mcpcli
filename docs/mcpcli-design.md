@@ -321,10 +321,14 @@ sockets are unlinked only while holding `daemon.lock` after verifying socket
 ownership. Unix peers are checked against the effective UID; Windows named
 pipes block remote clients and check the peer token SID.
 
-All IPC frames use a 4-byte little-endian byte length followed by UTF-8 JSON.
-Outbound frames serialize in a single bounded pass backed by leases from the
-1 GiB process active byte budget, and receivers reject empty, truncated, or
-over-limit lengths before allocating body buffers. Standard operations
+JSON IPC frames use a 4-byte little-endian byte length followed by nonempty
+UTF-8 JSON. Outbound frames serialize in a single bounded pass backed by leases
+from the 1 GiB process active byte budget, and receivers reject empty, truncated,
+or over-limit lengths before allocating body buffers. A bounded
+`uses_dual_clock()` response stream also permits one standalone `[0u8; 4]`
+header after the daemon enters task polling. This control marker has no JSON
+body and grants the cleanup grace described below; other zero-length headers
+are rejected. Standard operations
 (`status`, `stop`, `server`, `tools`, `call` with optional `detach` and
 `expected_schema`, `reset`, `events_list`, `events_poll`, `skills_list`,
 `skills_get`, `skills_files`, `skills_read`, `tasks_get`, `tasks_update`, and
@@ -373,18 +377,22 @@ and Stage 2:
   stalled socket connect or request write fails with exit `5` instead of
   hanging.
 - Stage 1b (`read_frame_header`) waits for the validated 4-byte response
-  header. For bounded requests, Stage 1b enforces the remaining operation
-  deadline (with a `+5s` client grace window on `uses_dual_clock()` requests
-  carrying `max_timeout_ms: Some`, paired with a `+3s` daemon outer timeout
-  grace so best-effort `tasks/cancel` and timeout diagnostics carrying
-  `data.taskId` finish cleanly). For unbounded `uses_dual_clock()` requests
-  (`max_timeout_ms: None`), Stage 1b applies no wall-clock cutoff and wakes on a
-  response header, daemon socket EOF or crash, `SIGINT`/`SIGTERM`, or a
-  daemon-returned timeout or cancellation error.
+  header. Bounded requests retain their original deadlines before task polling
+  begins, including during admission and tool discovery. When a
+  `uses_dual_clock()` request carrying `max_timeout_ms: Some` enters task
+  polling, the daemon grants a `+3s` outer timeout grace and sends `[0u8; 4]`.
+  The CLI accepts this marker once and adds `+5s` to its response-header
+  deadline and any explicit response-body deadline. This leaves time for
+  best-effort `tasks/cancel` and timeout diagnostics carrying `data.taskId`.
+  For unbounded `uses_dual_clock()` requests (`max_timeout_ms: None`), Stage 1b
+  applies no wall-clock cutoff and wakes on a response header, daemon socket
+  EOF or crash, `SIGINT`/`SIGTERM`, or a daemon-returned timeout or cancellation
+  error.
 - Stage 2 reads the response body under a 60-second idle progress clock
-  (`TRANSFER_IDLE_TIMEOUT`, capped by any remaining explicit deadline plus the
-  `+5s` grace on bounded dual-clock requests), aligned with the daemon's
-  60-second idle writeback clock.
+  (`TRANSFER_IDLE_TIMEOUT`, capped by any remaining explicit deadline), aligned
+  with the daemon's 60-second idle writeback clock. The explicit deadline gains
+  `+5s` only when Stage 1b received the task-polling marker; requests that never
+  entered task polling retain the original deadline.
 
 For `uses_dual_clock()` requests, the daemon splits the IPC stream into
 `(reader, writer)` before execution so it can distinguish a 1-byte cooperative
