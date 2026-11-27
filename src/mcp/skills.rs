@@ -15,7 +15,7 @@ use super::{
     routing_header_payload_bound, service_failure,
 };
 use crate::{
-    budget::{ByteLease, format_bytes},
+    budget::{ByteLease, Leased, format_bytes},
     media::{DecodeError, InflightBatch, MediaStore, decode_base64_leased},
 };
 
@@ -123,33 +123,50 @@ fn skill_root(skill_uri: &str) -> std::result::Result<&str, Failure> {
     })
 }
 
-fn validate_static_manifest(
-    skill: &Skill,
-) -> std::result::Result<Vec<(String, SkillResource)>, Failure> {
+fn validate_static_manifest(skill: &Skill) -> std::result::Result<(), Failure> {
     let SkillResources::Files(files) = &skill.resources else {
-        return Ok(Vec::new());
+        return Ok(());
     };
-    let mut entries = Vec::with_capacity(files.len());
     for entry in files {
-        let rel_path =
-            crate::skills::validate_manifest_entry_uri(&skill.uri, &entry.uri).map_err(|err| {
-                Failure::new(
-                    4,
-                    "skill_integrity",
-                    format!(
-                        "Skill {:?} manifest entry {:?} failed URI validation: {err}",
-                        skill.uri, entry.uri
-                    ),
-                )
-            })?;
-        entries.push((rel_path, entry.clone()));
+        crate::skills::validate_manifest_entry_uri(&skill.uri, &entry.uri).map_err(|err| {
+            Failure::new(
+                4,
+                "skill_integrity",
+                format!(
+                    "Skill {:?} manifest entry {:?} failed URI validation: {err}",
+                    skill.uri, entry.uri
+                ),
+            )
+        })?;
     }
-    Ok(entries)
+    Ok(())
 }
 
-fn frontmatter_map(skill: &Skill) -> std::result::Result<Map<String, Value>, Failure> {
+fn payload_bytes(value: &impl serde::Serialize) -> std::result::Result<usize, Failure> {
+    crate::json::serialized_len(value).map_err(|err| {
+        Failure::new(
+            4,
+            "mcp_protocol",
+            format!("Remote skills payload could not be measured: {err}"),
+        )
+    })
+}
+
+fn frontmatter_map(
+    skill: &Skill,
+    budget: &std::sync::Arc<crate::budget::ByteBudget>,
+) -> std::result::Result<Leased<Map<String, Value>>, Failure> {
+    let lease = budget
+        .try_acquire(payload_bytes(&skill.frontmatter)?)
+        .ok_or_else(|| {
+            Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "Remote skill frontmatter exceeds the active memory limit",
+            )
+        })?;
     match serde_json::to_value(&skill.frontmatter) {
-        Ok(Value::Object(map)) => Ok(map),
+        Ok(Value::Object(map)) => Ok(Leased::new(map, lease)),
         _ => Err(Failure::new(
             4,
             "skill_integrity",
@@ -255,6 +272,13 @@ async fn walk_skills(
                 })?;
 
             for item in items {
+                if !lease.try_grow(payload_bytes(&item)?) {
+                    return Err(Failure::new(
+                        1,
+                        "memory_limit_exceeded",
+                        "Remote skill catalog copies exceed the active memory limit",
+                    ));
+                }
                 let skill: Skill = serde_json::from_value(item.clone()).map_err(|e| {
                     Failure::new(
                         4,
@@ -334,7 +358,7 @@ async fn get_skill_once(
     _server: &str,
     uri: &str,
     deadline: Instant,
-) -> std::result::Result<Skill, Failure> {
+) -> std::result::Result<Leased<Skill>, Failure> {
     let budget = remaining_budget(deadline, "Remote skill lookup")?;
     if conn.termination.is_terminated() {
         conn.abort_service();
@@ -366,10 +390,11 @@ async fn get_skill_once(
                 )
             })?,
         };
-        let _ = observed_result(conn.ingress.take(), Some("skills/get"), false)
+        let (_, raw, lease) = observed_result(conn.ingress.take(), Some("skills/get"), false)
             .map_err(|e| Failure::from_error(e, false))?;
+        drop(raw);
         validate_static_manifest(&res.skill)?;
-        Ok(res.skill)
+        Ok(Leased::new(res.skill, lease))
     };
 
     match timeout(budget, req).await {
@@ -383,7 +408,7 @@ async fn resolve_remote_skill(
     server: &str,
     selector: &str,
     deadline: Instant,
-) -> std::result::Result<(Skill, bool), Failure> {
+) -> std::result::Result<(Leased<Skill>, bool), Failure> {
     let is_full_uri = validate_selector(selector)?;
     if is_full_uri {
         let skill = get_skill_once(conn, server, selector, deadline).await?;
@@ -393,7 +418,8 @@ async fn resolve_remote_skill(
     match get_skill_once(conn, server, &candidate_uri, deadline).await {
         Ok(skill) => Ok((skill, false)),
         Err(err) if is_invalid_params(&err) => {
-            let (skills, _, _lease) = walk_skills(conn, server, deadline).await?;
+            let (skills, raw, lease) = walk_skills(conn, server, deadline).await?;
+            drop(raw);
             let suffix = format!("/{selector}/SKILL.md");
             let mut matches: Vec<Skill> = skills
                 .into_iter()
@@ -411,7 +437,10 @@ async fn resolve_remote_skill(
                     "mcp_protocol",
                     format!("Remote skill {selector:?} was not found on server {server:?}"),
                 )),
-                1 => Ok((matches.pop().expect("checked len 1"), true)),
+                1 => Ok((
+                    Leased::new(matches.pop().expect("checked len 1"), lease),
+                    true,
+                )),
                 _ => {
                     let candidates: Vec<Value> =
                         matches.into_iter().map(|s| Value::String(s.uri)).collect();
@@ -425,6 +454,7 @@ async fn resolve_remote_skill(
                     let mut data = Map::new();
                     data.insert("candidates".into(), Value::Array(candidates));
                     fail.data = Some(Box::new(Value::Object(data)));
+                    fail.lease = Some(std::sync::Arc::new(lease));
                     Err(fail)
                 }
             }
@@ -662,7 +692,14 @@ pub async fn skills_list(
 ) -> std::result::Result<(Value, ByteLease), Failure> {
     check_skills_capability(conn.peer.peer_info().as_deref(), false)?;
     let deadline = Instant::now() + budget;
-    let (_typed, raw_skills, lease) = walk_skills(conn, server, deadline).await?;
+    let (_typed, raw_skills, mut lease) = walk_skills(conn, server, deadline).await?;
+    if !lease.try_grow(payload_bytes(&server)?.saturating_add(32)) {
+        return Err(Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "Remote skill listing exceeds the active memory limit",
+        ));
+    }
     let mut out = Map::new();
     out.insert("server".into(), Value::String(server.to_owned()));
     out.insert("skills".into(), Value::Array(raw_skills));
@@ -716,7 +753,7 @@ async fn fetch_and_verify_skill_md(
             )
         })?;
     }
-    let expected_fm = frontmatter_map(skill)?;
+    let expected_fm = frontmatter_map(skill, &conn.limits.budget)?;
     crate::skills::verify_remote_skill_md_frontmatter(&text, &expected_fm).map_err(|err| {
         Failure::new(
             4,
@@ -736,7 +773,7 @@ pub async fn skills_show(
     check_skills_capability(conn.peer.peer_info().as_deref(), false)?;
     let deadline = Instant::now() + budget;
     let (mut skill, from_list) = resolve_remote_skill(conn, server, selector, deadline).await?;
-    let (text, lease) = match fetch_and_verify_skill_md(conn, server, &skill, deadline).await {
+    let (text, mut lease) = match fetch_and_verify_skill_md(conn, server, &skill, deadline).await {
         Ok(pair) => pair,
         Err(err) if from_list && err.kind == "skill_integrity" => {
             skill = get_skill_once(conn, server, &skill.uri, deadline).await?;
@@ -745,21 +782,81 @@ pub async fn skills_show(
         Err(err) => return Err(err),
     };
     let is_dynamic = matches!(skill.resources, SkillResources::Dynamic);
-    let fm_val = serde_json::to_value(&skill.frontmatter).map_err(|e| {
-        Failure::new(
-            4,
-            "mcp_protocol",
-            format!("Failed to serialize skill frontmatter: {e}"),
-        )
-    })?;
+    let (frontmatter, frontmatter_lease) =
+        frontmatter_map(&skill, &conn.limits.budget)?.into_parts();
+    if !lease.try_grow(payload_bytes(&server)?.saturating_add(128)) {
+        return Err(Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "Remote skill display exceeds the active memory limit",
+        ));
+    }
+    let (skill, skill_lease) = skill.into_parts();
+    lease.merge(skill_lease);
+    lease.merge(frontmatter_lease);
     let mut out = Map::new();
     out.insert("server".into(), Value::String(server.to_owned()));
-    out.insert("uri".into(), Value::String(skill.uri.clone()));
-    out.insert("name".into(), Value::String(skill.name().to_owned()));
-    out.insert("frontmatter".into(), fm_val);
+    out.insert("uri".into(), Value::String(skill.uri));
+    out.insert("name".into(), Value::String(skill.frontmatter.name));
+    out.insert("frontmatter".into(), Value::Object(frontmatter));
     out.insert("verified".into(), Value::Bool(!is_dynamic));
     out.insert("dynamic".into(), Value::Bool(is_dynamic));
     out.insert("content".into(), Value::String(text));
+    Ok((Value::Object(out), lease))
+}
+
+fn project_static_files(
+    skill: Leased<Skill>,
+    server: &str,
+) -> std::result::Result<(Value, ByteLease), Failure> {
+    let (skill, mut lease) = skill.into_parts();
+    let root = skill_root(&skill.uri)?;
+    let SkillResources::Files(files) = skill.resources else {
+        return Err(Failure::new(
+            4,
+            "mcp_protocol",
+            "Skill has no static manifest",
+        ));
+    };
+    let mut extra = payload_bytes(&(server, root))?.saturating_add(64);
+    for entry in files.iter().filter(|entry| entry.uri != skill.uri) {
+        let path = entry
+            .uri
+            .strip_prefix(root)
+            .and_then(|path| path.strip_prefix('/'))
+            .ok_or_else(|| {
+                Failure::new(
+                    4,
+                    "skill_integrity",
+                    "Manifest entry is outside its skill root",
+                )
+            })?;
+        extra = extra.saturating_add(payload_bytes(&path)?.saturating_add(8));
+    }
+    if !lease.try_grow(extra) {
+        return Err(Failure::new(
+            1,
+            "memory_limit_exceeded",
+            "Remote skill file list exceeds the active memory limit",
+        ));
+    }
+    let projected = files
+        .into_iter()
+        .filter(|entry| entry.uri != skill.uri)
+        .map(|entry| {
+            let path = entry.uri[root.len() + 1..].to_owned();
+            let mut obj = Map::new();
+            obj.insert("path".into(), Value::String(path));
+            obj.insert("uri".into(), Value::String(entry.uri));
+            obj.insert("size".into(), Value::Number(entry.size.into()));
+            obj.insert("digest".into(), Value::String(entry.digest));
+            Value::Object(obj)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("server".into(), Value::String(server.to_owned()));
+    out.insert("uri".into(), Value::String(root.to_owned()));
+    out.insert("resources".into(), Value::Array(projected));
     Ok((Value::Object(out), lease))
 }
 
@@ -773,73 +870,55 @@ pub async fn skills_files(
     check_skills_capability(conn.peer.peer_info().as_deref(), dir.is_some())?;
     let deadline = Instant::now() + budget;
     let (skill, _from_list) = resolve_remote_skill(conn, server, selector, deadline).await?;
+    if dir.is_none() {
+        match &skill.resources {
+            SkillResources::Files(_) => return project_static_files(skill, server),
+            SkillResources::Dynamic => {
+                check_skills_capability(conn.peer.peer_info().as_deref(), true)?;
+            }
+            _ => {
+                return Err(Failure::new(
+                    4,
+                    "mcp_protocol",
+                    "Unsupported skill resources format",
+                ));
+            }
+        }
+    }
     let root = skill_root(&skill.uri)?;
-
-    if let Some(rel_dir) = dir {
-        let dir_uri = if rel_dir.is_empty() || rel_dir == "." {
-            root.to_owned()
-        } else {
-            crate::skills::validate_clean_skill_rel_path(rel_dir).map_err(|err| {
-                Failure::new(
-                    2,
-                    "invalid_skill_path",
-                    format!("Invalid remote skill directory {rel_dir:?}: {err}"),
-                )
-            })?;
-            format!("{root}/{rel_dir}")
-        };
-        let (resources, lease) = walk_directory(conn, server, &dir_uri, deadline).await?;
-        let mut out = Map::new();
-        out.insert("server".into(), Value::String(server.to_owned()));
-        out.insert("uri".into(), Value::String(dir_uri));
-        out.insert("resources".into(), Value::Array(resources));
-        return Ok((Value::Object(out), lease));
+    let rel_dir = dir.unwrap_or("");
+    if !rel_dir.is_empty() && rel_dir != "." {
+        crate::skills::validate_clean_skill_rel_path(rel_dir).map_err(|err| {
+            Failure::new(
+                2,
+                "invalid_skill_path",
+                format!("Invalid remote skill directory {rel_dir:?}: {err}"),
+            )
+        })?;
     }
-
-    match &skill.resources {
-        SkillResources::Files(_) => {
-            let entries = validate_static_manifest(&skill)?;
-            let projected: Vec<Value> = entries
-                .into_iter()
-                .filter(|(_, entry)| entry.uri != skill.uri)
-                .map(|(rel_path, entry)| {
-                    let mut obj = Map::new();
-                    obj.insert("path".into(), Value::String(rel_path));
-                    obj.insert("uri".into(), Value::String(entry.uri));
-                    obj.insert("size".into(), Value::Number(entry.size.into()));
-                    obj.insert("digest".into(), Value::String(entry.digest));
-                    Value::Object(obj)
-                })
-                .collect();
-            let mut out = Map::new();
-            out.insert("server".into(), Value::String(server.to_owned()));
-            out.insert("uri".into(), Value::String(root.to_owned()));
-            out.insert("resources".into(), Value::Array(projected));
-            let bytes = crate::json::serialized_len(&out).unwrap_or(0);
-            let lease = conn.limits.budget.try_acquire(bytes).ok_or_else(|| {
-                Failure::new(
-                    1,
-                    "memory_limit_exceeded",
-                    "Remote skill file list exceeds the active memory limit",
-                )
-            })?;
-            Ok((Value::Object(out), lease))
-        }
-        SkillResources::Dynamic => {
-            check_skills_capability(conn.peer.peer_info().as_deref(), true)?;
-            let (resources, lease) = walk_directory(conn, server, root, deadline).await?;
-            let mut out = Map::new();
-            out.insert("server".into(), Value::String(server.to_owned()));
-            out.insert("uri".into(), Value::String(root.to_owned()));
-            out.insert("resources".into(), Value::Array(resources));
-            Ok((Value::Object(out), lease))
-        }
-        _ => Err(Failure::new(
-            4,
-            "mcp_protocol",
-            "Unsupported skill resources format",
-        )),
-    }
+    let directory_lease = conn
+        .limits
+        .budget
+        .try_acquire(payload_bytes(&(server, root, rel_dir))?.saturating_add(64))
+        .ok_or_else(|| {
+            Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "Remote skill directory exceeds the active memory limit",
+            )
+        })?;
+    let dir_uri = if rel_dir.is_empty() || rel_dir == "." {
+        root.to_owned()
+    } else {
+        format!("{root}/{rel_dir}")
+    };
+    let (resources, mut lease) = walk_directory(conn, server, &dir_uri, deadline).await?;
+    lease.merge(directory_lease);
+    let mut out = Map::new();
+    out.insert("server".into(), Value::String(server.to_owned()));
+    out.insert("uri".into(), Value::String(dir_uri));
+    out.insert("resources".into(), Value::Array(resources));
+    Ok((Value::Object(out), lease))
 }
 
 enum VerifiedResource {
@@ -884,16 +963,9 @@ async fn fetch_and_verify_resource(
     file_uri: &str,
     deadline: Instant,
 ) -> std::result::Result<VerifiedResource, Failure> {
-    let entry = find_manifest_entry(skill, file_uri)?.cloned();
+    let entry = find_manifest_entry(skill, file_uri)?;
     let (item, lease) = read_resource_single(conn, server, file_uri, deadline).await?;
-    verify_resource_item(
-        skill,
-        entry.as_ref(),
-        file_uri,
-        item,
-        lease,
-        &conn.limits.budget,
-    )
+    verify_resource_item(skill, entry, file_uri, item, lease, &conn.limits.budget)
 }
 
 fn verify_resource_item(
@@ -904,11 +976,13 @@ fn verify_resource_item(
     lease: ByteLease,
     budget: &std::sync::Arc<crate::budget::ByteBudget>,
 ) -> std::result::Result<VerifiedResource, Failure> {
-    let mime_type = item
-        .get("mimeType")
-        .and_then(Value::as_str)
-        .unwrap_or("application/octet-stream")
-        .to_owned();
+    let mime_type = match item
+        .as_object_mut()
+        .and_then(|object| object.remove("mimeType"))
+    {
+        Some(Value::String(mime_type)) => mime_type,
+        _ => "application/octet-stream".to_owned(),
+    };
 
     if let Some(Value::String(text)) = item.as_object_mut().and_then(|o| o.remove("text")) {
         if text.len() > MAX_SKILL_CONTENT_BYTES {
@@ -931,7 +1005,7 @@ fn verify_resource_item(
             })?;
         }
         if file_uri == skill.uri {
-            let expected_fm = frontmatter_map(skill)?;
+            let expected_fm = frontmatter_map(skill, budget)?;
             crate::skills::verify_remote_skill_md_frontmatter(&text, &expected_fm).map_err(
                 |err| {
                     Failure::new(
@@ -1018,6 +1092,17 @@ pub async fn skills_read(
     check_skills_capability(conn.peer.peer_info().as_deref(), false)?;
     let deadline = Instant::now() + budget;
     let (mut skill, from_list) = resolve_remote_skill(conn, server, selector, deadline).await?;
+    let mut output_lease = conn
+        .limits
+        .budget
+        .try_acquire(payload_bytes(&(server, &skill.uri, rel_path, rel_path))?.saturating_add(128))
+        .ok_or_else(|| {
+            Failure::new(
+                1,
+                "memory_limit_exceeded",
+                "Remote skill resource metadata exceeds the active memory limit",
+            )
+        })?;
     let file_uri =
         crate::skills::resolve_skill_relative_uri(&skill.uri, rel_path).map_err(|err| {
             Failure::new(
@@ -1038,6 +1123,7 @@ pub async fn skills_read(
     };
 
     let is_dynamic = matches!(skill.resources, SkillResources::Dynamic);
+    drop(skill);
     let mut out = Map::new();
     out.insert("server".into(), Value::String(server.to_owned()));
     out.insert("uri".into(), Value::String(file_uri));
@@ -1049,8 +1135,9 @@ pub async fn skills_read(
         VerifiedResource::Text {
             text,
             mime_type,
-            lease,
+            mut lease,
         } => {
+            lease.merge(output_lease);
             out.insert("mimeType".into(), Value::String(mime_type));
             out.insert("content".into(), Value::String(text));
             Ok((Value::Object(out), lease, None))
@@ -1060,18 +1147,20 @@ pub async fn skills_read(
             decoded,
             decoded_lease,
             mime_type,
-            wire_lease,
+            mut wire_lease,
         } => {
-            out.insert("mimeType".into(), Value::String(mime_type.clone()));
             if inline_media {
+                wire_lease.merge(output_lease);
+                out.insert("mimeType".into(), Value::String(mime_type));
                 drop(decoded);
                 drop(decoded_lease);
                 out.insert("blob".into(), Value::String(blob));
                 Ok((Value::Object(out), wire_lease, None))
             } else {
                 drop(blob);
-                drop(wire_lease);
-                let (saved_record, record_lease, inflight) = media
+                wire_lease.shrink_to(payload_bytes(&mime_type)?);
+                output_lease.merge(wire_lease);
+                let (saved_record, mut record_lease, inflight) = media
                     .extract_resource_blob(&decoded, &mime_type, &conn.limits.budget)
                     .await
                     .map_err(|err| Failure {
@@ -1087,6 +1176,8 @@ pub async fn skills_read(
                     })?;
                 drop(decoded);
                 drop(decoded_lease);
+                record_lease.merge(output_lease);
+                out.insert("mimeType".into(), Value::String(mime_type));
                 out.insert("savedMedia".into(), Value::Array(vec![saved_record]));
                 Ok((Value::Object(out), record_lease, Some(inflight)))
             }
@@ -1122,6 +1213,291 @@ mod tests {
         init.protocol_version = version;
         init.server_info = Implementation::new("srv", "1.0");
         init.into()
+    }
+
+    fn normal_manifest() -> Skill {
+        let description = "Normal documentation catalog. "
+            .repeat(24)
+            .trim_end()
+            .to_owned();
+        let mut resources = vec![SkillResource::from_bytes(
+            "skill://demo/SKILL.md",
+            format!("---\nname: demo\ndescription: {description}\n---\n# Demo\n").as_bytes(),
+        )];
+        resources.extend((0..48).map(|index| {
+            SkillResource::from_bytes(
+                format!("skill://demo/references/guide-{index:02}.md"),
+                b"# Guide\n",
+            )
+        }));
+        Skill::new(
+            "skill://demo/SKILL.md",
+            SkillFrontmatter::new("demo", description),
+            SkillResources::Files(resources),
+        )
+    }
+
+    fn test_connection(
+        budget: std::sync::Arc<crate::budget::ByteBudget>,
+    ) -> (McpConnection, tokio::io::BufReader<tokio::io::DuplexStream>) {
+        use super::super::{
+            ChildTransport, CleanupState, EventNotificationTransport, EventRouter,
+            EventSchemaCache, Handler, Ingress, McpLimits, TransportTermination,
+        };
+        use std::sync::{Arc, atomic::AtomicBool};
+        let ingress = Ingress::default();
+        let termination = Arc::new(TransportTermination::default());
+        let router = EventRouter::new(budget.clone());
+        let tools_changed = Arc::new(AtomicBool::new(false));
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (read, write) = tokio::io::split(client);
+        let service = rmcp::service::serve_directly(
+            Handler {
+                tools_changed: tools_changed.clone(),
+            },
+            EventNotificationTransport::new(
+                ChildTransport::from_parts(
+                    read,
+                    write,
+                    ingress.clone(),
+                    termination.clone(),
+                    64 * 1024,
+                    budget.clone(),
+                ),
+                router.clone(),
+                termination.clone(),
+            ),
+            Some(peer_info(ProtocolVersion::V_2026_07_28, true, true, true)),
+        );
+        let connection = McpConnection {
+            peer: service.peer().clone(),
+            service: Some(service),
+            ingress,
+            event_router: router,
+            event_schemas: EventSchemaCache::default(),
+            termination,
+            stderr_capture: None,
+            limits: McpLimits {
+                budget: budget.clone(),
+                ..McpLimits::default()
+            },
+            server: crate::budget::Leased::new(Vec::new(), budget.empty_lease()),
+            closing: None,
+            cleanup: CleanupState::default(),
+            tools_changed,
+            http: false,
+        };
+        (connection, tokio::io::BufReader::new(server))
+    }
+
+    async fn request(server: &mut tokio::io::BufReader<tokio::io::DuplexStream>) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        assert!(server.read_line(&mut line).await.unwrap() > 0);
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn reply(server: &mut tokio::io::BufReader<tokio::io::DuplexStream>, message: Value) {
+        use tokio::io::AsyncWriteExt;
+        let mut bytes = serde_json::to_vec(&message).unwrap();
+        bytes.push(b'\n');
+        server.get_mut().write_all(&bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn lookup_and_list_fallback_retain_manifest_budget_until_drop() {
+        for fallback in [false, true] {
+            let budget = crate::budget::ByteBudget::new(1 << 20);
+            let (mut conn, mut server) = test_connection(budget.clone());
+            let manifest = normal_manifest();
+            let minimum = crate::json::serialized_len(&manifest).unwrap();
+            let selector = if fallback {
+                "demo"
+            } else {
+                "skill://demo/SKILL.md"
+            };
+            let mut lookup = Box::pin(resolve_remote_skill(
+                &conn,
+                "srv",
+                selector,
+                Instant::now() + Duration::from_secs(5),
+            ));
+            let get = tokio::select! {
+                result = &mut lookup => panic!("lookup returned before response: {result:?}"),
+                request = request(&mut server) => request,
+            };
+            assert_eq!(get["method"], "skills/get");
+            if fallback {
+                reply(
+                    &mut server,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": get["id"],
+                        "error": {"code": -32602, "message": "Use the published skill URI"}
+                    }),
+                )
+                .await;
+                let list = tokio::select! {
+                    result = &mut lookup => panic!("fallback returned before list: {result:?}"),
+                    request = request(&mut server) => request,
+                };
+                assert_eq!(list["method"], "skills/list");
+                reply(
+                    &mut server,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": list["id"], "result": {"skills": [manifest]}
+                    }),
+                )
+                .await;
+            } else {
+                reply(
+                    &mut server,
+                    serde_json::json!({
+                        "jsonrpc": "2.0", "id": get["id"], "result": {"skill": manifest}
+                    }),
+                )
+                .await;
+            }
+            let (skill, from_list) = lookup.await.unwrap();
+            assert_eq!(from_list, fallback);
+            assert!(
+                budget.used() >= minimum,
+                "manifest lease ended before its owner"
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                budget.used() >= minimum,
+                "manifest lease ended across await"
+            );
+            drop(skill);
+            drop(server);
+            conn.close().await.unwrap();
+            drop(conn);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_raw_and_typed_manifests_have_separate_budget() {
+        let budget = crate::budget::ByteBudget::new(1 << 20);
+        let (mut conn, mut server) = test_connection(budget.clone());
+        let manifest = normal_manifest();
+        let mut listing = Box::pin(walk_skills(
+            &conn,
+            "srv",
+            Instant::now() + Duration::from_secs(5),
+        ));
+        let list = tokio::select! {
+            result = &mut listing => panic!("listing returned before response: {result:?}"),
+            request = request(&mut server) => request,
+        };
+        reply(
+            &mut server,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": list["id"], "result": {"skills": [manifest]}
+            }),
+        )
+        .await;
+        let (typed, raw, lease) = listing.await.unwrap();
+        assert_eq!(typed.len(), 1);
+        assert_eq!(raw.len(), 1);
+        assert!(lease.bytes() >= payload_bytes(&typed).unwrap() + payload_bytes(&raw).unwrap());
+        drop(typed);
+        drop(raw);
+        drop(lease);
+        drop(server);
+        conn.close().await.unwrap();
+        drop(conn);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn static_projection_and_frontmatter_preflight_their_copies() {
+        let manifest = normal_manifest();
+        let bytes = payload_bytes(&manifest).unwrap();
+        let budget = crate::budget::ByteBudget::new(bytes);
+        let skill = Leased::new(manifest, budget.try_acquire(bytes).unwrap());
+        let error = project_static_files(skill, "srv").unwrap_err();
+        assert_eq!(error.kind, "memory_limit_exceeded");
+        assert_eq!(budget.used(), 0);
+
+        let manifest = normal_manifest();
+        let frontmatter_bytes = payload_bytes(&manifest.frontmatter).unwrap();
+        let limited = crate::budget::ByteBudget::new(frontmatter_bytes - 1);
+        let error = frontmatter_map(&manifest, &limited).unwrap_err();
+        assert_eq!(error.kind, "memory_limit_exceeded");
+        assert_eq!(limited.used(), 0);
+
+        let ample = crate::budget::ByteBudget::new(1 << 20);
+        let frontmatter = frontmatter_map(&manifest, &ample).unwrap();
+        assert_eq!(ample.used(), frontmatter_bytes);
+        drop(frontmatter);
+        assert_eq!(ample.used(), 0);
+        let skill = Leased::new(manifest, ample.try_acquire(bytes).unwrap());
+        let (files, lease) = project_static_files(skill, "srv").unwrap();
+        assert_eq!(files["resources"].as_array().unwrap().len(), 48);
+        assert_eq!(files["resources"][0]["path"], "references/guide-00.md");
+        assert!(lease.bytes() >= payload_bytes(&files).unwrap());
+        drop(files);
+        drop(lease);
+        assert_eq!(ample.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn show_retains_manifest_during_resource_read_and_leases_its_output() {
+        let budget = crate::budget::ByteBudget::new(1 << 20);
+        let (mut conn, mut server) = test_connection(budget.clone());
+        let manifest = normal_manifest();
+        let minimum = payload_bytes(&manifest).unwrap();
+        let description = manifest.frontmatter.description.clone();
+        let markdown = format!("---\nname: demo\ndescription: {description}\n---\n# Demo\n");
+        let mut show = Box::pin(skills_show(
+            &conn,
+            "srv",
+            "skill://demo/SKILL.md",
+            Duration::from_secs(5),
+        ));
+        let get = tokio::select! {
+            result = &mut show => panic!("show returned before lookup: {result:?}"),
+            request = request(&mut server) => request,
+        };
+        assert_eq!(get["method"], "skills/get");
+        reply(
+            &mut server,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": get["id"], "result": {"skill": manifest}
+            }),
+        )
+        .await;
+        let read = tokio::select! {
+            result = &mut show => panic!("show returned before resource read: {result:?}"),
+            request = request(&mut server) => request,
+        };
+        assert_eq!(read["method"], "resources/read");
+        assert!(
+            budget.used() >= minimum,
+            "manifest must stay leased during the resource RPC"
+        );
+        reply(
+            &mut server,
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": read["id"],
+                "result": {"contents": [{
+                    "uri": "skill://demo/SKILL.md", "text": markdown, "mimeType": "text/markdown"
+                }]}
+            }),
+        )
+        .await;
+        let (output, lease) = show.await.unwrap();
+        assert_eq!(output["frontmatter"]["description"], description);
+        assert_eq!(output["content"], markdown);
+        assert_eq!(output["verified"], true);
+        assert!(lease.bytes() >= payload_bytes(&output).unwrap());
+        drop(output);
+        drop(lease);
+        drop(server);
+        conn.close().await.unwrap();
+        drop(conn);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
@@ -1197,9 +1573,7 @@ mod tests {
                 SkillResource::from_bytes("skill://demo/refs/guide.md", b"hi"),
             ]),
         );
-        let entries = validate_static_manifest(&ok_skill).unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[1].0, "refs/guide.md");
+        validate_static_manifest(&ok_skill).unwrap();
 
         for bad_uri in [
             "skill://demo/%2e%2E/secret.md",
