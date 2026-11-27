@@ -455,7 +455,7 @@ fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
 fn module_for_src_file(src_root: &Path, file: &Path) -> Option<String> {
     let rel = file.strip_prefix(src_root).expect("file under src/");
     let rel_str = rel.to_string_lossy().replace('\\', "/");
-    if rel_str == "lib.rs" || rel_str == "platform/tests.rs" {
+    if rel_str == "lib.rs" {
         return None;
     }
     let first = rel.components().next().expect("non-empty relative path");
@@ -464,25 +464,111 @@ fn module_for_src_file(src_root: &Path, file: &Path) -> Option<String> {
     Some(module.to_owned())
 }
 
-fn is_top_level_module_file(src_root: &Path, file: &Path) -> bool {
-    let rel = file.strip_prefix(src_root).expect("file under src/");
-    let components: Vec<_> = rel.components().collect();
-    match components.as_slice() {
-        [single] => {
-            let name = single.as_os_str().to_string_lossy();
-            name != "lib.rs" && name != "main.rs"
+fn has_module_path_override(src: &str) -> bool {
+    let tokens = strip_cfg_test(&tokenize(src));
+    let mut index = 0;
+    while index + 1 < tokens.len() {
+        if tokens[index] == Token::Hash && tokens[index + 1] == Token::LBracket {
+            let end = skip_balanced(&tokens, index + 1, &Token::LBracket, &Token::RBracket);
+            if tokens[index + 2..end - 1].windows(2).any(|pair| {
+                matches!(&pair[0], Token::Ident(name) if name == "path") && pair[1] == Token::Other
+            }) {
+                return true;
+            }
+            index = end;
+        } else {
+            index += 1;
         }
-        [_, second] => second.as_os_str() == "mod.rs",
-        _ => false,
+    }
+    false
+}
+
+fn module_depth(src_root: &Path, file: &Path) -> usize {
+    let relative = file.strip_prefix(src_root).expect("file under src/");
+    if relative == Path::new("main.rs") {
+        0
+    } else {
+        relative.components().count() - usize::from(file.file_name().unwrap() == "mod.rs")
     }
 }
 
-fn extract_top_level_super_dependencies(src: &str, self_module: &str) -> BTreeSet<String> {
-    let layers = layer_map();
-    extract_dependencies(src, "super", self_module)
-        .into_iter()
-        .filter(|dep| layers.contains_key(dep.as_str()))
-        .collect()
+fn collect_relative_path(
+    tokens: &[Token],
+    mut index: usize,
+    mut depth: usize,
+    self_module: &str,
+    deps: &mut BTreeSet<String>,
+) -> usize {
+    while let Some(Token::Ident(name)) = tokens.get(index) {
+        if tokens.get(index + 1) != Some(&Token::ColonColon) {
+            break;
+        }
+        if name == "super" {
+            let Some(parent) = depth.checked_sub(1) else {
+                return index + 2;
+            };
+            depth = parent;
+        } else if name != "self" {
+            break;
+        }
+        index += 2;
+    }
+    match tokens.get(index) {
+        Some(Token::LBrace) => {
+            let end = skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace);
+            index += 1;
+            while index + 1 < end {
+                index = collect_relative_path(tokens, index, depth, self_module, deps);
+                while index + 1 < end && tokens[index] != Token::Comma {
+                    index = if tokens[index] == Token::LBrace {
+                        skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace)
+                    } else {
+                        index + 1
+                    };
+                }
+                index += 1;
+            }
+            end
+        }
+        Some(Token::Ident(target)) => {
+            if depth == 0 && target != self_module && layer_map().contains_key(target.as_str()) {
+                deps.insert(target.clone());
+            }
+            index + 1
+        }
+        _ => index + 1,
+    }
+}
+
+fn extract_super_dependencies(src: &str, self_module: &str, file_depth: usize) -> BTreeSet<String> {
+    let tokens = strip_cfg_test(&tokenize(src));
+    let mut deps = BTreeSet::new();
+    let mut depth = file_depth;
+    let mut scopes = Vec::new();
+    let mut index = 0;
+    while index < tokens.len() {
+        if matches!(&tokens[index], Token::Ident(name) if name == "super")
+            && tokens.get(index + 1) == Some(&Token::ColonColon)
+        {
+            index = collect_relative_path(&tokens, index, depth, self_module, &mut deps);
+            continue;
+        }
+        match &tokens[index] {
+            Token::LBrace => {
+                let module = index >= 2
+                    && matches!(&tokens[index - 2], Token::Ident(name) if name == "mod")
+                    && matches!(&tokens[index - 1], Token::Ident(_));
+                scopes.push(module);
+                depth += usize::from(module);
+            }
+            Token::RBrace => {
+                depth -= usize::from(scopes.pop().unwrap_or(false));
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    deps
 }
 
 fn scan_production_graph() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<String>>) {
@@ -494,18 +580,32 @@ fn scan_production_graph() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<Strin
     let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for file in files {
+        if file == src_root.join("platform/tests.rs") {
+            continue;
+        }
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        assert!(
+            !has_module_path_override(&content),
+            "{}: DAG gate requires standard module file paths; remove the path attribute",
+            file.display()
+        );
         let Some(module) = module_for_src_file(&src_root, &file) else {
             continue;
         };
         modules.insert(module.clone());
-        let content = fs::read_to_string(&file)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
-
         let entry = graph.entry(module.clone()).or_default();
-        entry.extend(extract_dependencies(&content, "crate", &module));
-        if is_top_level_module_file(&src_root, &file) {
-            entry.extend(extract_top_level_super_dependencies(&content, &module));
-        }
+        let own_module = if L0_MODULES.contains(&module.as_str()) {
+            ""
+        } else {
+            module.as_str()
+        };
+        entry.extend(extract_dependencies(&content, "crate", own_module));
+        entry.extend(extract_super_dependencies(
+            &content,
+            &module,
+            module_depth(&src_root, &file),
+        ));
         if module == "main" {
             entry.extend(extract_dependencies(&content, "mcpcli", &module));
         }
@@ -674,10 +774,82 @@ fn scanner_checks_top_level_super_module_references() {
         }
     "#;
 
-    let deps = extract_top_level_super_dependencies(sample, "runtime");
+    let deps = extract_super_dependencies(sample, "runtime", 1);
     let expected: BTreeSet<String> = ["budget", "config", "ipc", "platform"]
         .into_iter()
         .map(str::to_owned)
         .collect();
     assert_eq!(deps, expected);
+}
+
+#[test]
+fn scanner_resolves_super_chains_in_files_and_inline_modules() {
+    let sample = r#"
+        use super::super::daemon::App;
+        use super::{super::{config, json::parse}, ingress::Ingress};
+        mod nested {
+            use super::super::super::auth::HttpAuthManager;
+            fn f() { let _ = super::super::super::ipc::PROTOCOL; }
+            use super::super::events::EventRouter;
+        }
+        fn f() { let _ = super::super::runtime::Paths::new; }
+        #[cfg(test)]
+        mod tests { use super::super::super::events_stream::run; }
+    "#;
+    let deps = extract_super_dependencies(sample, "mcp", 2);
+    let expected = ["auth", "config", "daemon", "ipc", "json", "runtime"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(deps, expected);
+    assert_eq!(
+        extract_super_dependencies("mod nested { use super::super::daemon::App; }", "mcp", 1),
+        ["daemon".to_owned()].into_iter().collect()
+    );
+    assert!(extract_super_dependencies("use super::daemon::Helper;", "mcp", 2).is_empty());
+    assert!(
+        extract_super_dependencies("use super::super::mcp::McpConnection;", "mcp", 2).is_empty()
+    );
+    let root = Path::new("src");
+    assert_eq!(module_depth(root, Path::new("src/mcp.rs")), 1);
+    assert_eq!(module_depth(root, Path::new("src/platform/mod.rs")), 1);
+    assert_eq!(module_depth(root, Path::new("src/mcp/ingress.rs")), 2);
+    assert_eq!(
+        module_depth(root, Path::new("src/platform/nested/mod.rs")),
+        2
+    );
+}
+
+#[test]
+fn scanner_requires_standard_production_module_paths() {
+    assert!(has_module_path_override(
+        r#"#[path = "helper.rs"] mod helper;"#
+    ));
+    assert!(has_module_path_override(
+        r#"#[cfg_attr(unix, path = "helper.rs")] mod helper;"#
+    ));
+    assert!(!has_module_path_override(
+        r#"#[cfg(test)] #[path = "helper.rs"] mod helper;"#
+    ));
+    assert!(!has_module_path_override(
+        r##"const DOC: &str = r#"#[path = "helper.rs"]"#;"##
+    ));
+    assert!(!has_module_path_override("#[cfg(unix)] mod helper;"));
+    let root = Path::new("src");
+    assert_eq!(
+        module_depth(root, Path::new("src/platform/unix/freebsd_acl.rs")),
+        3
+    );
+    assert_eq!(
+        extract_super_dependencies("use super::super::super::daemon::App;", "platform", 3),
+        ["daemon".to_owned()].into_iter().collect()
+    );
+}
+
+#[test]
+fn scanner_keeps_self_qualified_crate_paths_for_l0() {
+    assert_eq!(
+        extract_dependencies("use crate::platform::digest;", "crate", ""),
+        ["platform".to_owned()].into_iter().collect()
+    );
 }

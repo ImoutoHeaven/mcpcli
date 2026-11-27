@@ -12,10 +12,8 @@ use std::path::{Component, Path};
 use std::process::{Child, Command};
 
 #[cfg(target_os = "freebsd")]
-#[path = "freebsd_acl.rs"]
 mod freebsd_acl;
 #[cfg(target_os = "macos")]
-#[path = "macos_acl.rs"]
 mod macos_acl;
 
 pub fn uid() -> u32 {
