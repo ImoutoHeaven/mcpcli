@@ -49,6 +49,30 @@ def call(request):
     record("call", tool=name, request_id=request_id, arguments=arguments)
     if name == "die":
         os._exit(7)
+    if name == "progress_wait":
+        ticks = int(arguments.get("ticks", 5))
+        interval = float(arguments.get("interval", 0.3))
+        token = request["params"].get("_meta", {}).get("progressToken")
+        cancelled = threading.Event()
+        with state_lock:
+            pending[request_id] = cancelled
+        record("waiting", request_id=request_id)
+        did_cancel = False
+        for index in range(1, ticks + 1):
+            if cancelled.wait(interval):
+                did_cancel = True
+                break
+            if token is not None:
+                send({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progressToken": token, "progress": index, "total": ticks},
+                })
+        with state_lock:
+            pending.pop(request_id, None)
+        record("wait_finished", request_id=request_id, cancelled=did_cancel)
+        result(request, {"ticks": ticks, "cancelled": did_cancel}, failed=did_cancel)
+        return
     if name in ("wait", "spawn_wait"):
         if name == "spawn_wait":
             child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", args.log])
@@ -157,17 +181,27 @@ for line in sys.stdin:
             "serverInfo": {"name": "cli-fixture", "version": "1"},
         }})
     elif method == "tools/list":
-        names = ["get", "set", "increment", "echo", "mixed", "multimodal", "error", "wait", "spawn_wait", "unlock", "die"]
+        names = ["get", "set", "increment", "echo", "mixed", "multimodal", "error", "wait", "spawn_wait", "progress_wait", "unlock", "die"]
         with state_lock:
             if unlocked:
                 names.append("admin")
-        send({"jsonrpc": "2.0", "id": request["id"], "result": {
-            "tools": [{"name": name, "description": "Fixture " + name,
-                       "inputSchema": {"type": "object", "additionalProperties": True}}
-                      for name in names]
-        }})
+        tools = []
+        for name in names:
+            entry = {
+                "name": name,
+                "description": (
+                    "\n  Progress Wait Summary Line\r\nSecond detail line for progress_wait"
+                    if name == "progress_wait"
+                    else "Fixture " + name
+                ),
+                "inputSchema": {"type": "object", "additionalProperties": True},
+            }
+            if name == "progress_wait":
+                entry["annotations"] = {"readOnlyHint": True}
+            tools.append(entry)
+        send({"jsonrpc": "2.0", "id": request["id"], "result": {"tools": tools}})
     elif method == "tools/call":
-        if request["params"]["name"] in ("wait", "spawn_wait"):
+        if request["params"]["name"] in ("wait", "spawn_wait", "progress_wait"):
             threading.Thread(target=call, args=(request,), daemon=True).start()
         else:
             call(request)

@@ -113,8 +113,11 @@ class Fixture:
 
     def command(self, *args, session="default", timeout=10):
         self.sessions.add(session)
-        return [str(self.binary), "--config", str(self.config), "--session", session,
-                "--timeout", str(timeout), *args]
+        cmd = [str(self.binary), "--config", str(self.config), "--session", session]
+        if timeout is not None:
+            cmd.extend(["--timeout", str(timeout)])
+        cmd.extend(args)
+        return cmd
 
     def invoke(self, *args, code=0, session="default", timeout=10, input_text=None, wall_timeout=40):
         command = self.command(*args, session=session, timeout=timeout)
@@ -919,7 +922,9 @@ def admission_uses_original_deadline(f):
         for _ in range(32):
             held.append(IdleConnection(endpoint))
         started = time.monotonic()
-        failed = f.fail("call", "state", "increment", timeout=1, code=5, wall_timeout=3)
+        failed = f.fail(
+            "call", "state", "increment", "--max-timeout", "1", timeout=1, code=5, wall_timeout=3
+        )
         assert failed["kind"] == "timeout", failed
         assert time.monotonic() - started < 2.5, "admission renewed the expired request budget"
         assert not f.events("call", tool="increment"), "queued request executed after its deadline"
@@ -1579,10 +1584,304 @@ def oauth_cli_login_refresh_diagnostics_and_logout(f):
         assert oauth_state["revoked"], "expected revocation endpoint to receive tokens"
         assert f.value("auth", "status", "oauth_srv")["authenticated"] is False
         slow_out, slow_err = slow_call.communicate(timeout=5)
-        assert slow_call.returncode == 0, slow_err
-        assert json.loads(slow_out)["result"]["content"][0]["text"] == "ok:slow_ping"
+        assert slow_call.returncode == 4 and not slow_out, slow_err
+        slow_diag = error_value(subprocess.CompletedProcess([], 4, slow_out, slow_err))
+        assert slow_diag["kind"] == "cancelled" and slow_diag["outcome_unknown"] is True
         f.value("reset", "--force", "oauth_srv")
         assert f.fail("tools", "oauth_srv", code=4)["kind"] == "auth_required"
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def v07_call_dual_clock_progress_and_force_reset(f):
+    # Validation: max-timeout < timeout and max-timeout > 86400 fail locally with exit 2.
+    err_order = f.fail("call", "state", "echo", "--max-timeout", "1", timeout=2, code=2)
+    assert err_order["kind"] == "invalid_timeout"
+    err_upper = f.fail("call", "state", "echo", "--max-timeout", "86401", timeout=1, code=2)
+    assert err_upper["kind"] == "invalid_timeout"
+
+    # Unbounded default (no --max-timeout): progresses every 0.3s for ~2.1s under --timeout 1.
+    for extra in ([], ["--oneshot"]):
+        res = f.value(
+            *extra, "call", "state", "progress_wait",
+            "--args", json.dumps({"ticks": 7, "interval": 0.3}),
+            timeout=1,
+        )
+        assert res["result"]["structuredContent"] == {"ticks": 7, "cancelled": False}
+
+    # Explicit --max-timeout caps continuously progressing calls in both daemon and --oneshot modes.
+    for extra in ([], ["--oneshot"]):
+        started = time.monotonic()
+        err = f.fail(
+            *extra, "call", "state", "progress_wait",
+            "--args", json.dumps({"ticks": 20, "interval": 0.3}),
+            "--max-timeout", "2",
+            timeout=1,
+            code=5,
+        )
+        elapsed = time.monotonic() - started
+        assert err["kind"] == "timeout" and err["outcome_unknown"] is True
+        assert 1.5 <= elapsed < 5.0, f"expected ~2s hard timeout, got {elapsed:.2f}s"
+
+    # reset --force interrupts an in-flight long call promptly.
+    before_waiting = len(f.events("waiting"))
+    inflight = f.start(
+        "call", "state", "progress_wait",
+        "--args", json.dumps({"ticks": 60, "interval": 0.3}),
+        timeout=2,
+    )
+    wait_for(lambda: len(f.events("waiting")) > before_waiting, "progress_wait never started")
+    reset_started = time.monotonic()
+    f.value("reset", "--force", "state", timeout=5)
+    assert time.monotonic() - reset_started < 4.0
+    out, err_text = inflight.communicate(timeout=5)
+    assert inflight.returncode == 4 and not out, f"unexpected result: rc={inflight.returncode} out={out!r} err={err_text!r}"
+    err = error_value(subprocess.CompletedProcess([], 4, out, err_text))
+    assert err["kind"] == "cancelled" and err["outcome_unknown"] is True
+
+
+def v07_config_validate_enabled_and_server_timeout(f):
+    agents_file = f.root / "AGENTS.md"
+    agents_file.write_text("Follow the v0.7 specification.\n", encoding="utf-8")
+    f.settings["agents"] = "AGENTS.md"
+    f.settings["servers"]["state"]["timeout"] = 1
+    f.settings["servers"]["disabled_stdio"] = {
+        "transport": "stdio",
+        "command": "~/does-not-exist/bin",
+        "cwd": "/definitely/missing/v07/dir",
+        "env": {"SECRET": "${UNSET_V07_DISABLED_SECRET}"},
+        "enabled": False,
+        "description": "Disabled local server",
+    }
+    f.settings["servers"]["disabled_http"] = {
+        "transport": "http",
+        "url": "http://127.0.0.1:9/mcp",
+        "enabled": False,
+        "oauth": {
+            "client_id": "disabled-cid",
+            "client_secret": "${UNSET_V07_DISABLED_OAUTH_SECRET}",
+        },
+        "description": "Disabled remote server",
+    }
+    f.save_config()
+
+    # Offline config validate succeeds without starting a daemon.
+    val = f.value("config", "validate", timeout=None)
+    assert val == {"valid": True, "servers": 3, "enabledServers": 1, "skills": 1, "warnings": []}
+    assert not f.runtime.exists(), "config validate must not create runtime dir or start daemon"
+    val_text = f.invoke("--text", "config", "validate", timeout=None).stdout
+    assert "valid: true" in val_text and "servers: 3 (1 enabled)" in val_text and "skills: 1" in val_text
+
+    # Catalog and search expose enabled boolean and mark disabled servers in --text.
+    cat = f.value("catalog", timeout=None)
+    by_name = {srv["name"]: srv for srv in cat["servers"]}
+    assert by_name["state"]["enabled"] is True
+    assert by_name["disabled_stdio"]["enabled"] is False
+    assert by_name["disabled_http"]["enabled"] is False
+    cat_text = f.invoke("--text", "catalog", timeout=None).stdout
+    assert "server disabled_stdio [disabled]\tDisabled local server" in cat_text
+    assert "server state\tStateful acceptance fixture" in cat_text
+
+    search = f.value("search", "disabled", timeout=None)
+    assert all(srv["enabled"] is False for srv in search["servers"])
+    assert len(search["servers"]) == 2
+
+    # Command matrix for disabled servers: blocked locally with exit 2 / server_disabled.
+    for cmd in (
+        ("server", "disabled_stdio"),
+        ("tools", "disabled_stdio"),
+        ("inspect", "disabled_stdio", "echo"),
+        ("call", "disabled_stdio", "echo", "--stdin"),
+        ("events", "list", "disabled_stdio"),
+        ("events", "poll", "disabled_stdio", "ev"),
+        ("events", "stream", "disabled_stdio", "ev"),
+        ("auth", "login", "disabled_http", "--no-browser"),
+        ("reset", "disabled_stdio"),
+    ):
+        err = f.fail(*cmd, code=2, timeout=None)
+        assert err["kind"] == "server_disabled", f"{cmd}: expected server_disabled, got {err}"
+    assert not f.runtime.exists(), "disabled server rejections must stay local"
+
+    # auth status and auth logout are allowed on disabled HTTP servers.
+    cred_file = f.root / "disabled-creds.json"
+    f.env["MCPCLI_CREDENTIALS"] = str(cred_file)
+    assert f.value("auth", "status", "disabled_http", timeout=None)["authenticated"] is False
+    logout_res = f.value("auth", "logout", "disabled_http", timeout=None)
+    assert logout_res["loggedOut"] is True and logout_res["authenticated"] is False
+
+    # Per-server timeout (1s) applies when --timeout is omitted (call + --stdin).
+    started = time.monotonic()
+    err_wait = f.fail("call", "state", "wait", "--args", json.dumps({"seconds": 5}), timeout=None, code=5)
+    assert err_wait["kind"] == "timeout"
+    assert time.monotonic() - started < 4.0
+
+    # daemon status shows disabled servers as "disabled".
+    status = f.value("daemon", "status", timeout=None)
+    assert status["servers"]["disabled_stdio"]["state"] == "disabled"
+    assert status["servers"]["disabled_http"]["state"] == "disabled"
+
+    # Per-server timeout also governs --stdin argument reading when --timeout is omitted.
+    stdin_proc = f.start("call", "state", "echo", "--stdin", timeout=None, open_stdin=True)
+    started = time.monotonic()
+    stdin_proc.stdin.write('{"unfinished":')
+    stdin_proc.stdin.flush()
+    assert stdin_proc.wait(timeout=5.5) == 5
+    stdin_out, stdin_err = stdin_proc.communicate()
+    assert not stdin_out
+    assert error_value(subprocess.CompletedProcess([], 5, stdin_out, stdin_err))["kind"] == "timeout"
+    assert time.monotonic() - started < 5.5
+
+    # Server timeout also participates in --max-timeout >= timeout validation.
+    f.settings["servers"]["state"]["timeout"] = 5
+    f.save_config()
+    err_max = f.fail("call", "state", "echo", "--max-timeout", "2", timeout=None, code=2)
+    assert err_max["kind"] == "invalid_timeout"
+
+    # Invalid config fails config validate with exit 2.
+    f.settings["agents"] = "missing-agents.md"
+    f.save_config()
+    err_val = f.fail("config", "validate", timeout=None, code=2)
+    assert err_val["kind"] == "agents"
+
+
+def v07_tools_filter_and_summary(f):
+    # Empty --filter fails locally with exit 2.
+    err_empty = f.fail("tools", "state", "--filter", "", code=2)
+    assert err_empty["kind"] == "query"
+    assert not f.runtime.exists()
+
+    # Default output preserves v0.6.0 {"pages": [...]} shape.
+    raw = f.value("tools", "state")
+    assert "pages" in raw and "tools" not in raw
+
+    # --filter outputs flattened {"tools": [...]} with case-insensitive name/description match.
+    filtered = f.value("tools", "state", "--filter", "PROGRESS")
+    assert "pages" not in filtered
+    assert [t["name"] for t in filtered["tools"]] == ["progress_wait"]
+    assert "inputSchema" in filtered["tools"][0]
+
+    # --summary outputs compact {name, description?, annotations?} without inputSchema.
+    summarized = f.value("tools", "state", "--filter", "progress_wait", "--summary")
+    assert "pages" not in summarized
+    assert summarized["tools"] == [{
+        "name": "progress_wait",
+        "description": "Progress Wait Summary Line",
+        "annotations": {"readOnlyHint": True},
+    }]
+
+    # --text renders flattened --filter/--summary output cleanly.
+    text = f.invoke("--text", "tools", "state", "--filter", "progress_wait", "--summary").stdout
+    assert text == "progress_wait\nProgress Wait Summary Line\n"
+
+
+def v07_auth_login_flags_and_conflicts(f):
+    import http.server
+    import urllib.parse
+    import urllib.request
+
+    state = {"dcr_names": [], "callback_paths": []}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def _json(self, code, payload):
+            body = json.dumps(payload).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            base = f"http://127.0.0.1:{self.server.server_port}"
+            if self.path == "/.well-known/oauth-protected-resource/mcp":
+                self._json(200, {"resource": f"{base}/mcp", "authorization_servers": [f"{base}/issuer"]})
+            elif self.path == "/.well-known/oauth-authorization-server/issuer":
+                self._json(200, {
+                    "issuer": f"{base}/issuer",
+                    "authorization_endpoint": f"{base}/oauth/authorize",
+                    "token_endpoint": f"{base}/oauth/token",
+                    "registration_endpoint": f"{base}/oauth/register",
+                    "response_types_supported": ["code"],
+                    "code_challenge_methods_supported": ["S256"],
+                })
+            elif self.path.startswith("/oauth/authorize?"):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                redirect_uri = q["redirect_uri"][0]
+                state["callback_paths"].append(urllib.parse.urlparse(redirect_uri).path)
+                loc = f"{redirect_uri}?code=test-code&state={q['state'][0]}"
+                self.send_response(302)
+                self.send_header("Location", loc)
+                self.end_headers()
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode("utf-8")
+            if self.path == "/oauth/register":
+                body = json.loads(raw)
+                state["dcr_names"].append(body.get("client_name"))
+                self._json(201, {"client_id": "dcr-custom-1", "redirect_uris": body.get("redirect_uris", [])})
+            elif self.path == "/oauth/token":
+                self._json(200, {
+                    "access_token": "AT_V07_1",
+                    "token_type": "Bearer",
+                    "expires_in": 3600,
+                    "scope": "mcp:read",
+                })
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        base_url = f"http://127.0.0.1:{srv.server_port}"
+        cred_file = f.root / "v07-auth-creds.json"
+        f.env["MCPCLI_CREDENTIALS"] = str(cred_file)
+        f.settings["servers"] = {
+            "dcr_srv": {"transport": "http", "url": f"{base_url}/mcp"},
+            "cid_srv": {
+                "transport": "http",
+                "url": f"{base_url}/mcp",
+                "oauth": {"client_id": "configured-cid"},
+            },
+        }
+        f.save_config()
+
+        # Conflict: --client-name with configured or CLI client_id fails with exit 2.
+        assert f.fail("auth", "login", "cid_srv", "--client-name", "bad", "--no-browser", code=2)["kind"] == "arguments"
+        assert f.fail(
+            "auth", "login", "dcr_srv", "--client-id", "x", "--client-name", "bad", "--no-browser", code=2
+        )["kind"] == "arguments"
+
+        # Find a free ephemeral port for --callback-port.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            cb_port = probe.getsockname()[1]
+
+        proc = f.start(
+            "auth", "login", "dcr_srv",
+            "--callback-port", str(cb_port),
+            "--callback-path", "/custom/cb",
+            "--client-name", "my-custom-cli",
+            "--no-browser",
+            timeout=15,
+        )
+        readline_with_timeout(proc.stderr, 5)
+        auth_url = readline_with_timeout(proc.stderr, 5).strip()
+        assert f"127.0.0.1%3A{cb_port}%2Fcustom%2Fcb" in auth_url
+        with urllib.request.urlopen(auth_url, timeout=5) as resp:
+            assert resp.status == 200
+        out, err_text = proc.communicate(timeout=5)
+        assert proc.returncode == 0, err_text
+        assert json.loads(out)["authenticated"] is True
+        assert state["dcr_names"] == ["my-custom-cli"]
+        assert state["callback_paths"] == ["/custom/cb"]
     finally:
         srv.shutdown()
         srv.server_close()
@@ -1603,6 +1902,10 @@ CASES = [
     burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
     events_clean_sep3415_and_transport_header_rules, http_session_404_requires_reset, oauth_cli_login_refresh_diagnostics_and_logout,
     unprivileged_execute_only_ancestors,
+    v07_call_dual_clock_progress_and_force_reset,
+    v07_config_validate_enabled_and_server_timeout,
+    v07_tools_filter_and_summary,
+    v07_auth_login_flags_and_conflicts,
 ]
 
 

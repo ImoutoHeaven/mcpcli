@@ -135,6 +135,41 @@ pub fn safe_text(text: &str) -> String {
     result
 }
 
+pub fn summary_description(text: &str) -> Option<String> {
+    let normalized = safe_text(text);
+    let line = normalized
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    let mut chars = line.chars();
+    let mut result: String = chars.by_ref().take(256).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    Some(result)
+}
+
+pub fn summarize_tool(tool: &Value) -> Value {
+    let Some(object) = tool.as_object() else {
+        return tool.clone();
+    };
+    let mut summary = Map::new();
+    if let Some(name) = object.get("name").and_then(Value::as_str) {
+        summary.insert("name".into(), Value::String(name.to_owned()));
+    }
+    if let Some(description) = object
+        .get("description")
+        .and_then(Value::as_str)
+        .and_then(summary_description)
+    {
+        summary.insert("description".into(), Value::String(description));
+    }
+    if let Some(annotations) = object.get("annotations").filter(|value| value.is_object()) {
+        summary.insert("annotations".into(), annotations.clone());
+    }
+    Value::Object(summary)
+}
+
 fn single_line(text: &str, limit: usize) -> String {
     let mut result = String::new();
     let mut count = 0;
@@ -237,5 +272,41 @@ mod tests {
         assert_eq!(safe_text("one\r\ntwo\r\n"), "one\ntwo\n");
         assert_eq!(safe_text("spoof\roverwrite"), "spoof\\roverwrite");
         assert_eq!(safe_text("mixed\r\r\nline"), "mixed\\r\nline");
+    }
+
+    #[test]
+    fn summarize_tool_projects_first_non_empty_line_and_annotations() {
+        let long_line = "😀".repeat(260);
+        let tool = json!({
+            "name": "search_docs",
+            "description": format!("\n  \r\n  {long_line}\nSecond line ignored"),
+            "inputSchema": {"type": "object"},
+            "annotations": {"readOnlyHint": true, "openWorldHint": false},
+            "_meta": {"internal": 1}
+        });
+        let summary = summarize_tool(&tool);
+        assert_eq!(summary["name"], "search_docs");
+        let desc = summary["description"].as_str().unwrap();
+        assert_eq!(desc.chars().count(), 257);
+        assert!(desc.ends_with('…'));
+        assert_eq!(
+            summary["annotations"],
+            json!({"readOnlyHint": true, "openWorldHint": false})
+        );
+        assert!(summary.get("inputSchema").is_none());
+        assert!(summary.get("_meta").is_none());
+
+        let blank_desc = summarize_tool(&json!({
+            "name": "noop",
+            "description": "  \r\n\t  ",
+            "inputSchema": {}
+        }));
+        assert_eq!(blank_desc, json!({"name": "noop"}));
+
+        let control_desc = summarize_tool(&json!({
+            "name": "ctrl",
+            "description": "first\u{1b}[31mred\rnext\nsecond"
+        }));
+        assert_eq!(control_desc["description"], "first\\u{1b}[31mred\\rnext");
     }
 }

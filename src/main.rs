@@ -67,8 +67,11 @@ struct Cli {
 }
 
 impl Cli {
-    fn timeout_secs(&self) -> u64 {
-        self.timeout.unwrap_or(60).min(3600)
+    fn timeout_secs_for(&self, server: &ServerConfig) -> u64 {
+        self.timeout
+            .or_else(|| server.timeout())
+            .unwrap_or(60)
+            .min(3600)
     }
 
     fn validate_request_timeout(&self) -> Result<()> {
@@ -86,6 +89,28 @@ impl Cli {
     fn has_explicit_timeout(&self) -> bool {
         self.timeout.is_some()
     }
+}
+
+fn validate_call_max_timeout(
+    timeout_secs: u64,
+    max_timeout: Option<u64>,
+) -> Result<Option<Duration>> {
+    let Some(max_secs) = max_timeout else {
+        return Ok(None);
+    };
+    if max_secs == 0 || max_secs > 86_400 {
+        return Err(usage(
+            "invalid_timeout",
+            "max-timeout must be between 1 and 86400 seconds",
+        ));
+    }
+    if max_secs < timeout_secs {
+        return Err(usage(
+            "invalid_timeout",
+            "max-timeout must be greater than or equal to timeout",
+        ));
+    }
+    Ok(Some(Duration::from_secs(max_secs)))
 }
 
 #[allow(dead_code)]
@@ -122,7 +147,19 @@ enum Command {
     /// Read live server information, capabilities, and instructions.
     Server { server: String },
     /// List current tool definitions for a server.
-    Tools { server: String },
+    Tools {
+        server: String,
+        #[arg(
+            long,
+            help = "Filter tools by case-insensitive substring match on name or description"
+        )]
+        filter: Option<String>,
+        #[arg(
+            long,
+            help = "Return compact tool summaries (name, first-line description, annotations)"
+        )]
+        summary: bool,
+    },
     /// Read complete tool metadata and JSON schemas.
     Inspect { server: String, tool: String },
     /// Invoke one tool. Arguments must be a JSON object.
@@ -140,6 +177,12 @@ enum Command {
             help = "Keep base64 media inline instead of saving to the local media cache"
         )]
         inline_media: bool,
+        #[arg(
+            long,
+            value_parser = clap::value_parser!(u64).range(1..),
+            help = "Optional hard wall-clock limit in seconds (1-86400; default unbounded while progress continues)"
+        )]
+        max_timeout: Option<u64>,
     },
     /// Close a server connection and discard its session state.
     Reset {
@@ -166,11 +209,22 @@ enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Validate configuration, AGENTS.md, and configured skill directories offline.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Manage the daemon for the selected config and session.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommand {
+    /// Validate configuration, AGENTS.md, and skills offline without starting a daemon.
+    Validate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
@@ -274,6 +328,12 @@ enum AuthCommand {
         scopes: Vec<String>,
         #[arg(long)]
         client_id: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=65535))]
+        callback_port: Option<u16>,
+        #[arg(long)]
+        callback_path: Option<String>,
+        #[arg(long)]
+        client_name: Option<String>,
         #[arg(long)]
         no_browser: bool,
     },
@@ -433,6 +493,7 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
             json!({
                 "name": name,
                 "transport": server.transport(),
+                "enabled": server.enabled(),
                 "description": server.description().unwrap_or("")
             })
         })
@@ -444,11 +505,13 @@ fn catalog(loaded: &LoadedConfig, query: Option<&str>) -> Result<Output> {
         .collect();
     let mut lines = Vec::new();
     for server in &servers {
-        lines.push(format!(
-            "server {}\t{}",
-            server["name"].as_str().unwrap(),
-            brief(server["description"].as_str().unwrap())
-        ));
+        let name = server["name"].as_str().unwrap();
+        let desc = brief(server["description"].as_str().unwrap());
+        if server["enabled"].as_bool() == Some(false) {
+            lines.push(format!("server {name} [disabled]\t{desc}"));
+        } else {
+            lines.push(format!("server {name}\t{desc}"));
+        }
     }
     for skill in &selected_skills {
         lines.push(format!(
@@ -579,6 +642,7 @@ async fn remote(
     cli: &Cli,
     loaded: &LoadedConfig,
     operation: Leased<Operation>,
+    max_timeout: Option<u64>,
     uncertain: &AtomicBool,
 ) -> Result<RemoteOutput> {
     let server = match &*operation {
@@ -602,7 +666,13 @@ async fn remote(
         ));
     }
     cli.validate_request_timeout()?;
-    let budget = Duration::from_secs(cli.timeout_secs());
+    let timeout_secs = cli.timeout_secs_for(config);
+    let hard = if operation.is_call() {
+        validate_call_max_timeout(timeout_secs, max_timeout)?
+    } else {
+        None
+    };
+    let budget = Duration::from_secs(timeout_secs);
     let started = Instant::now();
     if cli.oneshot {
         let oneshot_fut = async {
@@ -631,10 +701,19 @@ async fn remote(
                     Operation::Call {
                         tool, arguments, ..
                     } => {
+                        let remaining_hard = hard.map(|h| h.saturating_sub(started.elapsed()));
+                        if remaining_hard.is_some_and(|d| d.is_zero()) {
+                            return Err(Failure::new(
+                                5,
+                                "timeout",
+                                "request deadline exceeded before dispatch",
+                            )
+                            .into());
+                        }
                         let budgets = CallBudgets {
                             pre_dispatch_deadline: started + budget,
                             idle: budget,
-                            hard: None,
+                            hard: remaining_hard,
                         };
                         connection
                             .call_with_dispatch_leased(
@@ -719,6 +798,18 @@ async fn remote(
             }
         };
         if operation.is_call() {
+            if let Some(h) = hard {
+                return timeout(h + Duration::from_secs(10), oneshot_fut)
+                    .await
+                    .map_err(|_| {
+                        Failure::new(
+                            5,
+                            "timeout",
+                            "request deadline exceeded; the call is not replayed",
+                        )
+                        .uncertain(uncertain.load(Ordering::Acquire))
+                    })?;
+            }
             return oneshot_fut.await;
         }
         return timeout(budget + Duration::from_secs(10), oneshot_fut)
@@ -746,8 +837,10 @@ async fn remote(
             "deadline elapsed while starting the daemon; tool was not dispatched",
         )
     })??;
-    let remaining = budget.saturating_sub(started.elapsed());
-    if remaining.is_zero() {
+    let elapsed = started.elapsed();
+    let remaining = budget.saturating_sub(elapsed);
+    let remaining_hard = hard.map(|h| h.saturating_sub(elapsed));
+    if remaining.is_zero() || remaining_hard.is_some_and(|d| d.is_zero()) {
         return Err(Failure::new(5, "timeout", "deadline elapsed before dispatch").into());
     }
     let (input_lease, operation) = {
@@ -755,7 +848,7 @@ async fn remote(
         (lease, operation)
     };
     let request = if operation.is_call() {
-        paths.request_call_with_budgets(&loaded.digest, operation, remaining, None)?
+        paths.request_call_with_budgets(&loaded.digest, operation, remaining, remaining_hard)?
     } else {
         paths.request_with_explicit(
             &loaded.digest,
@@ -840,22 +933,33 @@ fn listed_tools(value: &Value) -> Result<impl Iterator<Item = &Value>> {
 }
 
 fn write_tools_text(stdout: &mut impl Write, value: &Value) -> std::io::Result<()> {
-    let tools = listed_tools(value).map_err(std::io::Error::other)?;
-    let parts = tools.enumerate().flat_map(|(index, tool)| {
-        let name = tool["name"].as_str().unwrap_or("<unnamed>");
-        let description = tool["description"]
-            .as_str()
-            .filter(|description| !description.is_empty());
-        [
-            (index > 0).then_some("\n\n"),
-            Some(name),
-            description.map(|_| "\n"),
-            description,
-        ]
-        .into_iter()
-        .flatten()
-    });
-    discovery::write_text_parts(stdout, parts)
+    fn render_tools<'a>(
+        stdout: &mut impl Write,
+        tools: impl Iterator<Item = &'a Value>,
+    ) -> std::io::Result<()> {
+        let parts = tools.enumerate().flat_map(|(index, tool)| {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            let description = tool["description"]
+                .as_str()
+                .filter(|description| !description.is_empty());
+            [
+                (index > 0).then_some("\n\n"),
+                Some(name),
+                description.map(|_| "\n"),
+                description,
+            ]
+            .into_iter()
+            .flatten()
+        });
+        discovery::write_text_parts(stdout, parts)
+    }
+
+    if let Some(tools) = value.get("tools").and_then(Value::as_array) {
+        render_tools(stdout, tools.iter())
+    } else {
+        let tools = listed_tools(value).map_err(std::io::Error::other)?;
+        render_tools(stdout, tools)
+    }
 }
 
 fn take_listed_tool(value: &mut Value, name: &str) -> Result<Value> {
@@ -1129,6 +1233,46 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             }
             catalog(&loaded, Some(query))
         }
+        Command::Config {
+            command: ConfigCommand::Validate,
+        } => {
+            if loaded.config.agents.is_some() {
+                agents::load(loaded.config.agents.as_deref())
+                    .map_err(|error| usage("agents", format!("{error:#}")))?;
+            }
+            let skill_catalog = if loaded.config.skills.is_empty() {
+                skills::SkillCatalog::default()
+            } else {
+                skills::discover(&loaded.config.skills)
+                    .map_err(|error| usage("skills", format!("{error:#}")))?
+            };
+            let servers = loaded.config.servers.len();
+            let enabled_servers = loaded
+                .config
+                .servers
+                .values()
+                .filter(|server| server.enabled())
+                .count();
+            let skills_count = skill_catalog.skills.len();
+            let mut lines = vec![
+                "valid: true".to_owned(),
+                format!("servers: {servers} ({enabled_servers} enabled)"),
+                format!("skills: {skills_count}"),
+            ];
+            for warning in &skill_catalog.warnings {
+                lines.push(format!("warning: {}", safe_text(warning)));
+            }
+            Ok(Output::with_text(
+                json!({
+                    "valid": true,
+                    "servers": servers,
+                    "enabledServers": enabled_servers,
+                    "skills": skills_count,
+                    "warnings": skill_catalog.warnings,
+                }),
+                lines.join("\n"),
+            ))
+        }
         Command::Server { server } => {
             let remote = remote(
                 cli,
@@ -1139,6 +1283,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     },
                     ByteBudget::global().empty_lease(),
                 ),
+                None,
                 uncertain,
             )
             .await?;
@@ -1149,7 +1294,16 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 Ok(Output::json(value))
             }))
         }
-        Command::Tools { server } => {
+        Command::Tools {
+            server,
+            filter,
+            summary,
+        } => {
+            if let Some(substr) = filter
+                && substr.is_empty()
+            {
+                return Err(usage("query", "filter must not be empty"));
+            }
             let remote = remote(
                 cli,
                 &loaded,
@@ -1159,13 +1313,40 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     },
                     ByteBudget::global().empty_lease(),
                 ),
+                None,
                 uncertain,
             )
             .await?;
             Ok(remote.into_output(|value| {
-                if cli.text {
-                    let _ = listed_tools(&value)?;
-                }
+                let value = if filter.is_some() || *summary {
+                    let needle = filter.as_deref().map(str::to_lowercase);
+                    let tools: Vec<Value> = listed_tools(&value)?
+                        .filter(|tool| {
+                            needle.as_ref().is_none_or(|q| {
+                                tool.get("name")
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|name| name.to_lowercase().contains(q))
+                                    || tool
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .is_some_and(|desc| desc.to_lowercase().contains(q))
+                            })
+                        })
+                        .map(|tool| {
+                            if *summary {
+                                discovery::summarize_tool(tool)
+                            } else {
+                                tool.clone()
+                            }
+                        })
+                        .collect();
+                    json!({ "tools": tools })
+                } else {
+                    if cli.text {
+                        let _ = listed_tools(&value)?;
+                    }
+                    value
+                };
                 Ok(Output::json(value))
             }))
         }
@@ -1179,6 +1360,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     },
                     ByteBudget::global().empty_lease(),
                 ),
+                None,
                 uncertain,
             )
             .await?;
@@ -1192,15 +1374,30 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             args_file,
             stdin,
             inline_media,
+            max_timeout,
         } => {
             if tool.is_empty() || tool.len() > 512 || tool.chars().any(char::is_control) {
                 return Err(usage("tool", "invalid tool name"));
             }
+            let server_config = loaded
+                .config
+                .servers
+                .get(server)
+                .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
+            if !server_config.enabled() {
+                return Err(usage(
+                    "server_disabled",
+                    format!("server {server:?} is disabled"),
+                ));
+            }
+            cli.validate_request_timeout()?;
+            let timeout_secs = cli.timeout_secs_for(server_config);
+            let _ = validate_call_max_timeout(timeout_secs, *max_timeout)?;
             let args = arguments(
                 args,
                 args_file,
                 *stdin,
-                Duration::from_secs(cli.timeout_secs()),
+                Duration::from_secs(timeout_secs),
                 ByteBudget::global(),
             )
             .await?;
@@ -1220,6 +1417,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     },
                     input_lease,
                 ),
+                *max_timeout,
                 uncertain,
             )
             .await?;
@@ -1257,6 +1455,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     },
                     ByteBudget::global().empty_lease(),
                 ),
+                None,
                 uncertain,
             )
             .await?;
@@ -1340,6 +1539,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         },
                         ByteBudget::global().empty_lease(),
                     ),
+                    None,
                     uncertain,
                 )
                 .await?;
@@ -1358,14 +1558,25 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 if event.is_empty() || event.len() > 512 || event.chars().any(char::is_control) {
                     return Err(usage("invalid_event", "invalid event name"));
                 }
+                let server_config =
+                    loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                if !server_config.enabled() {
+                    return Err(usage(
+                        "server_disabled",
+                        format!("server {server:?} is disabled"),
+                    ));
+                }
                 cli.validate_request_timeout()?;
+                let timeout_secs = cli.timeout_secs_for(server_config);
                 let (input_lease, parsed_args) = if args.is_some() || args_file.is_some() || *stdin
                 {
                     let leased = arguments(
                         args,
                         args_file,
                         *stdin,
-                        Duration::from_secs(cli.timeout_secs()),
+                        Duration::from_secs(timeout_secs),
                         ByteBudget::global(),
                     )
                     .await?;
@@ -1388,6 +1599,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         },
                         input_lease,
                     ),
+                    None,
                     uncertain,
                 )
                 .await?;
@@ -1404,6 +1616,9 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                 server,
                 scopes,
                 client_id,
+                callback_port,
+                callback_path,
+                client_name,
                 no_browser,
             } => {
                 cli.validate_request_timeout()?;
@@ -1425,7 +1640,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         ),
                     ));
                 };
-                let budget = Duration::from_secs(cli.timeout_secs());
+                let budget = Duration::from_secs(cli.timeout_secs_for(cfg));
                 let deadline = Instant::now() + budget;
                 let configured_scopes = oauth.as_ref().map_or(&[][..], |o| o.scopes.as_slice());
                 let (value, text) = auth::login(auth::LoginOptions {
@@ -1436,10 +1651,13 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                     client_id: client_id.as_deref(),
                     configured_client_id: oauth.as_ref().and_then(|o| o.client_id.as_deref()),
                     client_secret: oauth.as_ref().and_then(|o| o.client_secret.as_deref()),
-                    client_name: None,
+                    client_name: client_name.as_deref(),
                     configured_client_name: oauth.as_ref().and_then(|o| o.client_name.as_deref()),
-                    callback_port: oauth.as_ref().and_then(|o| o.callback_port),
-                    callback_path: oauth.as_ref().and_then(|o| o.callback_path.as_deref()),
+                    callback_port: (*callback_port)
+                        .or_else(|| oauth.as_ref().and_then(|o| o.callback_port)),
+                    callback_path: callback_path
+                        .as_deref()
+                        .or_else(|| oauth.as_ref().and_then(|o| o.callback_path.as_deref())),
                     auth_server_metadata_url: oauth
                         .as_ref()
                         .and_then(|o| o.auth_server_metadata_url.as_deref()),
@@ -1471,7 +1689,7 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
                         ),
                     ));
                 };
-                let budget = Duration::from_secs(cli.timeout_secs());
+                let budget = Duration::from_secs(cli.timeout_secs_for(cfg));
                 let deadline = Instant::now() + budget;
                 let (value, text) =
                     auth::logout(server, url, oauth.as_ref(), *enabled, budget).await?;
@@ -1611,6 +1829,12 @@ async fn run_events_stream(
         .servers
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
+    if !server_config.enabled() {
+        return Err(usage(
+            "server_disabled",
+            format!("server {server:?} is disabled"),
+        ));
+    }
     let (parsed_args, input_lease) = if args.is_some() || args_file.is_some() || *stdin {
         let leased = events_stream::wait_with_budget(
             Duration::from_secs(30),
@@ -2148,6 +2372,12 @@ mod tests {
             "mcp:write",
             "--client-id",
             "my-client",
+            "--callback-port",
+            "8765",
+            "--callback-path",
+            "/oauth/cb",
+            "--client-name",
+            "my-cli",
             "--no-browser",
         ])
         .unwrap();
@@ -2158,10 +2388,21 @@ mod tests {
                     ref server,
                     ref scopes,
                     ref client_id,
+                    callback_port: Some(8765),
+                    ref callback_path,
+                    ref client_name,
                     no_browser: true,
                 }
-            } if server == "remote" && scopes == &["mcp:read", "mcp:write"] && client_id.as_deref() == Some("my-client")
+            } if server == "remote"
+                && scopes == &["mcp:read", "mcp:write"]
+                && client_id.as_deref() == Some("my-client")
+                && callback_path.as_deref() == Some("/oauth/cb")
+                && client_name.as_deref() == Some("my-cli")
         ));
+        assert!(
+            Cli::try_parse_from(["mcpcli", "auth", "login", "remote", "--callback-port", "0"])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["mcpcli", "auth", "status"]).is_ok());
         assert!(Cli::try_parse_from(["mcpcli", "auth", "status", "remote"]).is_ok());
         assert!(Cli::try_parse_from(["mcpcli", "auth", "logout", "remote"]).is_ok());
@@ -2431,17 +2672,123 @@ mod tests {
     fn cli_and_help_probe_definitions_are_consistent() {
         Cli::command().debug_assert();
         TopLevelHelpProbe::command().debug_assert();
-        let parsed =
-            Cli::try_parse_from(["mcpcli", "call", "srv", "tool", "--inline-media"]).unwrap();
+        let parsed = Cli::try_parse_from([
+            "mcpcli",
+            "call",
+            "srv",
+            "tool",
+            "--inline-media",
+            "--max-timeout",
+            "300",
+        ])
+        .unwrap();
         assert!(!parsed.has_explicit_timeout());
-        assert_eq!(parsed.timeout_secs(), 60);
         assert!(matches!(
             parsed.command,
             Command::Call {
                 inline_media: true,
+                max_timeout: Some(300),
                 ..
             }
         ));
+        assert!(Cli::try_parse_from(["mcpcli", "config", "validate"]).is_ok());
+        let tools_cmd =
+            Cli::try_parse_from(["mcpcli", "tools", "srv", "--filter", "search", "--summary"])
+                .unwrap();
+        assert!(matches!(
+            tools_cmd.command,
+            Command::Tools {
+                ref server,
+                ref filter,
+                summary: true,
+            } if server == "srv" && filter.as_deref() == Some("search")
+        ));
+    }
+
+    #[test]
+    fn validate_call_max_timeout_enforces_bounds_and_order() {
+        assert_eq!(validate_call_max_timeout(60, None).unwrap(), None);
+        assert_eq!(
+            validate_call_max_timeout(60, Some(60)).unwrap(),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            validate_call_max_timeout(60, Some(86_400)).unwrap(),
+            Some(Duration::from_secs(86_400))
+        );
+        let too_small = validate_call_max_timeout(60, Some(59))
+            .unwrap_err()
+            .downcast::<Failure>()
+            .unwrap();
+        assert_eq!(too_small.code, 2);
+        assert_eq!(too_small.kind, "invalid_timeout");
+        let too_large = validate_call_max_timeout(60, Some(86_401))
+            .unwrap_err()
+            .downcast::<Failure>()
+            .unwrap();
+        assert_eq!(too_large.code, 2);
+        assert_eq!(too_large.kind, "invalid_timeout");
+    }
+
+    #[test]
+    fn write_tools_text_renders_flattened_tools_array() {
+        let flat = json!({
+            "tools": [
+                {"name": "alpha", "description": "First line"},
+                {"name": "beta"}
+            ]
+        });
+        assert_eq!(tools_text(&flat).unwrap(), "alpha\nFirst line\n\nbeta\n");
+    }
+
+    #[test]
+    fn catalog_includes_enabled_flag_and_marks_disabled_in_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string(&json!({
+                "version": 1,
+                "servers": {
+                    "active": {
+                        "transport": "stdio",
+                        "command": "echo",
+                        "description": "Active server",
+                        "timeout": 15
+                    },
+                    "off": {
+                        "transport": "stdio",
+                        "command": "~/nonexistent/bin",
+                        "cwd": "/definitely/missing/dir",
+                        "env": {"TOKEN": "${MISSING_SECRET_VAR}"},
+                        "enabled": false,
+                        "description": "Disabled server"
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&cfg_path).unwrap();
+        let out = catalog(&loaded, None).unwrap();
+        let servers = out.value.as_ref().unwrap()["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        let active = servers.iter().find(|s| s["name"] == "active").unwrap();
+        let off = servers.iter().find(|s| s["name"] == "off").unwrap();
+        assert_eq!(active["enabled"], true);
+        assert_eq!(off["enabled"], false);
+        let text = out.text.unwrap();
+        assert!(text.contains("server active\tActive server"));
+        assert!(text.contains("server off [disabled]\tDisabled server"));
+
+        let cli = Cli::try_parse_from(["mcpcli", "tools", "active"]).unwrap();
+        assert_eq!(cli.timeout_secs_for(&loaded.config.servers["active"]), 15);
+        let cli_override =
+            Cli::try_parse_from(["mcpcli", "--timeout", "9", "tools", "active"]).unwrap();
+        assert_eq!(
+            cli_override.timeout_secs_for(&loaded.config.servers["active"]),
+            9
+        );
     }
 
     #[test]

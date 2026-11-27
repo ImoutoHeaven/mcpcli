@@ -36,6 +36,14 @@ requires no external language runtime, though a configured MCP server may
 require Python, Node, or another interpreter. Configured stdio commands and
 event callback commands run with the current user's permissions.
 
+Configured MCP servers in `mcpcli.json` are chosen explicitly by the user and
+treated as trusted peers. Deliberately malicious MCP servers, such as a server
+spamming `notifications/progress` to hold a slot open, are outside the threat
+model. Local OS isolation (socket and pipe peer checks, directory ACLs, and
+symlink or reparse defenses), secret redaction in error diagnostics, OAuth SSRF
+checks on remote endpoints, and `ByteBudget` OOM protection against accidental
+oversized payloads remain in force.
+
 ## 2. Connection ownership
 
 The daemon owns stdio children, HTTP streams, protocol negotiation,
@@ -64,13 +72,14 @@ that upstream state.
 | `catalog` | Global `AGENTS.md` (if configured), server descriptions, and skill metadata | No |
 | `agents` | Full configured global `AGENTS.md` file | No |
 | `search QUERY` | Offline case-insensitive substring match across `AGENTS.md`, servers, and skills | No |
-| `auth login SERVER` | OAuth 2.1 PKCE (`S256`) discovery, registration, and token storage for an HTTP server | No |
+| `config validate` | Offline validation of `mcpcli.json`, `AGENTS.md`, and configured skill roots | No |
+| `auth login [--callback-port PORT] [--callback-path PATH] [--client-name NAME] SERVER` | OAuth 2.1 PKCE (`S256`) discovery, registration, and token storage for an HTTP server | No |
 | `auth status [SERVER]` | Stored OAuth credential state, scopes, and expiry without exposing raw tokens | No |
 | `auth logout SERVER` | Remove stored OAuth credentials for an HTTP server | No |
 | `server SERVER` | Lifecycle metadata, negotiated version, capabilities, and upstream instructions | If needed |
-| `tools SERVER` | Fresh, complete paginated tool definitions | If needed |
+| `tools [--filter SUBSTR] [--summary] SERVER` | Fresh, complete paginated tool definitions, with optional client-side filtering and summary projection | If needed |
 | `inspect SERVER TOOL` | Complete definition and schemas for one tool | If needed |
-| `call [--inline-media] SERVER TOOL` | One tool call, saving binary media locally by default | If needed |
+| `call [--inline-media] [--max-timeout SECS] SERVER TOOL` | One tool call, saving binary media locally by default | If needed |
 | `events list SERVER` | Fresh paginated event definitions from `events/list` | If needed |
 | `events poll SERVER EVENT` | Single `events/poll` batch fetch with optional cursor and filter arguments | If needed |
 | `events stream SERVER EVENT` | Foreground push or poll stream emitting SEP-3415 NDJSON or invoking a callback | If needed |
@@ -84,8 +93,28 @@ that upstream state.
 Tool schemas are fetched only for the requested server. Every `tools`,
 `inspect`, and `call` command fetches the current tool pages before acting,
 populating `2026-07-28` HTTP `x-mcp-header` (`Mcp-Param-*`) mappings and
-dropping tools withdrawn by the server or rejected by the SDK. Discovery,
-pagination, and tool dispatch share one operation deadline.
+dropping tools withdrawn by the server or rejected by the SDK. For regular
+commands, discovery, pagination, and request execution share one operation
+deadline; for `call`, queueing, connection setup, and discovery share a
+pre-dispatch deadline before switching to the progress-resettable inactivity
+timeout (see Section 6).
+
+`tools` accepts optional client-side filters applied to the fresh paginated
+response: `--filter SUBSTR` performs a non-empty case-insensitive substring
+match on tool `name` or `description` (an empty string fails with exit `2`),
+and `--summary` projects each matched tool to `name`, optional single-line
+`description` (normalized with `safe_text` and truncated to 256 Unicode scalar
+values with `…`), and optional `annotations`. Without `--filter` or `--summary`,
+JSON output stays `{"pages":[...]}` with raw pagination cursors and tool
+objects. With either flag, JSON output flattens to `{"tools":[...]}` without
+stale cursors, and `--text` prints each tool's name and first-line description.
+
+`config validate` runs offline without starting the daemon or opening MCP
+connections. It loads and validates `mcpcli.json`, reads `AGENTS.md` when
+configured, and discovers configured `skills`, printing
+`{"valid":true,"servers":N,"enabledServers":E,"skills":M,"warnings":[...]}`
+(or readable lines with `--text`) and exiting `0`, or exiting `2` on validation
+errors.
 
 `mcpcli` stores no persistent tool schema cache and disables the SDK response
 cache. Live connections accept `notifications/tools/list_changed` messages
@@ -110,8 +139,50 @@ aliases; unknown fields fail validation).
 
 | Transport | Fields |
 | --- | --- |
-| `stdio` | `transport: "stdio"`, `command`, optional `args`, `env`, `cwd`, `description` |
-| `http` | `transport: "http"`, `url`, optional `headers`, `description` |
+| `stdio` | `transport: "stdio"`, `command`, optional `args`, `env`, `cwd`, `description`, `enabled`, `timeout` |
+| `http` | `transport: "http"`, `url`, optional `headers`, `oauth`, `description`, `enabled`, `timeout` |
+
+Both transports accept optional `enabled` (boolean, default `true`) and
+`timeout` (integer seconds, `1..=3600`, default unset -> `60`). When `enabled`
+is `false`, configuration loading still checks JSON shape and field types so
+typos fail early, while skipping `~/` expansion, `cwd` canonicalization, and
+`${VAR}` expansion so a host missing that directory, `HOME`, or secret can keep
+the server disabled. Disabled servers appear in `catalog` and `search` with
+`"enabled": false` and in `daemon status` with `"state": "disabled"`.
+`config validate` validates their schema without running env, `~/`, or `cwd`
+checks. `server`, `tools`, `inspect`, `call`, `events *`, `auth login`, and
+`reset` reject disabled servers locally (and defensively in the daemon) with
+exit `2` (`kind: "server_disabled"`) without opening a connection.
+`auth status` and `auth logout` stay available for disabled HTTP servers so
+stored credentials can still be inspected or deleted, with `auth logout`
+skipping confidential-client remote revocation so unexpanded `${VAR}` literals
+are never transmitted.
+
+Per-server `timeout` sets the default `--timeout` for commands targeting that
+server when `--timeout` is omitted (`server`, `tools`, `inspect`, `call`
+including `--stdin` argument reads, `events list`, `events poll`, `reset`,
+`auth login`, and `auth logout`). It does not override `events stream`, whose
+`--timeout` is an optional millisecond run budget.
+
+HTTP servers accept an optional `oauth` object (rejected on `stdio` servers)
+with optional `client_id`, `client_secret`, `client_name`, `callback_port`
+(`1..=65535`), `callback_path` (starts with `/`, printable ASCII without `?`,
+`#`, whitespace, or control characters, up to 256 bytes, default `"/callback"`),
+`scopes` (non-empty whitespace-free strings), `auth_server_metadata_url`, and
+`account` (1 to 64 ASCII alphanumerics, `_`, or `-`). `client_id` and
+`client_secret` expand `${VAR}` whole-value and inline templates like `headers`;
+`client_secret` requires a non-empty `client_id`. `client_name` (non-empty, up
+to 128 printable ASCII characters) applies to Dynamic Client Registration only
+and is rejected when `client_id` is set. `OAuthConfig` implements `Debug`
+manually to redact `client_secret` as `"[REDACTED]"`.
+
+`"~"` and leading `"~/"` (plus `"~\\"` on Windows) expand in `agents`,
+`skills[]`, `stdio.command`, and `stdio.cwd` before path validation and
+resolution relative to the configuration file's directory. Home resolves from
+`HOME` on Unix or `USERPROFILE` on Windows; config loading fails with exit `2`
+if expansion is requested when that variable is unset, empty, non-UTF-8,
+contains NUL, or is not an absolute path. `~user/` syntax and `stdio.args` are
+never expanded.
 
 Relative paths resolve from the configuration file's directory, which is also
 the default `cwd` for stdio servers. Plain command names resolve via the
@@ -132,7 +203,10 @@ time and request build time. Validation errors report field paths and JSON
 types while omitting secret values.
 
 The daemon snapshots its launch environment on startup and computes a SHA-256
-digest over the resolved configuration and expanded values. OAuth 2.1 tokens
+digest over the resolved configuration and expanded values, including expanded
+`oauth` values (`client_secret` included) and raw disabled-server fields.
+Changing static `mcpcli.json` OAuth settings or toggling `enabled` therefore
+triggers a config mismatch until `daemon restart`. Dynamic OAuth 2.1 tokens
 managed by `mcpcli auth` live in a separate private `credentials.json` file
 outside that digest so token acquisition, rotation, and logout never invalidate
 a running daemon. Callers whose configuration digest differs are rejected until
@@ -161,11 +235,12 @@ that allow directory replacement or junction grafting. Pinned directory handles
 keep verified paths stable during file operations.
 
 Each namespace hashes the canonical configuration path and session name. Every
-IPC request carries protocol version `4` (`ipc::PROTOCOL = 4`), namespace,
+IPC request carries protocol version `5` (`ipc::PROTOCOL = 5`), namespace,
 executable SHA-256 (`/proc/self/exe` on Linux, native executable path
-elsewhere), configuration digest, timeout budget, monotonic deadline, and
-optional explicit deadline. Version, binary, or configuration mismatches fail
-with exit status `6` until `daemon restart`.
+elsewhere), configuration digest, timeout budget (`timeout_ms`), optional
+`max_timeout_ms` (valid only for `Operation::Call`, `timeout_ms..=86_400_000`),
+monotonic deadline, and optional explicit deadline. Version, binary, or
+configuration mismatches fail with exit status `6` until `daemon restart`.
 
 `startup.lock` serializes concurrent starters and `daemon.lock` stays locked
 for the daemon's lifetime. Lock files are never unlinked, and stale Unix
@@ -184,7 +259,7 @@ Streaming operations (`events_stream`) read one `Request` on the data endpoint,
 acquire one of `MAX_EVENT_STREAMS = 32` concurrent stream permits, release the
 short-lived accept connection permit so active event streams cannot starve
 regular RPC traffic, and write a sequence of length-prefixed `StreamFrame`
-records (`protocol: 4`, `namespace`, `build`, `epoch`, `kind`). Each `kind`
+records (`protocol: 5`, `namespace`, `build`, `epoch`, `kind`). Each `kind`
 carries `frame: "notification"` (`method` and optional `params`),
 `frame: "error"` (`error: Failure`), or `frame: "end"`. Streaming IPC frames
 omit the 1-hour total request cap and apply the 60-second per-frame idle
@@ -204,22 +279,60 @@ Connection permits are acquired before `accept` so excess callers wait in the
 OS listen queue under their original monotonic deadline. Per-server mutexes
 are acquired before the 8-slot global operation semaphore so queued calls to
 one slow server leave other servers free to run. Request reads have a 5-second
-framing timeout. After sending a request/response RPC, the CLI waits for the
-validated 4-byte response header under its remaining operation budget, then
-switches response body reads to a 60-second idle progress clock (capped by any
-remaining explicit `--timeout` deadline) aligned with the daemon's 60-second
-idle writeback clock.
+framing timeout.
+
+On the CLI side, request/response IPC exchange splits into Stage 1a, Stage 1b,
+and Stage 2:
+
+- Stage 1a (`connect` and `write_raw_idle`) is always bounded by
+  `admission_deadline` (derived from `timeout_ms` or `deadline_ms`), so a
+  stalled socket connect or request write fails with exit `5` instead of
+  hanging.
+- Stage 1b (`read_frame_header`) waits for the validated 4-byte response
+  header. For bounded requests (including `Call` with `max_timeout_ms: Some`),
+  Stage 1b enforces the remaining operation deadline. For unbounded `Call`
+  (`max_timeout_ms: None`), Stage 1b applies no wall-clock cutoff and wakes on a
+  response header, daemon socket EOF or crash, `SIGINT`/`SIGTERM`, or a
+  daemon-returned timeout or cancellation error.
+- Stage 2 reads the response body under a 60-second idle progress clock
+  (`TRANSFER_IDLE_TIMEOUT`, capped by any remaining explicit deadline), aligned
+  with the daemon's 60-second idle writeback clock.
+
+If all 32 `MAX_CONNECTIONS` daemon connection slots are simultaneously occupied
+by unbounded `Call` requests, a 33rd unbounded `Call` whose small request frame
+fits into the kernel socket buffer during Stage 1a waits in the OS listen queue
+with no client-side wall-clock cutoff during Stage 1b; callers can pass
+`--max-timeout` or send `SIGINT` to bound or cancel it.
 
 ## 6. Transports, failure handling, and shutdown
 
-`--timeout` has two command-specific contracts. Regular request/response
-commands interpret `--timeout` in seconds (`1` to `3600`, default `60`) covering
-slot queueing, connection setup (capped at `30` seconds), discovery or listing,
-and request execution. `events stream` interprets `--timeout` in milliseconds as
-the total foreground run budget (unbounded when omitted, while connection and
-subscription handshakes remain capped at `30` seconds). Local IPC body transfer
-uses its 60-second idle progress clock once a valid frame header arrives, and
-connection teardown has a separate bounded grace window.
+`--timeout` has three command-specific contracts:
+
+- Regular request/response commands (`server`, `tools`, `inspect`,
+  `events list`, `events poll`, `reset`, `auth login`, `auth logout`) interpret
+  `--timeout` in seconds (`1` to `3600`, defaulting to the server's configured
+  `timeout` or `60`) covering slot queueing, connection setup (capped at `30`
+  seconds), discovery or listing, and request execution.
+- `call` uses a dual-clock progress timeout. `--timeout` (`1` to `3600` seconds,
+  defaulting to the server's configured `timeout` or `60`) bounds queueing
+  (`ServerState` mutex and 8-slot `work` semaphore), connection setup (capped at
+  `30` seconds), and fresh tool discovery (`walk_tools`) under one shared
+  `pre_dispatch_deadline`. Once `tools/call` is dispatched through `rmcp`'s
+  native `PeerRequestOptions` (`reset_timeout_on_progress`), `--timeout` acts as
+  the maximum silent gap between matching `notifications/progress` messages.
+  Optional `--max-timeout` (`1` to `86400` seconds, default `None`) sets a hard
+  wall-clock cap across queueing, discovery, and execution when supplied (and
+  requires `max_timeout >= timeout`, else exit `2` with `kind: "invalid_timeout"`).
+  When `--max-timeout` is omitted, a `tools/call` that keeps emitting matching
+  `notifications/progress` within `--timeout` runs without a total wall-clock
+  cutoff in both daemon and `--oneshot` modes.
+- `events stream` interprets `--timeout` in milliseconds as the total
+  foreground run budget (unbounded when omitted, while connection and
+  subscription handshakes remain capped at `30` seconds).
+
+Local IPC body transfer uses its 60-second idle progress clock once a valid
+frame header arrives, and connection teardown has a separate bounded grace
+window.
 
 `tools/call` is never retried. `reqwest` retries, HTTP redirects, and automatic
 HTTP session reinitialization are disabled so a POST cannot be replayed after
@@ -315,19 +428,30 @@ this repository under the unmodified-upstream requirement; they require an
 upstream SDK change before an exact ownership guarantee can be made.
 
 Disconnecting a CLI client cancels its in-flight operation while keeping a
-healthy server connection open for future commands. When a server connection
-dies, including when an upstream session-bearing Streamable HTTP server returns
-HTTP `404 Not Found` for an expired or evicted `Mcp-Session-Id`, `BoundedHttp`
-records connection termination via `termination.terminate`, marks the
-connection closed, cancels active event streams through `mark_lost()`
-(`streams_cancel.cancel()`), and transitions the server slot into
-`session_lost` (exit status `6`). Subsequent commands for that server report
-`session_lost` until `reset SERVER` clears the slot. `reset` marks the slot
-unavailable before awaiting cleanup and keeps the slot blocked if cleanup is
-interrupted or fails. If the local client worker has already exited and only
-the remote HTTP `DELETE` failed or timed out (2-second deadline; `2xx`, `404`,
-and `405` count as clean), `reset --force SERVER` clears that slot with a
-stderr warning while leaving other servers untouched.
+healthy server connection open for future commands. For `Operation::Call`, the
+daemon also keeps an unlocked per-server `call_cancels` side table holding a
+`CancellationToken` registered upon acquiring `ServerState` (covering
+connection setup, `walk_tools`, and the post-dispatch response wait).
+`reset --force SERVER` cancels any active `call_cancels` token before awaiting
+`ServerState`, interrupting an in-flight `Call` immediately rather than waiting
+behind the server lock. Cancellation before dispatch returns `code: 4`,
+`kind: "cancelled"`, `outcome_unknown: false`; cancellation after dispatch
+sends a best-effort `notifications/cancelled` (2-second timeout) and returns
+`code: 4`, `kind: "cancelled"`, `outcome_unknown: true`, after which
+`reset --force` closes the connection.
+
+When a server connection dies, including when an upstream session-bearing
+Streamable HTTP server returns HTTP `404 Not Found` for an expired or evicted
+`Mcp-Session-Id`, `BoundedHttp` records connection termination via
+`termination.terminate`, marks the connection closed, cancels active event
+streams through `mark_lost()` (`streams_cancel.cancel()`), and transitions the
+server slot into `session_lost` (exit status `6`). Subsequent commands for that
+server report `session_lost` until `reset SERVER` clears the slot. `reset`
+marks the slot unavailable before awaiting cleanup and keeps the slot blocked
+if cleanup is interrupted or fails. If the local client worker has already
+exited and only the remote HTTP `DELETE` failed or timed out (2-second
+deadline; `2xx`, `404`, and `405` count as clean), `reset --force SERVER`
+clears that slot with a stderr warning while leaving other servers untouched.
 
 Daemon shutdown closes listeners, cancels active calls and event streams, joins
 handlers, closes every server connection (up to 8 seconds per close future,
@@ -348,8 +472,19 @@ On Windows, startup clears handle inheritance on standard streams so detached
 daemons never hold a caller's pipes open. Stdio children spawn suspended, join
 a kill-on-close Job object after thread ownership checks, and then resume.
 Daemon backgrounding detaches from any parent Job; supervisors that forbid Job
-breakaway should run `daemon run` directly. Child `stderr` is redirected to
-null so noisy servers cannot fill disks or leak secrets into daemon logs.
+breakaway should run `daemon run` directly.
+
+Stdio child `stderr` is piped into a bounded 16 KiB ring buffer
+(`stderr_tail_bytes`, backed by a fixed `ByteLease`; falls back to null if the
+lease is unavailable) and drained continuously by a background task so noisy
+children do not block on a full OS pipe. Only on spawn, handshake, or transport
+failure (never on success), `mcpcli` waits up to 100 ms for `stderr` EOF, takes
+up to the last 4 KiB on a valid UTF-8 boundary, escapes control characters with
+`safe_text`, and attaches it as `Failure.data["stderr_tail"]`. `stderr_tail` is
+unredacted diagnostic output returned only in failure diagnostics and is never
+written to daemon log files. Closing or dropping the connection, or failing a
+handshake after snapshotting `stderr_tail`, aborts the drain task so detached
+grandchildren inheriting `stderr` cannot leak the task or its `ByteLease`.
 
 ## 7. MCP Events
 
@@ -439,27 +574,70 @@ and a `MAX_STDERR_BYTES = 64 KiB` rolling `stderr` capture buffer:
 `mcpcli auth` provides a non-GUI, Unix-style OAuth 2.1 client workflow for
 Streamable HTTP MCP servers:
 
-- `mcpcli auth login SERVER [--scope SCOPE]... [--client-id ID] [--no-browser]`
+- `mcpcli auth login SERVER [--scope SCOPE]... [--client-id ID] [--client-name NAME] [--callback-port PORT] [--callback-path PATH] [--no-browser]`
 - `mcpcli auth status [SERVER]`
 - `mcpcli auth logout SERVER`
 
-`auth login` discovers Protected Resource Metadata ([RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728))
+HTTP servers may also declare a per-server `oauth` block in `mcpcli.json`
+(`client_id`, `client_secret`, `client_name`, `callback_port`, `callback_path`,
+`scopes`, `auth_server_metadata_url`, and `account`). CLI flags on `auth login`
+override the server's `oauth` fields for that invocation, and `--scope` merges
+and deduplicates onto configured `oauth.scopes`. Passing `--client-name` when
+either `--client-id` or `oauth.client_id` is set fails validation (exit `2`).
+Passing a `--client-id` different from `oauth.client_id` clears
+`oauth.client_secret` for that invocation so a secret for one client is never
+sent under another client ID.
+
+When `oauth.auth_server_metadata_url` is omitted, `auth login` discovers
+Protected Resource Metadata ([RFC 9728](https://datatracker.ietf.org/doc/html/rfc9728))
 from the server's `WWW-Authenticate` `resource_metadata` parameter or
 well-known endpoint, verifies canonical resource binding, and fetches
 Authorization Server Metadata ([RFC 8414](https://datatracker.ietf.org/doc/html/rfc8414)).
-`auth login` binds an ephemeral `127.0.0.1:0` loopback HTTP callback listener
-(`http://127.0.0.1:<port>/callback`) before client resolution: when
-`--client-id` is omitted, every login performs Dynamic Client Registration
-([RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)) as a public native CLI client
-(`token_endpoint_auth_method = "none"`, `grant_types = ["authorization_code", "refresh_token"]`,
+When `oauth.auth_server_metadata_url` is set, `auth login` skips RFC 9728
+discovery, fetches AS metadata directly from that URL (with HTTPS and DNS SSRF
+checks), and uses the server's canonical resource URL as the RFC 8707
+`resource` parameter. The returned metadata document must carry a non-empty
+`issuer` passing OAuth endpoint validation and matching the metadata URL under
+RFC 8414 Section 3.3 and OIDC 1.0 origin and path ownership rules: same scheme,
+host, and port, and metadata path matching
+`/.well-known/oauth-authorization-server<issuer_path>`,
+`/.well-known/openid-configuration<issuer_path>`, or
+`<issuer_path>/.well-known/openid-configuration` (with trailing slash
+normalization on `<issuer_path>`).
+
+`auth login` binds a literal `127.0.0.1:<port>` loopback HTTP callback listener
+(`http://127.0.0.1:<port><callback_path>`, ephemeral port `0` and `"/callback"`
+by default, per RFC 8252 Section 8.3 to avoid IPv4/IPv6 `localhost` mismatch)
+before client resolution. When no `client_id` is supplied by CLI or config,
+every login performs Dynamic Client Registration
+([RFC 7591](https://datatracker.ietf.org/doc/html/rfc7591)) as a public native
+CLI client (`client_name` defaulting to `"mcpcli"`,
+`token_endpoint_auth_method = "none"`,
+`grant_types = ["authorization_code", "refresh_token"]`,
 `response_types = ["code"]`) bound to that invocation's loopback `redirect_uri`
 rather than reusing a prior client registration tied to an older port.
+
+When `oauth.client_secret` is configured with `client_id`, `auth login` acts as
+a confidential client. It checks `token_endpoint_auth_methods_supported` in AS
+metadata, selecting `"client_secret_basic"` if supported or absent, else
+`"client_secret_post"` if supported, and failing with `mcp_protocol` otherwise.
+The chosen `token_endpoint_auth_method` (`"none"`, `"client_secret_basic"`, or
+`"client_secret_post"`) is saved on `StoredCredential`; `client_secret` itself
+is never persisted to `credentials.json`.
+
 Authorization requests always use Authorization Code with PKCE `S256`
 ([RFC 7636](https://datatracker.ietf.org/doc/html/rfc7636)), a cryptographic `state` parameter, and
 the `resource` URI from the verified metadata ([RFC 8707](https://datatracker.ietf.org/doc/html/rfc8707)).
 Credential keys preserve non-root path slashes and query components: `/mcp`,
 `/mcp/`, and `/mcp?tenant=a` remain distinct resources. Protected Resource
 Metadata discovery inserts the well-known path while preserving the resource query.
+`credentials.json` stays at version `1`: when `oauth.account` is omitted, the
+storage key is the bare canonical resource URL; when `oauth.account` is set,
+the key is `<canonical_resource_url>#account=<account>` (server URLs forbid `#`
+fragments, so `#account=` keys cannot collide with bare resource URLs).
+Per-resource locks hash the storage key to isolate login, refresh, and logout
+per account while keeping `StoredCredential.resource` as the bare canonical URL
+for RFC 8707. `auth status` includes `account` when present.
 
 For non-loopback MCP servers, all OAuth metadata, registration, authorization,
 token, and revocation endpoints must use `https://` and must not address or
@@ -495,17 +673,24 @@ restarting other server sessions.
 When a stored access token is within 30 seconds of expiry (`expires_at <= now + 30s`)
 or an upstream HTTP server returns any `401 Unauthorized` while a
 `refresh_token` is held, `BoundedHttp` runs `grant_type=refresh_token` once
-under a per-resource file lock shared by daemon and oneshot processes, atomically
-persists rotated credentials, and retries the request once. Login commits and logout
-use the same lock, so a completed refresh cannot overwrite a later login or restore
-a logged-out credential. The complete refresh exchange, including its response body,
-has a 15-second deadline. If the token endpoint rejects refresh with
-`invalid_grant`, `invalid_client`, or `unauthorized_client`, `mcpcli` clears
-the stored `refresh_token` on disk and withholds confirmed-expired access
-tokens from upstream requests.
+under the per-storage-key file lock shared by daemon and oneshot processes,
+authenticating with the runtime `oauth.client_secret` and stored
+`token_endpoint_auth_method` when present (falling back to `"none"` for public
+clients or legacy records), atomically persists rotated credentials, and
+retries the request once. Login commits and logout use the same lock, so a
+completed refresh cannot overwrite a later login or restore a logged-out
+credential. The complete refresh exchange, including its response body, has a
+15-second deadline. If the token endpoint rejects refresh with `invalid_grant`,
+`invalid_client`, or `unauthorized_client`, `mcpcli` clears the stored
+`refresh_token` on disk and withholds confirmed-expired access tokens from
+upstream requests.
 
 The logout deadline covers lock acquisition and local credential deletion.
-After deletion, remote revocation is best effort and uses the remaining budget.
+After deletion, remote RFC 7009 revocation is best effort using the remaining
+budget and authenticates with runtime `oauth.client_secret` and stored
+`token_endpoint_auth_method` when applicable. For `enabled: false` servers,
+`auth logout` deletes the local credential and skips confidential-client remote
+revocation so unexpanded `${VAR}` templates are never sent.
 
 When an HTTP server returns `401 Unauthorized` or `403 Forbidden` that cannot
 be satisfied automatically, `BoundedHttp` parses RFC 6750 and RFC 9728
@@ -528,7 +713,8 @@ Upstream server instructions remain distinct from the local `AGENTS.md` file.
 Server descriptions, instructions, and tool or event metadata are untrusted
 data and never authorize tool execution or data disclosure.
 
-`tools SERVER` outputs `{"pages":[...]}` with raw cursors and metadata intact,
+`tools SERVER` outputs `{"pages":[...]}` with raw cursors and metadata intact
+(or flattened `{"tools":[...]}` when `--filter` or `--summary` is passed),
 `inspect SERVER TOOL` outputs the matching raw tool object, and `call` projects
 directly from the ingress-verified raw `serde_json::Value` so unknown fields
 and explicit `null` members survive intact. Upstream JSON-RPC errors go to
@@ -649,13 +835,15 @@ trees, and non-UTF-8 or binary files are rejected.
 | CLI arguments / configuration | 1 MiB each |
 | Argument container nesting | 64 |
 | Process active byte budget | 1 GiB |
-| IPC protocol / frame limits | Version 4; 4 MiB request / 512 MiB response or stream frame |
+| IPC protocol / frame limits | Version 5; 4 MiB request / 512 MiB response or stream frame |
 | IPC request read / frame transfer idle | 5 s / 60 s |
+| `call` `--max-timeout` | 1 to 86,400 s (optional; unbounded when omitted) |
 | Concurrent daemon event streams | 32 (`MAX_EVENT_STREAMS`) |
 | Event notification / queue depth | 4 MiB / 128 notifications per subscription |
 | Event catalog pages | 100 (`MAX_EVENT_PAGES`) |
 | Cursor file / stream ack / callback stderr | 64 KiB each |
 | MCP stdio message | 512 MiB per line |
+| MCP stdio `stderr` ring buffer / diagnostic tail | 16 KiB / 4 KiB |
 | HTTP JSON response | 512 MiB |
 | HTTP POST / GET SSE | 512 MiB per event |
 | SSE event ID | 8 KiB of UTF-8 bytes |

@@ -32,12 +32,14 @@ Create `mcpcli.json`, or select another file with `-c PATH`, `--config PATH`, or
       "transport": "stdio",
       "command": "npx",
       "args": ["--yes", "@modelcontextprotocol/server-filesystem", "."],
+      "timeout": 120,
       "description": "Local workspace file operations"
     },
     "remote": {
       "transport": "http",
       "url": "https://example.com/mcp",
       "headers": { "Authorization": "Bearer ${MCP_TOKEN}" },
+      "enabled": true,
       "description": "Remote Streamable HTTP MCP service"
     }
   },
@@ -45,11 +47,18 @@ Create `mcpcli.json`, or select another file with `-c PATH`, `--config PATH`, or
 }
 ~~~
 
-Paths resolve from the configuration directory. `env` expands whole-value references such as
-`"${VAR}"`. HTTP `headers` also expand inline templates such as `"Bearer ${MCP_TOKEN}"`.
+Paths resolve from the configuration directory; `"~"` and leading `"~/"` (plus `"~\\"` on Windows)
+expand from `HOME` or `USERPROFILE` in `agents`, `skills[]`, `stdio.command`, and `stdio.cwd`.
+`env` expands whole-value references such as `"${VAR}"`. HTTP `headers` and `oauth` (`client_id`,
+`client_secret`) also expand inline templates such as `"Bearer ${MCP_TOKEN}"`.
 Both use the launch environment; `args` pass directly to the OS process API without interpolation.
-On Windows, use `npx.cmd` for npm launchers. Optional `agents` points to one global `AGENTS.md`
-file, and each `skills` entry mounts a skill directory or a parent directory of skills.
+On Windows, use `npx.cmd` for npm launchers. Optional per-server `enabled: false` disables a server
+without requiring its local `cwd`, `HOME`, or `${VAR}` secrets on the current host, and optional
+`timeout` (`1` to `3600` seconds) sets that server's default `--timeout`. HTTP servers also accept
+an optional `oauth` object (`client_id`, `client_secret`, `client_name`, `callback_port`,
+`callback_path`, `scopes`, `auth_server_metadata_url`, `account`). Optional `agents` points to one
+global `AGENTS.md` file, and each `skills` entry mounts a skill directory or a parent directory of
+skills.
 
 ## Authenticate
 
@@ -58,16 +67,19 @@ PKCE (`S256`):
 
 ~~~sh
 mcpcli auth login remote
+mcpcli auth login remote --callback-port 8765 --callback-path /callback --client-name my-cli
 mcpcli auth login remote --scope mcp:tools --scope mcp:events --client-id my-cli --no-browser
 mcpcli auth status
 mcpcli auth status remote
 mcpcli auth logout remote
 ~~~
 
-`auth login` discovers Protected Resource Metadata and Authorization Server Metadata, registers
-a public client for that login's ephemeral `127.0.0.1:0` loopback callback `redirect_uri` when
-`--client-id` is omitted, and completes Authorization Code + PKCE (`S256`) over the loopback
-callback (or reads a pasted redirect URL or authorization code on `stdin` with `--no-browser`).
+`auth login` discovers Protected Resource Metadata and Authorization Server Metadata (or fetches
+`oauth.auth_server_metadata_url` directly when configured), binds `127.0.0.1:<port><path>`
+(ephemeral port `0` and `/callback` by default), registers a public client when no `client_id` is
+configured or passed, and completes Authorization Code + PKCE (`S256`) over the loopback callback
+(or reads a pasted redirect URL or authorization code on `stdin` with `--no-browser`). Set
+`oauth.account` to isolate credentials for multiple accounts against the same server URL.
 
 Credentials live in a private file (`0600` on Unix, owner-only DACL on Windows) resolved in order:
 `MCPCLI_CREDENTIALS`, `<MCPCLI_RUNTIME_DIR>/credentials.json`, `$XDG_STATE_HOME/mcpcli/credentials.json`
@@ -79,13 +91,16 @@ upon any `401` response when a `refresh_token` is present, without restarting th
 ## Use
 
 ~~~sh
+mcpcli config validate
 mcpcli catalog
 mcpcli agents
 mcpcli search file
 mcpcli server filesystem
 mcpcli tools filesystem
+mcpcli tools filesystem --filter read --summary
 mcpcli inspect filesystem read_file
 mcpcli call filesystem read_file --args '{"path":"Cargo.toml"}'
+mcpcli call filesystem long_task --max-timeout 600 --args '{}'
 mcpcli call --inline-media filesystem read_file --args '{"path":"logo.png"}'
 mcpcli skills list
 mcpcli skill show example-skill
@@ -111,8 +126,9 @@ in `savedMedia`; pass `--inline-media` to keep Base64 payloads inline.
 writes unmodified SEP-3415 `EventOccurrence` objects as NDJSON on `stdout`, or delivers each
 event over `stdin` to `<CMD>...` before advancing `--cursor-file`. Batch or stream truncation
 diagnostics go to `stderr`. `--timeout` sets the request deadline in seconds (`1` to `3600`,
-default `60`) for regular commands, and sets the run deadline budget in milliseconds for
-`events stream`.
+defaulting to the server's `timeout` or `60`) for regular commands, acts as the progress-resettable
+inactivity timeout for `call` (with optional `--max-timeout` in `1` to `86400` seconds; unbounded
+when omitted), and sets the run deadline budget in milliseconds for `events stream`.
 
 The daemon starts on demand. `--session NAME` or `MCPCLI_SESSION` isolates client sessions,
 `--oneshot` opens a single-command connection, and `daemon run` runs in the foreground. Restart
