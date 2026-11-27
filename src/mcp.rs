@@ -54,7 +54,9 @@ use crate::{
 
 mod events;
 mod ingress;
+pub mod skills;
 mod sse;
+pub mod tasks;
 #[cfg(windows)]
 use crate::platform::windows_job;
 pub use events::{
@@ -62,7 +64,9 @@ pub use events::{
     MAX_EVENT_NOTIFICATION_BYTES, MAX_EVENT_PAGES, PollEventsParams, StreamEventsParams,
 };
 use events::{EventNotificationTransport, EventRouter, EventSchemaCache};
+pub use ingress::SKILL_RESOURCE_MAX_FRAME_BYTES;
 use ingress::{Ingress, IngressError, ObserveOutcome};
+pub use rmcp::model::{SKILLS_EXTENSION_ID, TASKS_EXTENSION_ID};
 
 pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
@@ -174,6 +178,118 @@ fn failure_with_outcome(
         lease: None,
     }
     .into()
+}
+
+/// Structured error returned by SEP-2640 (`skills`), SEP-2663 (`tasks`),
+/// and schema-gated `call_with_options_leased` operations without depending on `crate::ipc`.
+#[derive(Clone, Debug)]
+pub struct McpOpError {
+    pub code: i32,
+    pub kind: String,
+    pub message: String,
+    pub outcome_unknown: bool,
+    pub rpc_error: Option<Arc<Value>>,
+    pub auth: Option<Box<crate::auth::AuthChallengeInfo>>,
+    pub stderr_tail: Option<Box<str>>,
+    pub data: Option<Box<Value>>,
+    pub(crate) lease: Option<Arc<ByteLease>>,
+}
+
+impl McpOpError {
+    pub fn new(code: i32, kind: &str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            kind: kind.into(),
+            message: message.into(),
+            outcome_unknown: false,
+            rpc_error: None,
+            auth: None,
+            stderr_tail: None,
+            data: None,
+            lease: None,
+        }
+    }
+
+    pub fn uncertain(mut self, uncertain: bool) -> Self {
+        self.outcome_unknown = uncertain;
+        self
+    }
+
+    pub fn from_error(error: anyhow::Error, calling: bool) -> Self {
+        let error = match error.downcast::<Self>() {
+            Ok(op_err) => return op_err,
+            Err(other) => other,
+        };
+        if let Ok(error) = error.downcast::<McpFailure>() {
+            let (code, kind) = match error.kind {
+                FailureKind::Timeout => (5, "timeout"),
+                FailureKind::Cancelled => (4, "cancelled"),
+                FailureKind::Protocol => (4, "mcp_protocol"),
+                FailureKind::Transport => (4, "mcp_transport"),
+                FailureKind::AuthRequired => (4, "auth_required"),
+                FailureKind::InsufficientScope => (4, "insufficient_scope"),
+            };
+            Self {
+                code,
+                kind: kind.into(),
+                message: error.message,
+                outcome_unknown: error.outcome_unknown,
+                rpc_error: error.rpc_error,
+                auth: error.auth.map(Box::new),
+                stderr_tail: error.stderr_tail.map(String::into_boxed_str),
+                data: None,
+                lease: error.lease,
+            }
+        } else {
+            Self::new(4, "mcp_error", "MCP operation failed").uncertain(calling)
+        }
+    }
+}
+
+impl fmt::Display for McpOpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for McpOpError {}
+
+/// Optional parameters for `McpConnection::call_with_options_leased`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CallOptions<'a> {
+    pub expected_schema: Option<&'a crate::schema::ExpectedSchema>,
+}
+
+/// Outcome of a `tools/call` dispatch supporting both synchronous results and SEP-2663 tasks.
+pub enum CallOutcome {
+    Complete {
+        value: Value,
+        lease: ByteLease,
+    },
+    Task {
+        seed: tasks::TaskSeed,
+        value: Value,
+        lease: ByteLease,
+    },
+}
+
+/// Upper bound in bytes for a single `Mcp-Name` HTTP routing header value (with Base64 expansion).
+pub(super) fn routing_header_payload_bound(value: &str) -> usize {
+    value.len().div_ceil(3).saturating_mul(4).saturating_add(10)
+}
+
+/// Strip 2026-07-28 extensions (`events`, `tasks`) from legacy `<= 2025-11-25` `initialize` requests.
+pub(super) fn strip_modern_extensions_for_legacy_initialize(message: &mut ClientJsonRpcMessage) {
+    if let ClientJsonRpcMessage::Request(request) = message
+        && let ClientRequest::InitializeRequest(init) = &mut request.request
+        && init.params.protocol_version <= ProtocolVersion::V_2025_11_25
+        && let Some(extensions) = init.params.capabilities.extensions.as_mut()
+    {
+        extensions.remove(EVENTS_EXTENSION_ID);
+        extensions.remove(TASKS_EXTENSION_ID);
+        if extensions.is_empty() {
+            init.params.capabilities.extensions = None;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -436,8 +552,10 @@ impl Service<RoleClient> for Handler {
     fn get_info(&self) -> ClientConfig {
         let mut extensions = ExtensionCapabilities::new();
         extensions.insert(EVENTS_EXTENSION_ID.to_owned(), Map::new());
+        extensions.insert(TASKS_EXTENSION_ID.to_owned(), Map::new());
         let mut capabilities = ClientCapabilities::default();
         capabilities.extensions = Some(extensions);
+        capabilities.elicitation = None;
         ClientConfig::new(
             capabilities,
             Implementation::new("mcpcli", env!("CARGO_PKG_VERSION")),
@@ -1229,6 +1347,49 @@ impl McpConnection {
         dispatched: &AtomicBool,
         call_cancel: CancellationToken,
     ) -> Result<(Value, ByteLease)> {
+        match self
+            .call_inner(name, arguments, None, budgets, dispatched, call_cancel)
+            .await?
+        {
+            CallOutcome::Complete { value, lease } => Ok((value, lease)),
+            CallOutcome::Task { .. } => Err(failure_with_outcome(
+                FailureKind::Protocol,
+                "The server returned an asynchronous task; side effects may have occurred, the call was not retried",
+                true,
+            )),
+        }
+    }
+
+    pub async fn call_with_options_leased(
+        &self,
+        name: &str,
+        arguments: &Map<String, Value>,
+        options: CallOptions<'_>,
+        budgets: CallBudgets,
+        dispatched: &AtomicBool,
+        call_cancel: CancellationToken,
+    ) -> std::result::Result<CallOutcome, McpOpError> {
+        self.call_inner(
+            name,
+            arguments,
+            options.expected_schema,
+            budgets,
+            dispatched,
+            call_cancel,
+        )
+        .await
+        .map_err(|err| McpOpError::from_error(err, dispatched.load(Ordering::Acquire)))
+    }
+
+    async fn call_inner(
+        &self,
+        name: &str,
+        arguments: &Map<String, Value>,
+        expected_schema: Option<&crate::schema::ExpectedSchema>,
+        budgets: CallBudgets,
+        dispatched: &AtomicBool,
+        call_cancel: CancellationToken,
+    ) -> Result<CallOutcome> {
         enum CallWaitOutcome {
             Terminated,
             Cancelled,
@@ -1273,6 +1434,29 @@ impl McpConnection {
                 "Tool was not dispatched: not present in the current catalog",
             ));
         }
+        let tool = pages
+            .iter()
+            .filter_map(|page| page.get("tools").and_then(Value::as_array))
+            .flatten()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name));
+        if let Some(expected) = expected_schema {
+            let live_input = tool
+                .and_then(|t| t.get("inputSchema"))
+                .unwrap_or(&Value::Null);
+            let live_output = tool
+                .and_then(|t| t.get("outputSchema"))
+                .filter(|v| !v.is_null());
+            if let Err(reason) =
+                crate::schema::verify_tool_schema(expected, live_input, live_output)
+            {
+                return Err(McpOpError::new(
+                    2,
+                    "schema_mismatch",
+                    format!("Tool {name:?} schema mismatch: {reason}"),
+                )
+                .into());
+            }
+        }
         let parameter_bytes = crate::json::serialized_len(arguments)?.saturating_add(name.len());
         let header_bytes = if self.http
             && self
@@ -1280,12 +1464,8 @@ impl McpConnection {
                 .peer_info()
                 .is_some_and(|info| info.protocol_version >= ProtocolVersion::STANDARD_HEADERS)
         {
-            let schema = pages
-                .iter()
-                .filter_map(|page| page.get("tools").and_then(Value::as_array))
-                .flatten()
-                .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
-                .and_then(|tool| tool.get("inputSchema"))
+            let schema = tool
+                .and_then(|t| t.get("inputSchema"))
                 .and_then(Value::as_object);
             events::routing_header_payload_bound(name, Some(arguments), schema)
         } else {
@@ -1416,25 +1596,135 @@ impl McpConnection {
         match response {
             CallToolResponse::Complete(sdk_result) => {
                 drop(sdk_result);
-                observed_result(self.ingress.take(), Some("tools/call"), true)
-                    .map(|(_, value, lease)| (value, lease))
+                let (_, value, lease) =
+                    observed_result(self.ingress.take(), Some("tools/call"), true)?;
+                Ok(CallOutcome::Complete { value, lease })
             }
             CallToolResponse::InputRequired(_) => Err(failure_with_outcome(
                 FailureKind::Protocol,
                 "The tool requires unsupported interactive input; side effects may have occurred, the call was not retried",
                 true,
             )),
-            CallToolResponse::Task(_) => Err(failure_with_outcome(
-                FailureKind::Protocol,
-                "The server returned an unsupported asynchronous task; side effects may have occurred, the call was not retried",
-                true,
-            )),
+            CallToolResponse::Task(create_res) => {
+                if !self.supports_tasks() {
+                    let mut fail = McpOpError::new(
+                        4,
+                        "mcp_protocol",
+                        "The server returned an asynchronous task without negotiating the tasks capability; side effects may have occurred, the call was not retried",
+                    )
+                    .uncertain(true);
+                    let mut data = Map::new();
+                    data.insert(
+                        "taskId".into(),
+                        Value::String(create_res.task.task_id.clone()),
+                    );
+                    fail.data = Some(Box::new(Value::Object(data)));
+                    return Err(fail.into());
+                }
+                let seed = tasks::TaskSeed::from_create_task_result(&create_res);
+                drop(create_res);
+                let (_, value, lease) =
+                    observed_result(self.ingress.take(), Some("tools/call"), true)?;
+                Ok(CallOutcome::Task { seed, value, lease })
+            }
             _ => Err(failure_with_outcome(
                 FailureKind::Protocol,
                 "Unsupported MCP tool response; outcome unknown, the call was not retried",
                 true,
             )),
         }
+    }
+
+    pub fn supports_tasks(&self) -> bool {
+        tasks::check_tasks_capability(self.peer.peer_info().as_deref()).is_ok()
+    }
+
+    pub fn check_tasks_support(&self) -> std::result::Result<(), McpOpError> {
+        tasks::check_tasks_capability(self.peer.peer_info().as_deref())
+    }
+
+    pub fn supports_skills(&self) -> bool {
+        skills::check_skills_capability(self.peer.peer_info().as_deref(), false).is_ok()
+    }
+
+    pub fn check_skills_support(&self, require_dir: bool) -> std::result::Result<(), McpOpError> {
+        skills::check_skills_capability(self.peer.peer_info().as_deref(), require_dir)
+    }
+
+    pub async fn skills_list(
+        &self,
+        server: &str,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), McpOpError> {
+        skills::skills_list(self, server, budget).await
+    }
+
+    pub async fn skills_show(
+        &self,
+        server: &str,
+        selector: &str,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), McpOpError> {
+        skills::skills_show(self, server, selector, budget).await
+    }
+
+    pub async fn skills_files(
+        &self,
+        server: &str,
+        selector: &str,
+        dir: Option<&str>,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), McpOpError> {
+        skills::skills_files(self, server, selector, dir, budget).await
+    }
+
+    pub async fn skills_read(
+        &self,
+        server: &str,
+        selector: &str,
+        rel_path: &str,
+        inline_media: bool,
+        media: &crate::media::MediaStore,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease, Option<crate::media::InflightBatch>), McpOpError>
+    {
+        skills::skills_read(
+            self,
+            server,
+            selector,
+            rel_path,
+            inline_media,
+            media,
+            budget,
+        )
+        .await
+    }
+
+    pub async fn get_task(
+        &self,
+        task_id: &str,
+        budget: Duration,
+    ) -> std::result::Result<tasks::TaskSnapshot, McpOpError> {
+        tasks::get_task(self, task_id, budget).await
+    }
+
+    pub async fn update_task(
+        &self,
+        task_id: &str,
+        input_responses: Map<String, Value>,
+        budget: Duration,
+        dispatched: &AtomicBool,
+    ) -> std::result::Result<Value, McpOpError> {
+        tasks::update_task(self, task_id, input_responses, budget, dispatched).await
+    }
+
+    pub async fn cancel_task(
+        &self,
+        task_id: &str,
+        budget: Duration,
+        dispatched: &AtomicBool,
+    ) -> std::result::Result<Value, McpOpError> {
+        tasks::cancel_task(self, task_id, budget, dispatched).await
     }
 
     pub fn events_client(&self) -> McpEventsClient {
@@ -2088,6 +2378,7 @@ fn is_standard_notification(method: &str) -> bool {
             | "notifications/resources/updated"
             | "notifications/roots/list_changed"
             | "notifications/subscriptions/acknowledged"
+            | "notifications/tasks"
             | "notifications/tools/list_changed"
     )
 }
@@ -2100,12 +2391,18 @@ fn is_standard_method(method: &str) -> bool {
             | "server/discover"
             | "prompts/get"
             | "prompts/list"
+            | "resources/directory/read"
             | "resources/list"
             | "resources/read"
             | "resources/subscribe"
             | "resources/unsubscribe"
             | "resources/templates/list"
+            | "skills/get"
+            | "skills/list"
             | "subscriptions/listen"
+            | "tasks/cancel"
+            | "tasks/get"
+            | "tasks/update"
             | "tools/call"
             | "tools/list"
             | "completion/complete"
@@ -2337,21 +2634,21 @@ where
                 }
                 let newline = available.iter().position(|&b| b == b'\n');
                 let take = newline.map_or(available.len(), |idx| idx + 1);
+                let active_limit = self.ingress.active_response_limit(self.max_line_bytes);
                 let next_len = self.line_buf.len().saturating_add(take);
-                if next_len > self.max_line_bytes {
+                if next_len > active_limit {
                     (
                         take,
                         false,
                         Some(format!(
                             "MCP stdio response exceeds the {} limit",
-                            format_bytes(self.max_line_bytes)
+                            format_bytes(active_limit)
                         )),
                     )
-                } else if !self.line_lease.reserve_vec(
-                    &mut self.line_buf,
-                    next_len,
-                    self.max_line_bytes,
-                ) {
+                } else if !self
+                    .line_lease
+                    .reserve_vec(&mut self.line_buf, next_len, active_limit)
+                {
                     (
                         take,
                         false,
@@ -2479,8 +2776,9 @@ where
 
     fn send(
         &mut self,
-        item: ClientJsonRpcMessage,
+        mut item: ClientJsonRpcMessage,
     ) -> impl Future<Output = std::io::Result<()>> + Send + 'static {
+        strip_modern_extensions_for_legacy_initialize(&mut item);
         let terminated = self.termination.is_terminated();
         if !terminated {
             self.ingress.track(&item);
@@ -2556,6 +2854,13 @@ where
                     Err(IngressError::InvalidMetadata) => Err((
                         FailureKind::Protocol,
                         "MCP response JSON cannot be represented losslessly".into(),
+                    )),
+                    Err(IngressError::FrameTooLarge { limit }) => Err((
+                        FailureKind::Transport,
+                        format!(
+                            "MCP stdio response exceeds the {} limit",
+                            format_bytes(limit)
+                        ),
                     )),
                     Ok(ObserveOutcome::Captured(message)) => {
                         self.clear_line_buf();
@@ -2713,7 +3018,7 @@ impl BoundedHttp {
     async fn post(
         &self,
         uri: Arc<str>,
-        message: ClientJsonRpcMessage,
+        mut message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
         auth: Option<String>,
         headers: HashMap<HeaderName, HeaderValue>,
@@ -2722,7 +3027,9 @@ impl BoundedHttp {
         if self.termination.is_terminated() {
             return Err(HttpError::TransportChannelClosed);
         }
+        strip_modern_extensions_for_legacy_initialize(&mut message);
         self.ingress.track(&message);
+        let active_limit = self.ingress.active_response_limit(limit);
         let mut passthrough_guard = match &message {
             ClientJsonRpcMessage::Request(request)
                 if matches!(
@@ -2869,7 +3176,7 @@ impl BoundedHttp {
             return Ok(StreamableHttpPostResponse::Sse(
                 sse::bounded_stream(
                     response,
-                    limit,
+                    active_limit,
                     self.budget.clone(),
                     self.ingress.clone(),
                     self.termination.clone(),
@@ -2953,7 +3260,7 @@ impl BoundedHttp {
                 retry_after,
             )));
         }
-        let (body, lease) = self.bounded_body(response, limit).await?;
+        let (body, lease) = self.bounded_body(response, active_limit).await?;
         let raw = Leased::new(body, lease);
         if notification && raw.is_empty() {
             return Ok(StreamableHttpPostResponse::Accepted);
@@ -2961,7 +3268,7 @@ impl BoundedHttp {
         if !is_json {
             return Err(HttpError::UnexpectedContentType(None));
         }
-        match self.observe_response(raw, limit, false)? {
+        match self.observe_response(raw, active_limit, false)? {
             ObserveOutcome::Captured(message) => Ok(StreamableHttpPostResponse::Json(
                 ingress::into_sdk(message),
                 session,
@@ -2998,6 +3305,11 @@ impl BoundedHttp {
                         FailureKind::Protocol,
                         std::io::ErrorKind::InvalidData,
                         "MCP response JSON cannot be represented losslessly".into(),
+                    ),
+                    IngressError::FrameTooLarge { limit } => (
+                        FailureKind::Transport,
+                        std::io::ErrorKind::InvalidData,
+                        format!("HTTP response exceeds the {} limit", format_bytes(limit)),
                     ),
                 };
                 self.termination.terminate(kind, message.clone());
@@ -5206,5 +5518,204 @@ for line in sys.stdin:
         // ByteLease must already be released even while a cloned McpEventsClient is still alive.
         assert_eq!(budget.used(), 0);
         drop(events_client);
+    }
+
+    #[test]
+    fn handler_declares_events_and_tasks_and_strips_for_legacy_initialize() {
+        let handler = Handler {
+            tools_changed: Arc::new(AtomicBool::new(false)),
+        };
+        let info = handler.get_info();
+        assert!(info.capabilities.elicitation.is_none());
+        let exts = info.capabilities.extensions.as_ref().expect("extensions");
+        assert!(exts.contains_key(EVENTS_EXTENSION_ID));
+        assert!(exts.contains_key(TASKS_EXTENSION_ID));
+
+        let mut legacy_init: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/events": {},
+                        "io.modelcontextprotocol/tasks": {}
+                    }
+                },
+                "clientInfo": {"name": "mcpcli", "version": "0.7.0"}
+            }
+        }))
+        .unwrap();
+        strip_modern_extensions_for_legacy_initialize(&mut legacy_init);
+        let ClientJsonRpcMessage::Request(req) = &legacy_init else {
+            panic!("expected request");
+        };
+        let ClientRequest::InitializeRequest(init) = &req.request else {
+            panic!("expected initialize");
+        };
+        assert!(init.params.capabilities.extensions.is_none());
+
+        assert!(is_standard_notification("notifications/tasks"));
+        for method in [
+            "skills/list",
+            "skills/get",
+            "resources/directory/read",
+            "tasks/get",
+            "tasks/update",
+            "tasks/cancel",
+        ] {
+            assert!(is_standard_method(method), "{method}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn call_with_options_leased_gates_schema_mismatch_and_unnegotiated_task() {
+        let script = r#"
+import json, sys
+for line in sys.stdin:
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "server/discover":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "resultType": "complete",
+                "supportedVersions": ["2026-07-28"],
+                "capabilities": {"tools": {}},
+                "ttlMs": 60000,
+                "cacheScope": "public",
+                "_meta": {
+                    "io.modelcontextprotocol/serverInfo": {
+                        "name": "no-tasks-srv",
+                        "version": "0.1.0"
+                    }
+                }
+            }
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/list":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "resultType": "complete",
+                "tools": [{
+                    "name": "echo",
+                    "description": "echo input",
+                    "inputSchema": {
+                        "type": "object",
+                        "required": ["q"],
+                        "properties": {"q": {"type": "string"}}
+                    }
+                }]
+            }
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": msg["id"],
+            "result": {
+                "resultType": "task",
+                "taskId": "unneg-task-42",
+                "status": "working",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUpdatedAt": "2026-01-01T00:00:00Z",
+                "ttlMs": 60000
+            }
+        }
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+        let config = ServerConfig::Stdio {
+            command: "python3".into(),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            description: None,
+            enabled: true,
+            timeout: None,
+        };
+        let budget = ByteBudget::new(1024 * 1024);
+        let limits = McpLimits {
+            budget: budget.clone(),
+            ..McpLimits::default()
+        };
+        let mut conn = McpConnection::connect_with_limits(&config, Duration::from_secs(5), limits)
+            .await
+            .expect("connect to stdio server");
+
+        let mut args = Map::new();
+        args.insert("q".into(), Value::String("hello".into()));
+        let budgets = CallBudgets {
+            pre_dispatch_deadline: Instant::now() + Duration::from_secs(5),
+            idle: Duration::from_secs(5),
+            hard: None,
+        };
+
+        // 1. Schema mismatch fails pre-dispatch with exit code 2 and outcome_unknown: false.
+        let mismatch = crate::schema::parse_expected_schema(
+            serde_json::json!({
+                "type": "object",
+                "required": ["q"],
+                "properties": {"q": {"type": "integer"}}
+            }),
+            crate::schema::SchemaMode::Compatible,
+        )
+        .unwrap();
+        let dispatched = AtomicBool::new(false);
+        let err = conn
+            .call_with_options_leased(
+                "echo",
+                &args,
+                CallOptions {
+                    expected_schema: Some(&mismatch),
+                },
+                budgets,
+                &dispatched,
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("expected schema mismatch");
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "schema_mismatch");
+        assert!(!err.outcome_unknown);
+        assert!(!dispatched.load(Ordering::Acquire));
+
+        // 2. Unnegotiated CreateTaskResult returns exit code 4, mcp_protocol, outcome_unknown: true, and data.taskId.
+        let dispatched2 = AtomicBool::new(false);
+        let err = conn
+            .call_with_options_leased(
+                "echo",
+                &args,
+                CallOptions::default(),
+                budgets,
+                &dispatched2,
+                CancellationToken::new(),
+            )
+            .await
+            .err()
+            .expect("expected unnegotiated task rejection");
+        assert_eq!(err.code, 4);
+        assert_eq!(err.kind, "mcp_protocol");
+        assert!(err.outcome_unknown);
+        assert!(dispatched2.load(Ordering::Acquire));
+        assert_eq!(
+            err.data
+                .as_deref()
+                .and_then(|d| d.get("taskId"))
+                .and_then(Value::as_str),
+            Some("unneg-task-42")
+        );
+
+        let _ = conn.close().await;
+        drop(conn);
+        assert_eq!(budget.used(), 0);
     }
 }

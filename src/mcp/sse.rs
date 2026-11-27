@@ -136,12 +136,16 @@ impl<S> BoundedSseStream<S> {
         self.parsed.clear();
     }
 
-    fn fail_too_large(&mut self) -> SseError {
+    fn effective_limit(&self) -> usize {
+        self.ingress.active_response_limit(self.limit)
+    }
+
+    fn fail_too_large(&mut self, limit: usize) -> SseError {
         self.done = true;
         self.clear_all();
         let msg = format!(
             "SSE event exceeds the {} response limit",
-            format_bytes(self.limit)
+            format_bytes(limit)
         );
         self.termination
             .terminate(FailureKind::Transport, msg.clone());
@@ -212,6 +216,11 @@ impl<S> BoundedSseStream<S> {
                     self.termination
                         .terminate(FailureKind::Protocol, message.into());
                     return Err(SseError::Body(Box::new(std::io::Error::other(message))));
+                }
+                Err(super::IngressError::FrameTooLarge { limit }) => {
+                    drop(sse);
+                    drop(lease);
+                    return Err(self.fail_too_large(limit));
                 }
             }
             self.parsed.push_back(Leased::new(sse, lease));
@@ -333,14 +342,15 @@ impl<S> BoundedSseStream<S> {
         }
 
         while !bytes.is_empty() {
+            let active_limit = self.effective_limit();
             let Some(pos) = bytes.iter().position(|&b| matches!(b, b'\r' | b'\n')) else {
                 let next_line_len = self.line_buf.len().saturating_add(bytes.len());
-                if self.current_raw_bytes.saturating_add(next_line_len) > self.limit {
-                    return Err(self.fail_too_large());
+                if self.current_raw_bytes.saturating_add(next_line_len) > active_limit {
+                    return Err(self.fail_too_large(active_limit));
                 }
                 if !self
                     .line_lease
-                    .reserve_vec(&mut self.line_buf, next_line_len, self.limit)
+                    .reserve_vec(&mut self.line_buf, next_line_len, active_limit)
                 {
                     return Err(self.fail_memory_limit());
                 }
@@ -363,8 +373,8 @@ impl<S> BoundedSseStream<S> {
                 if fragment.is_empty() {
                     self.dispatch_event()?;
                 } else if fragment[0] == b':' {
-                    if self.current_raw_bytes.saturating_add(fragment.len()) > self.limit {
-                        return Err(self.fail_too_large());
+                    if self.current_raw_bytes.saturating_add(fragment.len()) > active_limit {
+                        return Err(self.fail_too_large(active_limit));
                     }
                     let Some(comment_lease) = self.budget.try_acquire(fragment.len()) else {
                         return Err(self.fail_memory_limit());
@@ -375,8 +385,8 @@ impl<S> BoundedSseStream<S> {
                         .current_raw_bytes
                         .saturating_add(fragment.len())
                         .saturating_add(1);
-                    if next_raw > self.limit {
-                        return Err(self.fail_too_large());
+                    if next_raw > active_limit {
+                        return Err(self.fail_too_large(active_limit));
                     }
                     self.current_raw_bytes = next_raw;
                     self.parse_borrowed_field(fragment)?;
@@ -384,8 +394,8 @@ impl<S> BoundedSseStream<S> {
             } else {
                 let total_len = self.line_buf.len().saturating_add(fragment.len());
                 if self.line_buf[0] == b':' {
-                    if self.current_raw_bytes.saturating_add(total_len) > self.limit {
-                        return Err(self.fail_too_large());
+                    if self.current_raw_bytes.saturating_add(total_len) > active_limit {
+                        return Err(self.fail_too_large(active_limit));
                     }
                     self.clear_line_buf();
                 } else {
@@ -393,12 +403,12 @@ impl<S> BoundedSseStream<S> {
                         .current_raw_bytes
                         .saturating_add(total_len)
                         .saturating_add(1);
-                    if next_raw > self.limit {
-                        return Err(self.fail_too_large());
+                    if next_raw > active_limit {
+                        return Err(self.fail_too_large(active_limit));
                     }
                     if !self
                         .line_lease
-                        .reserve_vec(&mut self.line_buf, total_len, self.limit)
+                        .reserve_vec(&mut self.line_buf, total_len, active_limit)
                     {
                         return Err(self.fail_memory_limit());
                     }

@@ -2,7 +2,7 @@
 use crate::budget::{ByteBudget, ByteLease, Leased};
 use rmcp::model::{
     ClientJsonRpcMessage, ClientNotification, ErrorCode, ErrorData, RequestId,
-    ServerJsonRpcMessage, ServerResult,
+    ServerJsonRpcMessage, ServerNotification, ServerResult, TaskPayload,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,10 +12,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+pub const SKILL_RESOURCE_MAX_FRAME_BYTES: usize = 32 << 20;
+
 #[derive(Debug)]
 pub(super) enum IngressError {
     MemoryExhausted,
     InvalidMetadata,
+    FrameTooLarge { limit: usize },
 }
 
 pub(super) enum ObserveOutcome {
@@ -57,12 +60,29 @@ impl Ingress {
             ClientJsonRpcMessage::Request(request) => {
                 let mut state = self.0.lock().expect("response observation mutex");
                 match request.request.method() {
-                    m @ ("initialize" | "server/discover" | "tools/list" | "tools/call") => {
+                    m @ ("initialize"
+                    | "server/discover"
+                    | "tools/list"
+                    | "tools/call"
+                    | "skills/list"
+                    | "skills/get"
+                    | "resources/read"
+                    | "resources/directory/read"
+                    | "tasks/get"
+                    | "tasks/update"
+                    | "tasks/cancel") => {
                         let method = match m {
                             "initialize" => "initialize",
                             "server/discover" => "server/discover",
                             "tools/list" => "tools/list",
-                            _ => "tools/call",
+                            "tools/call" => "tools/call",
+                            "skills/list" => "skills/list",
+                            "skills/get" => "skills/get",
+                            "resources/read" => "resources/read",
+                            "resources/directory/read" => "resources/directory/read",
+                            "tasks/get" => "tasks/get",
+                            "tasks/update" => "tasks/update",
+                            _ => "tasks/cancel",
                         };
                         if state.capture_active {
                             state
@@ -126,6 +146,24 @@ impl Ingress {
         Some(Clear(self.clone()))
     }
 
+    pub(super) fn active_response_limit(&self, default_limit: usize) -> usize {
+        let state = self.0.lock().expect("response observation mutex");
+        let reading_resource = state.entries.values().any(|entry| {
+            matches!(
+                entry,
+                Entry::Capture {
+                    method: "resources/read",
+                    response: None,
+                }
+            )
+        });
+        if reading_resource {
+            default_limit.min(SKILL_RESOURCE_MAX_FRAME_BYTES)
+        } else {
+            default_limit
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn observe_bytes(
         &self,
@@ -153,8 +191,11 @@ impl Ingress {
         error_only: bool,
     ) -> Result<ObserveOutcome, IngressError> {
         let wire_len = raw.len();
-        if wire_len > limit {
-            return Ok(ObserveOutcome::NotMatched);
+        let effective_limit = self.active_response_limit(limit);
+        if wire_len > effective_limit {
+            return Err(IngressError::FrameTooLarge {
+                limit: effective_limit,
+            });
         }
         let value_lease = budget
             .try_acquire(wire_len)
@@ -233,9 +274,18 @@ impl Ingress {
             }
         };
         let id = match &mut message {
-            ServerJsonRpcMessage::Request(_) | ServerJsonRpcMessage::Notification(_)
-                if !error_only =>
-            {
+            ServerJsonRpcMessage::Request(_) if !error_only => {
+                return Ok(ObserveOutcome::Captured(Leased::new(
+                    Box::new(message),
+                    sdk_lease,
+                )));
+            }
+            ServerJsonRpcMessage::Notification(notif) if !error_only => {
+                if let ServerNotification::TaskStatusNotification(n) = &mut notif.notification {
+                    n.params.meta = None;
+                    n.params.task.task.status_message = None;
+                    clear_task_payload(&mut n.params.task.payload);
+                }
                 return Ok(ObserveOutcome::Captured(Leased::new(
                     Box::new(message),
                     sdk_lease,
@@ -278,9 +328,10 @@ impl Ingress {
                         result.structured_content = None;
                         result.meta = None;
                     }
-                    ("initialize", ServerResult::InitializeResult(_))
-                    | ("server/discover", ServerResult::DiscoverResult(_))
-                    | ("tools/list", ServerResult::ListToolsResult(_)) => {}
+                    ("tools/call", ServerResult::CreateTaskResult(res)) => {
+                        res.meta = None;
+                        res.task.status_message = None;
+                    }
                     ("tools/call", ServerResult::InputRequiredResult(_)) => {
                         message = ServerJsonRpcMessage::error(
                             ErrorData::new(
@@ -291,16 +342,88 @@ impl Ingress {
                             Some(response.id.clone()),
                         );
                     }
-                    ("tools/call", ServerResult::CreateTaskResult(_)) => {
+                    ("tasks/get", ServerResult::GetTaskResult(res)) => {
+                        res.meta = None;
+                        res.task.task.status_message = None;
+                        clear_task_payload(&mut res.task.payload);
+                    }
+                    ("tasks/update" | "tasks/cancel", ServerResult::TaskAckResult(ack)) => {
+                        ack.meta = None;
+                    }
+                    ("tasks/update" | "tasks/cancel", ServerResult::EmptyResult(_)) => {}
+                    ("tasks/update" | "tasks/cancel", ServerResult::CustomResult(custom)) => {
+                        let valid_ack =
+                            custom
+                                .0
+                                .as_object()
+                                .is_some_and(|obj| match obj.get("resultType") {
+                                    None => true,
+                                    Some(Value::String(s)) => s == "complete",
+                                    Some(_) => false,
+                                });
+                        if valid_ack {
+                            response.result = ServerResult::task_ack(());
+                        } else {
+                            message = ServerJsonRpcMessage::error(
+                                ErrorData::new(
+                                    ErrorCode::INVALID_REQUEST,
+                                    "Invalid task acknowledgement response",
+                                    None,
+                                ),
+                                Some(response.id.clone()),
+                            );
+                        }
+                    }
+                    ("resources/read", ServerResult::ReadResourceResult(res)) => {
+                        res.contents.clear();
+                        res.meta = None;
+                    }
+                    ("resources/read", ServerResult::InputRequiredResult(_)) => {
                         message = ServerJsonRpcMessage::error(
                             ErrorData::new(
                                 ErrorCode::INVALID_REQUEST,
-                                "The server returned an unsupported asynchronous task; side effects may have occurred",
+                                "The resource requires unsupported interactive input",
                                 None,
                             ),
                             Some(response.id.clone()),
                         );
                     }
+                    ("skills/list", ServerResult::ListSkillsResult(res)) => {
+                        if let Err(err) = rmcp::model::validate_skills(&res.skills) {
+                            message = ServerJsonRpcMessage::error(
+                                ErrorData::new(
+                                    ErrorCode::INVALID_REQUEST,
+                                    format!("Invalid skills/list response: {err}"),
+                                    None,
+                                ),
+                                Some(response.id.clone()),
+                            );
+                        } else {
+                            res.skills.clear();
+                            res.meta = None;
+                        }
+                    }
+                    ("skills/get", ServerResult::GetSkillResult(res)) => {
+                        if let Err(err) = res.skill.validate() {
+                            message = ServerJsonRpcMessage::error(
+                                ErrorData::new(
+                                    ErrorCode::INVALID_REQUEST,
+                                    format!("Invalid skills/get response: {err}"),
+                                    None,
+                                ),
+                                Some(response.id.clone()),
+                            );
+                        } else {
+                            res.meta = None;
+                        }
+                    }
+                    ("resources/directory/read", ServerResult::ListResourcesResult(res)) => {
+                        res.resources.clear();
+                        res.meta = None;
+                    }
+                    ("initialize", ServerResult::InitializeResult(_))
+                    | ("server/discover", ServerResult::DiscoverResult(_))
+                    | ("tools/list", ServerResult::ListToolsResult(_)) => {}
                     _ => response.result = ServerResult::empty(()),
                 }
             }
@@ -389,6 +512,16 @@ impl Ingress {
             }
         }
         None
+    }
+}
+
+fn clear_task_payload(payload: &mut TaskPayload) {
+    match payload {
+        TaskPayload::Completed { result } => result.clear(),
+        TaskPayload::Failed { error } => error.clear(),
+        TaskPayload::InputRequired { input_requests } => input_requests.clear(),
+        TaskPayload::Working | TaskPayload::Cancelled => {}
+        _ => {}
     }
 }
 
@@ -941,6 +1074,281 @@ mod tests {
             panic!("expected passthrough events/poll response");
         };
         drop(poll_msg);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn resources_read_enforces_32mib_limit_before_allocating_leases() {
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().unwrap();
+        let read_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "resources/read",
+            "params": {"uri": "skill://demo/SKILL.md"}
+        }))
+        .unwrap();
+        ingress.track(&read_req);
+        assert_eq!(
+            ingress.active_response_limit(512 << 20),
+            SKILL_RESOURCE_MAX_FRAME_BYTES
+        );
+        // Tight budget smaller than 4x wire_len must still fail with FrameTooLarge, not MemoryExhausted.
+        let tiny_budget = ByteBudget::new(1024);
+        let raw_lease = tiny_budget.try_acquire(128).unwrap();
+        let err = ingress
+            .observe_owned(
+                Leased::new(vec![b'x'; 128], raw_lease),
+                64,
+                &tiny_budget,
+                false,
+            )
+            .err()
+            .expect("expected FrameTooLarge");
+        assert!(matches!(err, IngressError::FrameTooLarge { limit: 64 }));
+        assert_eq!(tiny_budget.used(), 0);
+
+        // InputRequiredResult on resources/read is rewritten to INVALID_REQUEST error frame.
+        let budget = ByteBudget::new(1 << 20);
+        let input_req = br#"{"jsonrpc":"2.0","id":7,"result":{"resultType":"input_required","inputRequests":{"k":{"method":"roots/list"}},"requestState":"st"}}"#;
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(input_req, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured error rewrite");
+        };
+        let ServerJsonRpcMessage::Error(rpc_err) = &**msg else {
+            panic!("expected error frame");
+        };
+        assert_eq!(rpc_err.error.code, ErrorCode::INVALID_REQUEST);
+        drop(msg);
+        let _ = ingress.take();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn skills_list_and_get_validate_before_clearing_sdk_copy() {
+        let budget = ByteBudget::new(1 << 20);
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().unwrap();
+
+        // Invalid skills/list (skill name mismatch) must become INVALID_REQUEST before clear().
+        let list_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "skills/list",
+            "params": {}
+        }))
+        .unwrap();
+        ingress.track(&list_req);
+        let bad_list = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "skills": [{
+                    "uri": "skill://demo/SKILL.md",
+                    "frontmatter": {"name": "wrong", "description": "d"},
+                    "resources": "dynamic"
+                }]
+            }
+        }))
+        .unwrap();
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(&bad_list, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected error rewrite");
+        };
+        let ServerJsonRpcMessage::Error(err) = &**msg else {
+            panic!("expected INVALID_REQUEST error");
+        };
+        assert_eq!(err.error.code, ErrorCode::INVALID_REQUEST);
+        drop(msg);
+        let _ = ingress.take();
+
+        // Valid skills/list passes validation, clears SDK skills vec, and retains lossless capture.
+        let list_req2: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "skills/list",
+            "params": {}
+        }))
+        .unwrap();
+        ingress.track(&list_req2);
+        let good_list = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "skills": [{
+                    "uri": "skill://demo/SKILL.md",
+                    "frontmatter": {"name": "demo", "description": "d"},
+                    "resources": "dynamic"
+                }],
+                "_meta": {"trace": "x"}
+            }
+        }))
+        .unwrap();
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(&good_list, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured list");
+        };
+        let ServerJsonRpcMessage::Response(resp) = &**msg else {
+            panic!("expected response");
+        };
+        let ServerResult::ListSkillsResult(res) = &resp.result else {
+            panic!("expected ListSkillsResult");
+        };
+        assert!(res.skills.is_empty());
+        assert!(res.meta.is_none());
+        let (method, val, lease) = ingress.take().unwrap();
+        assert_eq!(method, "skills/list");
+        assert_eq!(
+            val.unwrap()["result"]["skills"][0]["uri"],
+            "skill://demo/SKILL.md"
+        );
+        drop(lease);
+        drop(msg);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn tasks_ack_custom_result_and_status_payload_stubbing() {
+        let budget = ByteBudget::new(1 << 20);
+        let ingress = Ingress::default();
+        let _capture = ingress.capture().unwrap();
+
+        // tasks/cancel with vendor extension field falls into CustomResult -> rewritten to task_ack.
+        let cancel_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tasks/cancel",
+            "params": {"taskId": "t-1"}
+        }))
+        .unwrap();
+        ingress.track(&cancel_req);
+        let vendor_ack =
+            br#"{"jsonrpc":"2.0","id":3,"result":{"resultType":"complete","vendorNote":"ok"}}"#;
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(vendor_ack, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured ack");
+        };
+        let ServerJsonRpcMessage::Response(resp) = &**msg else {
+            panic!("expected response");
+        };
+        assert!(matches!(resp.result, ServerResult::TaskAckResult(_)));
+        drop(msg);
+        let _ = ingress.take();
+
+        // tasks/update with non-"complete" resultType becomes INVALID_REQUEST.
+        let upd_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tasks/update",
+            "params": {"taskId": "t-1", "inputResponses": {"k": true}}
+        }))
+        .unwrap();
+        ingress.track(&upd_req);
+        let bad_ack =
+            br#"{"jsonrpc":"2.0","id":4,"result":{"resultType":"other","vendorNote":"no"}}"#;
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(bad_ack, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured error");
+        };
+        let ServerJsonRpcMessage::Error(err) = &**msg else {
+            panic!("expected error frame");
+        };
+        assert_eq!(err.error.code, ErrorCode::INVALID_REQUEST);
+        drop(msg);
+        let _ = ingress.take();
+
+        // tasks/get stubs status_message and payload.result while preserving lossless capture.
+        let get_req: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tasks/get",
+            "params": {"taskId": "t-1"}
+        }))
+        .unwrap();
+        ingress.track(&get_req);
+        let get_raw = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "result": {
+                "resultType": "complete",
+                "taskId": "t-1",
+                "status": "completed",
+                "statusMessage": "big status text",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUpdatedAt": "2026-01-01T00:00:01Z",
+                "ttlMs": 60000,
+                "result": {"content": [{"type": "text", "text": "hello"}]}
+            }
+        }))
+        .unwrap();
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(&get_raw, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured get_task");
+        };
+        let ServerJsonRpcMessage::Response(resp) = &**msg else {
+            panic!("expected response");
+        };
+        let ServerResult::GetTaskResult(res) = &resp.result else {
+            panic!("expected GetTaskResult");
+        };
+        assert!(res.task.task.status_message.is_none());
+        let TaskPayload::Completed { result } = &res.task.payload else {
+            panic!("expected completed payload");
+        };
+        assert!(result.is_empty());
+        let (_, val, lease) = ingress.take().unwrap();
+        assert_eq!(
+            val.unwrap()["result"]["result"]["content"][0]["text"],
+            "hello"
+        );
+        drop(lease);
+        drop(msg);
+
+        // notifications/tasks stubs status_message and payload.
+        let notif_raw = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/tasks",
+            "params": {
+                "taskId": "t-1",
+                "status": "completed",
+                "statusMessage": "huge",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "lastUpdatedAt": "2026-01-01T00:00:01Z",
+                "ttlMs": 60000,
+                "result": {"content": [{"type": "text", "text": "payload"}]}
+            }
+        }))
+        .unwrap();
+        let ObserveOutcome::Captured(msg) = ingress
+            .observe_bytes(&notif_raw, 1 << 20, &budget, false)
+            .unwrap()
+        else {
+            panic!("expected captured notification");
+        };
+        let ServerJsonRpcMessage::Notification(notif) = &**msg else {
+            panic!("expected notification");
+        };
+        let ServerNotification::TaskStatusNotification(n) = &notif.notification else {
+            panic!("expected TaskStatusNotification");
+        };
+        assert!(n.params.task.task.status_message.is_none());
+        let TaskPayload::Completed { result } = &n.params.task.payload else {
+            panic!("expected completed payload");
+        };
+        assert!(result.is_empty());
+        drop(msg);
         assert_eq!(budget.used(), 0);
     }
 }
