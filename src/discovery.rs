@@ -372,8 +372,12 @@ pub fn write_task_get(stdout: &mut impl Write, value: &Value) -> io::Result<()> 
 
     match status {
         "completed" => {
+            let saved_media = value
+                .get("savedMedia")
+                .and_then(Value::as_array)
+                .filter(|entries| !entries.is_empty());
+            let mut body_started = false;
             if let Some(result) = value.get("result").or_else(|| task.get("result")) {
-                stdout.write_all(b"\n")?;
                 if let Some(content) = result.get("content").and_then(Value::as_array) {
                     let texts: Vec<&str> = content
                         .iter()
@@ -381,12 +385,42 @@ pub fn write_task_get(stdout: &mut impl Write, value: &Value) -> io::Result<()> 
                         .filter_map(|b| b.get("text").and_then(Value::as_str))
                         .collect();
                     if !texts.is_empty() {
+                        stdout.write_all(b"\n")?;
                         write_text_parts(stdout, texts)?;
-                        return Ok(());
+                        body_started = true;
+                    } else if saved_media.is_none() {
+                        stdout.write_all(b"\n")?;
+                        write_text_json(stdout, result)?;
+                        stdout.write_all(b"\n")?;
+                        body_started = true;
                     }
+                } else {
+                    stdout.write_all(b"\n")?;
+                    write_text_json(stdout, result)?;
+                    stdout.write_all(b"\n")?;
+                    body_started = true;
                 }
-                write_text_json(stdout, result)?;
-                stdout.write_all(b"\n")?;
+            }
+            if let Some(entries) = saved_media {
+                if !body_started {
+                    stdout.write_all(b"\n")?;
+                }
+                for saved in entries {
+                    let kind = saved.get("kind").and_then(Value::as_str).unwrap_or("media");
+                    let mime = saved
+                        .get("mimeType")
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    let bytes = saved.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                    let path = saved.get("savedPath").and_then(Value::as_str).unwrap_or("");
+                    stdout.write_all(b"Saved ")?;
+                    write_safe_text(stdout, kind)?;
+                    stdout.write_all(b" [")?;
+                    write_safe_text(stdout, mime)?;
+                    write!(stdout, "] ({bytes} B): ")?;
+                    write_safe_text(stdout, path)?;
+                    stdout.write_all(b"\n")?;
+                }
             }
         }
         "failed" => {
@@ -671,6 +705,60 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "acknowledged t-1\ncancelled t-2\n"
+        );
+    }
+
+    #[test]
+    fn write_task_get_renders_saved_media_for_binary_and_mixed_completed_tasks() {
+        // Pure-binary completed task with extracted savedMedia.
+        let mut out = Vec::new();
+        write_task_get(
+            &mut out,
+            &json!({
+                "taskId": "t-bin",
+                "status": "completed",
+                "result": {
+                    "content": [{"type": "image", "mimeType": "image/png", "savedPath": "/tmp/media/img.png"}]
+                },
+                "savedMedia": [{
+                    "kind": "image",
+                    "mimeType": "image/png",
+                    "bytes": 256,
+                    "savedPath": "/tmp/media/img\u{1b}[31m.png"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "task t-bin [completed]\n\nSaved image [image/png] (256 B): /tmp/media/img\\u{1b}[31m.png\n"
+        );
+
+        // Mixed text + savedMedia completed task emits text followed by Saved lines.
+        let mut out = Vec::new();
+        write_task_get(
+            &mut out,
+            &json!({
+                "taskId": "t-mix",
+                "status": "completed",
+                "result": {
+                    "content": [
+                        {"type": "text", "text": "Done"},
+                        {"type": "resource", "resource": {"uri": "file:///a.mp4"}}
+                    ]
+                },
+                "savedMedia": [{
+                    "kind": "resource",
+                    "mimeType": "video/mp4",
+                    "bytes": 1234,
+                    "savedPath": "/tmp/media/abc.mp4"
+                }]
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "task t-mix [completed]\n\nDone\nSaved resource [video/mp4] (1234 B): /tmp/media/abc.mp4\n"
         );
     }
 }
