@@ -4,24 +4,29 @@
 
 `mcpcli` is a native command-line client for configured MCP tools, MCP
 `2026-07-28` Events (`io.modelcontextprotocol/events`, [SEP-3415](https://github.com/modelcontextprotocol/ext-events/blob/main/specification/beta/events/events.mdx)),
-OAuth 2.1 HTTP server authentication, a global `AGENTS.md` file, and local Agent
-Skills. Each invocation reads global instructions, manages OAuth credentials,
-lists or inspects tools, calls a tool, lists, polls, or streams events, or reads
-a skill resource, while a local daemon keeps connections and server state alive
-across commands.
+Skills over MCP (`io.modelcontextprotocol/skills`, SEP-2640), MCP Tasks
+(`io.modelcontextprotocol/tasks`, SEP-2663), OAuth 2.1 HTTP server
+authentication, a global `AGENTS.md` file, and local Agent Skills. Each
+invocation reads global instructions, manages OAuth credentials, lists or
+inspects tools, calls a tool, manages tasks, lists, polls, or streams events,
+or reads local or remote skill resources, while a local daemon keeps
+connections and server state alive across commands.
 
 The client speaks `stdio` and single-endpoint Streamable HTTP through
 `rmcp 3.9.0`. It prefers protocol version `2026-07-28`, falls back to
 `2025-11-25` lifecycle negotiation, and accepts older Streamable HTTP revisions
 (`2025-06-18` and `2025-03-26`) negotiated by the SDK. Over HTTP, `mcpcli`
 supports single-endpoint Streamable HTTP only and does not implement the
-deprecated `2024-11-05` two-endpoint HTTP+SSE (`/sse`) transport. Only tools
-and the `io.modelcontextprotocol/events` extension capability
-(`capabilities.extensions["io.modelcontextprotocol/events"]`) are exposed.
-MCP server resource endpoints (`resources/*`), prompts (`prompts/*`), sampling,
-roots, interactive elicitation (MRTR), asynchronous Tasks, deprecated
-`2024-11-05` two-endpoint `/sse`, and outbound MCP server hosting are out of
-scope.
+deprecated `2024-11-05` two-endpoint HTTP+SSE (`/sse`) transport. Client
+capabilities advertise `io.modelcontextprotocol/events` and
+`io.modelcontextprotocol/tasks` on `2026-07-28` connections and strip both
+extensions on `<= 2025-11-25` `initialize` requests so legacy servers see the
+same handshake bytes. Remote skills use `skills/*` and `resources/read` /
+`resources/directory/read` when the server advertises
+`io.modelcontextprotocol/skills` and `resources`. General prompts
+(`prompts/*`), sampling, roots, interactive elicitation (MRTR), CIMD, file
+uploads, deprecated `2024-11-05` two-endpoint `/sse`, and outbound MCP server
+hosting are out of scope.
 
 The dependency is the unmodified crates.io `rmcp =3.9.0` package, pinned by
 `Cargo.lock`. The repository has no `rmcp` vendor copy or Cargo patch. Local
@@ -37,12 +42,43 @@ require Python, Node, or another interpreter. Configured stdio commands and
 event callback commands run with the current user's permissions.
 
 Configured MCP servers in `mcpcli.json` are chosen explicitly by the user and
-treated as trusted peers. Deliberately malicious MCP servers, such as a server
-spamming `notifications/progress` to hold a slot open, are outside the threat
-model. Local OS isolation (socket and pipe peer checks, directory ACLs, and
+treated as trusted peers for transport setup, while remote skill manifests,
+Markdown bodies, binary resources, and task payloads are treated as untrusted
+data. Local OS isolation (socket and pipe peer checks, directory ACLs, and
 symlink or reparse defenses), secret redaction in error diagnostics, OAuth SSRF
-checks on remote endpoints, and `ByteBudget` OOM protection against accidental
-oversized payloads remain in force.
+checks on remote endpoints, manifest digest and frontmatter verification, and
+`ByteBudget` OOM protection against oversized payloads remain in force.
+
+### Module layering and static DAG gate
+
+Production source files follow an 18-module strict lower-triangular DAG across
+layers `L0` to `L8` (`layer(src) > layer(dst)`), enforced by `tests/dag_gate.rs`:
+
+| Layer | Modules | Constraints |
+| --- | --- | --- |
+| `L0` | `budget`, `discovery`, `platform`, `oauth_url` | Zero internal `crate::` dependencies |
+| `L1` | `schema`, `json`, `agents`, `skills` | `schema` has zero internal `crate::` dependencies (`L1 schema -> ∅`); `skills` depends only on `platform` |
+| `L2` | `config`, `ipc`, `events_exec` | `ipc` depends on `budget`, `json`, `schema` |
+| `L3` | `runtime` | Local IPC client exchange and dual-clock cancellation |
+| `L4` | `media`, `auth` | Private media cache and OAuth 2.1 client |
+| `L5` | `mcp` (`src/mcp.rs` + `src/mcp/*.rs`) | Sole module allowed to reference `rmcp` |
+| `L6` | `daemon` | Long-lived connection host and IPC server |
+| `L7` | `events_stream` | Foreground SEP-3415 event stream runner |
+| `L8` | `main` | CLI parsing, input budgeting, and output rendering |
+
+`tests/dag_gate.rs` enforces four static gates over non-`#[cfg(test)]` tokens:
+
+- All 18 modules (17 library modules plus `main`) are registered in
+  `MODULE_LAYERS`, satisfy `layer(src) > layer(dst)`, and keep `L0` plus
+  `L1 schema` free of internal `crate::` edges.
+- `RMCP_ALLOWED = &["mcp"]` blocks `rmcp` from leaking into `schema`, `skills`,
+  `ipc`, `daemon`, or `main`.
+- `SERDE_SAPHYR_ALLOWED = &["skills"]` restricts `serde_saphyr` to
+  `L1 src/skills.rs`.
+- `MCP_SUBMODULE_DAG` checks lateral edges among the five `src/mcp/*.rs`
+  submodules (`ingress -> ∅`, `sse -> {ingress}`, `events -> {ingress, sse}`,
+  `skills -> {ingress}`, `tasks -> {ingress}`) and runs Tarjan's SCC algorithm
+  to assert zero cycles.
 
 ## 2. Connection ownership
 
@@ -78,15 +114,19 @@ that upstream state.
 | `auth logout SERVER` | Remove stored OAuth credentials for an HTTP server | No |
 | `server SERVER` | Lifecycle metadata, negotiated version, capabilities, and upstream instructions | If needed |
 | `tools [--filter SUBSTR] [--summary] SERVER` | Fresh, complete paginated tool definitions, with optional client-side filtering and summary projection | If needed |
-| `inspect SERVER TOOL` | Complete definition and schemas for one tool | If needed |
-| `call [--inline-media] [--max-timeout SECS] SERVER TOOL` | One tool call, saving binary media locally by default | If needed |
+| `inspect [--schema FILE] [--schema-mode exact|compatible] SERVER TOOL` | Complete definition and schemas for one tool, with optional contract check | If needed |
+| `call [--detach] [--schema FILE] [--schema-mode exact|compatible] [--inline-media] [--max-timeout SECS] SERVER TOOL [KEY:=VALUE...]` | One tool call (default polls `resultType: "task"` to completion; `--detach` returns the task handle) | If needed |
+| `tasks` (`task`) `get [--wait] [--inline-media] [--max-timeout SECS] SERVER TASK_ID` | Fetch a task snapshot or wait for terminal state, saving completed binary media by default | If needed |
+| `tasks` (`task`) `update SERVER TASK_ID (--args \| --args-file \| --stdin)` | Send `inputResponses` to an `input_required` task | If needed |
+| `tasks` (`task`) `cancel SERVER TASK_ID` | Request cancellation of an MCP task | If needed |
 | `events list SERVER` | Fresh paginated event definitions from `events/list` | If needed |
 | `events poll SERVER EVENT` | Single `events/poll` batch fetch with optional cursor and filter arguments | If needed |
 | `events stream SERVER EVENT` | Foreground push or poll stream emitting SEP-3415 NDJSON or invoking a callback | If needed |
-| `skills` (`skill`) `list` | Mounted skill metadata and validation warnings | No |
-| `skills` (`skill`) `show NAME` | Full `SKILL.md` manifest and canonical skill directory | No |
-| `skills` (`skill`) `files NAME` | Relative resource file paths under that skill | No |
-| `skills` (`skill`) `read NAME PATH` | Full UTF-8 contents of one skill resource | No |
+| `skills` (`skill`) `builtin` | Embedded `mcpcli` agent skill guide (works without `mcpcli.json`) | No |
+| `skills` (`skill`) `list [--server SERVER]` | Local mounted skill metadata or remote `skills/list` | Only with `--server` |
+| `skills` (`skill`) `show [--server SERVER] NAME_OR_URI` | Local `SKILL.md` or verified remote `SKILL.md` | Only with `--server` |
+| `skills` (`skill`) `files [--server SERVER] [--dir REL_DIR] NAME_OR_URI` | Local relative file paths, remote manifest files, or remote directory listing | Only with `--server` |
+| `skills` (`skill`) `read [--server SERVER] [--inline-media] NAME_OR_URI PATH` | Local UTF-8 resource or verified remote text/binary skill resource | Only with `--server` |
 | `reset [--force] SERVER` | Close one server connection and clear its local slot | No |
 | `daemon start|status|stop|restart|run` | Manage the daemon for the selected session | No |
 
@@ -123,8 +163,25 @@ never relies on notification delivery.
 
 Tool and event filter arguments are passed as one JSON object through
 `--args JSON`, `--args-file PATH`, or `--stdin` (`call` defaults to `{}`).
-Property names, including distinct spellings such as `fooBar` and `foo_bar`,
-nested objects, arrays, and union shapes pass straight through in JSON.
+`call` also accepts trailing `KEY:=VALUE` positional arguments (`parse_kv_arguments`,
+mutually exclusive with `--args`, `--args-file`, and `--stdin`), splitting each
+item on the first `:=`, parsing valid lossless JSON literals, and falling back
+to strings otherwise. Keys starting with `-` pass after `--`. Property names,
+including distinct spellings such as `fooBar` and `foo_bar`, nested objects,
+arrays, and union shapes pass straight through in JSON.
+
+`inspect` and `call` accept `--schema FILE` (up to 1 MiB, max depth 64) and
+`--schema-mode exact|compatible` (default `compatible`). Snapshots containing
+`inputSchema` (object or boolean) extract both `inputSchema` and optional
+`outputSchema`; other top-level objects are treated as raw `inputSchema`.
+`compatible` runs the directional recursive `is_subschema(sub, sup, is_input)`
+check across the 7 core structural keywords (`type`, `const`, `enum`,
+`required`, `properties`, `additionalProperties`, `items`, including
+`"integer" <: "number"` and optional input parameter additions on schemas that
+omit `additionalProperties`) while failing closed via normalized equality on
+all non-annotation keywords. `call` verifies the schema against the fresh
+`walk_tools` entry before sending `tools/call` and exits `2`
+(`kind: "schema_mismatch"`, `outcome_unknown: false`) on mismatch.
 
 ## 4. Configuration and environment
 
@@ -235,19 +292,21 @@ that allow directory replacement or junction grafting. Pinned directory handles
 keep verified paths stable during file operations.
 
 Each namespace hashes the canonical configuration path and session name. Every
-IPC request carries protocol version `5` (`ipc::PROTOCOL = 5`), namespace,
+IPC request carries protocol version `6` (`ipc::PROTOCOL = 6`), namespace,
 executable SHA-256 (`/proc/self/exe` on Linux, native executable path
 elsewhere), configuration digest, timeout budget (`timeout_ms`), optional
-`max_timeout_ms` (valid only for `Operation::Call`, `timeout_ms..=86_400_000`),
+`max_timeout_ms` (valid only for `uses_dual_clock()` operations: `Call` without
+`detach` and `TasksGet` with `wait: true`, `timeout_ms..=86_400_000`),
 monotonic deadline, and optional explicit deadline. Version, binary, or
 configuration mismatches fail with exit status `6`. Within the same IPC version,
 `daemon restart` clears binary or configuration mismatches.
 
-Before upgrading from v0.6 (IPC 4) to v0.7 (IPC 5), use the v0.6 binary to run
-`daemon stop` for each active configuration and session. Then install v0.7 and
-run `daemon start`, or let the next command start the daemon. If v0.7 is already
-installed while a v0.6 daemon is running, use a retained or re-downloaded v0.6
-binary to stop it first.
+Before upgrading from an earlier IPC protocol version (such as IPC 5 in v0.7)
+to IPC 6, use the older binary to run `daemon stop` for each active
+configuration and session. Then install the new binary and run `daemon start`,
+or let the next command start the daemon. If the new binary is already
+installed while an older daemon is running, use a retained or re-downloaded
+older binary to stop it first.
 
 For calls, `timeout_ms` and `max_timeout_ms` retain the original idle and hard
 budgets. The absolute deadline includes time already spent starting the daemon.
@@ -266,14 +325,16 @@ All IPC frames use a 4-byte little-endian byte length followed by UTF-8 JSON.
 Outbound frames serialize in a single bounded pass backed by leases from the
 1 GiB process active byte budget, and receivers reject empty, truncated, or
 over-limit lengths before allocating body buffers. Standard operations
-(`status`, `stop`, `server`, `tools`, `call`, `reset`, `events_list`, and
-`events_poll`) exchange one `Request` and one `Response`.
+(`status`, `stop`, `server`, `tools`, `call` with optional `detach` and
+`expected_schema`, `reset`, `events_list`, `events_poll`, `skills_list`,
+`skills_get`, `skills_files`, `skills_read`, `tasks_get`, `tasks_update`, and
+`tasks_cancel`) exchange one `Request` and one `Response`.
 
 Streaming operations (`events_stream`) read one `Request` on the data endpoint,
 acquire one of `MAX_EVENT_STREAMS = 32` concurrent stream permits, release the
 short-lived accept connection permit so active event streams cannot starve
 regular RPC traffic, and write a sequence of length-prefixed `StreamFrame`
-records (`protocol: 5`, `namespace`, `build`, `epoch`, `kind`). Each `kind`
+records (`protocol: 6`, `namespace`, `build`, `epoch`, `kind`). Each `kind`
 carries `frame: "notification"` (`method` and optional `params`),
 `frame: "error"` (`error: Failure`), or `frame: "end"`. Streaming IPC frames
 omit the 1-hour total request cap and apply the 60-second per-frame idle
@@ -284,10 +345,19 @@ runs, or the daemon stops.
 Separate listeners prevent data traffic from starving management commands:
 
 - Data endpoint accepts up to 32 concurrent setup/RPC connections, 8 active
-  request/response server operations, and 32 concurrent `events_stream`
-  subscriptions.
+  request/response server operations, 24 concurrent task waiters
+  (`MAX_TASK_WAITERS = 24`), and 32 concurrent `events_stream` subscriptions.
 - Control endpoint accepts up to 8 concurrent connections and rejects any
   operation other than `status` and `stop` with `control_only`.
+
+When a `uses_dual_clock()` operation (`call` without `--detach`, or
+`tasks get --wait`) enters task polling, the daemon acquires one `task_waiters`
+permit and drops its `MAX_CONNECTIONS` permit immediately. Between `tasks/get`
+polls, the daemon sleeps without holding `Mutex<ServerState>` or `app.work`,
+so other commands on the same server continue unblocked. Each `McpConnection`
+gets a monotonic `conn_id` on `ServerState`; if `conn_id` changes during a poll
+sleep (for example, after `reset` and reconnect), the stale poller exits with
+`session_lost` without calling `mark_lost()` on the new healthy connection.
 
 Connection permits are acquired before `accept` so excess callers wait in the
 OS listen queue under their original monotonic deadline. Per-server mutexes
@@ -303,14 +373,28 @@ and Stage 2:
   stalled socket connect or request write fails with exit `5` instead of
   hanging.
 - Stage 1b (`read_frame_header`) waits for the validated 4-byte response
-  header. For bounded requests (including `Call` with `max_timeout_ms: Some`),
-  Stage 1b enforces the remaining operation deadline. For unbounded `Call`
+  header. For bounded requests, Stage 1b enforces the remaining operation
+  deadline (with a `+5s` client grace window on `uses_dual_clock()` requests
+  carrying `max_timeout_ms: Some`, paired with a `+3s` daemon outer timeout
+  grace so best-effort `tasks/cancel` and timeout diagnostics carrying
+  `data.taskId` finish cleanly). For unbounded `uses_dual_clock()` requests
   (`max_timeout_ms: None`), Stage 1b applies no wall-clock cutoff and wakes on a
   response header, daemon socket EOF or crash, `SIGINT`/`SIGTERM`, or a
   daemon-returned timeout or cancellation error.
 - Stage 2 reads the response body under a 60-second idle progress clock
-  (`TRANSFER_IDLE_TIMEOUT`, capped by any remaining explicit deadline), aligned
-  with the daemon's 60-second idle writeback clock.
+  (`TRANSFER_IDLE_TIMEOUT`, capped by any remaining explicit deadline plus the
+  `+5s` grace on bounded dual-clock requests), aligned with the daemon's
+  60-second idle writeback clock.
+
+For `uses_dual_clock()` requests, the daemon splits the IPC stream into
+`(reader, writer)` before execution so it can distinguish a 1-byte cooperative
+cancellation sentinel (`&[0u8]`, `Ok(1)`) from an actual client disconnect
+(`Ok(0) | Err(_)`). On `SIGINT` (`130`) or `SIGTERM` (`143`), the CLI writes
+`&[0u8]` and waits up to 2.5 seconds for the daemon's final response frame:
+a natural `completed` result preserves exit `0`/`3`, a `"cancelled"` failure
+maps to `130`/`143` (carrying `data.taskId` when a task handle was received),
+and EOF or timeout falls back locally to `130`/`143`. Non-dual-clock commands
+(other than `events stream`) cancel immediately on `SIGINT`/`SIGTERM`.
 
 If all 32 `MAX_CONNECTIONS` daemon connection slots are simultaneously occupied
 by unbounded `Call` requests, a 33rd unbounded `Call` whose small request frame
@@ -357,9 +441,14 @@ is set and subsequent transport or timeout failures report
 effects that already ran remain in effect.
 
 The application's stdio and HTTP adapters enforce a 512 MiB message or event
-limit and use a shared 1 GiB non-blocking byte budget for their buffers and
-decoded values. `list_tool_pages` enforces a 16 MiB catalog limit. SDK-owned
-allocations after handoff have the limits described under WONT FIX:
+limit (tightened to 32 MiB during in-flight `resources/read` calls via
+`Ingress::active_response_limit` both in streaming readers `ChildTransport` /
+`BoundedHttp` and at the top of `Ingress::observe_owned` before budget
+allocation, failing hard with `IngressError::FrameTooLarge` and exit `4`) and
+use a shared 1 GiB non-blocking byte budget for their buffers and decoded
+values. `list_tool_pages`, `walk_skills`, and `walk_directory` enforce a 16 MiB
+catalog limit. SDK-owned allocations after handoff have the limits described
+under WONT FIX:
 
 - `ChildTransport` reads stdio lines directly via `BufReader::fill_buf` and
   `consume`, releases the completed line buffer, and refuses writes once
@@ -391,8 +480,13 @@ allocations after handoff have the limits described under WONT FIX:
   upstream string-ID and subscription-metadata conversions. Temporary credit
   is returned after conversion; the local model remains in `Leased` until
   the transport returns it to the SDK. Its later SDK lifetime is not covered.
-- Matched tool calls and RPC errors give the SDK small stubs while the lossless
-  result or error keeps its own lease. SSE uses the official raw `Sse` API:
+- Matched tool calls, task results, skill responses, and RPC errors give the
+  SDK small stubs while the lossless result or error keeps its own lease.
+  `skills/list` and `skills/get` validate via `rmcp` before clearing SDK
+  copies; `CreateTaskResult`, `GetTaskResult`, and `TaskStatusNotification`
+  clear `status_message` and large task payloads on the SDK copy; and
+  `tasks/update` / `tasks/cancel` normalize valid `CustomResult`
+  acknowledgments into `task_ack`. SSE uses the official raw `Sse` API:
   the local parser queues owned events, encodes validated stubs before handoff,
   and keeps each event charged while it remains in that queue. The SDK parses
   the returned event again. Lossless initialize/discover output, tool pages,
@@ -446,12 +540,13 @@ this repository under the unmodified-upstream requirement; they require an
 upstream SDK change before an exact ownership guarantee can be made.
 
 Disconnecting a CLI client cancels its in-flight operation while keeping a
-healthy server connection open for future commands. For `Operation::Call`, the
-daemon also keeps an unlocked per-server `call_cancels` side table holding a
-`CancellationToken` registered upon acquiring `ServerState` (covering
-connection setup, `walk_tools`, and the post-dispatch response wait).
-`reset --force SERVER` cancels any active `call_cancels` token before awaiting
-`ServerState`. Its cancellation remains active while the reset waits for and
+healthy server connection open for future commands. For `uses_dual_clock()`
+operations, the daemon also keeps an unlocked per-server multi-slot
+`call_cancels` side table (`HashMap<u64, CancellationToken>`) registered upon
+acquiring `ServerState` (covering connection setup, `walk_tools`, post-dispatch
+response wait, and concurrent task polling).
+`reset --force SERVER` cancels every active `call_cancels` token before
+awaiting `ServerState`. Its cancellation remains active while the reset waits for and
 holds the slot, so calls already queued ahead of the reset are cancelled before
 dispatch and cannot block it again. Concurrent force resets retain independent
 cancellation guards. Cancellation before dispatch returns `code: 4`,
@@ -801,7 +896,9 @@ writes use the same 4 MiB limit.
 `--text` renders `text` blocks, inline text `resource` blocks (`type: "resource"`
 carrying `resource.text`), `resource_link` blocks (`type: "resource_link"` with
 URI and optional metadata), and `Saved <kind> [<mimeType>] (<bytes> B): <path>`
-lines for saved binary media. Inline binary blocks retained via
+lines for saved binary media (including completed `tasks get` responses via
+`extract_task_result_media`, which extracts `result.content` media in place
+without double-wrapping `"result"`). Inline binary blocks retained via
 `--inline-media` or unrecognized non-text blocks emit a summary notice on
 stderr, and `structuredContent` JSON prints to stdout when no content blocks
 were emitted (otherwise noting its presence on stderr). Text output normalizes
@@ -814,9 +911,9 @@ cleanup failure on stderr.
 | --- | --- |
 | 0 | Command succeeded |
 | 1 | Local runtime, media cache, output, or cleanup failure |
-| 2 | CLI usage, configuration, argument validation, or unknown server/tool/skill |
+| 2 | CLI usage, configuration, argument/path/task-ID validation, schema mismatch, or unknown server/tool/skill |
 | 3 | MCP `CallToolResult` returned `isError: true` |
-| 4 | MCP protocol/transport/authentication failure or daemon communication failure |
+| 4 | MCP protocol/transport/authentication, skill integrity, task failure/input_required/cancellation, or daemon communication failure |
 | 5 | Operation or transfer deadline exceeded |
 | 6 | Daemon protocol/binary/config mismatch or lost session requiring recovery |
 | 130 | Interrupted by `SIGINT` or `Ctrl-C` |
@@ -856,29 +953,40 @@ blocked and `GetFileInformationByHandleEx` directory enumeration. Symlinks,
 reparse points, traversal segments, alternate data streams, special files, deep
 trees, and non-UTF-8 or binary files are rejected.
 
+`skills builtin` prints the embedded `mcpcli` agent skill guide (synced to
+`CARGO_PKG_VERSION`) offline before loading `mcpcli.json`. Remote skills
+(`skills list|show|files|read --server <SERVER>`) require `2026-07-28`,
+`resources`, and `io.modelcontextprotocol/skills` (plus `directoryRead` for
+`--dir`), stay isolated per `(server, uri)` from local skills, enforce clean
+relative paths under `<skill_root>/` (rejecting `%`, `..`, `\`, `?`, `#`, and
+control characters), verify byte length and `sha256:` digests on static
+manifests, reject UTF-8 BOM on remote `SKILL.md` while comparing YAML
+frontmatter with mathematical numeric equality, support one `skills/get`
+refresh when a `skills/list` entry goes stale, and save binary resources via
+`MediaStore` unless `--inline-media` is passed.
+
 | Limit | Value |
 | --- | --- |
-| CLI arguments / configuration | 1 MiB each |
-| Argument container nesting | 64 |
+| CLI arguments / configuration / schema file | 1 MiB each |
+| Argument and schema container nesting | 64 |
 | Process active byte budget | 1 GiB |
-| IPC protocol / frame limits | Version 5; 4 MiB request / 512 MiB response or stream frame |
+| IPC protocol / frame limits | Version 6; 4 MiB request / 512 MiB response or stream frame |
 | IPC request read / frame transfer idle | 5 s / 60 s |
-| `call` `--max-timeout` | 1 to 86,400 s (optional; unbounded when omitted) |
-| Concurrent daemon event streams | 32 (`MAX_EVENT_STREAMS`) |
+| `call` / `tasks get --wait` `--max-timeout` | 1 to 86,400 s (optional; `+3s` daemon / `+5s` client grace) |
+| Concurrent daemon task waiters / event streams | 24 (`MAX_TASK_WAITERS`) / 32 (`MAX_EVENT_STREAMS`) |
 | Event notification / queue depth | 4 MiB / 128 notifications per subscription |
 | Event catalog pages | 100 (`MAX_EVENT_PAGES`) |
 | Cursor file / stream ack / callback stderr | 64 KiB each |
-| MCP stdio message | 512 MiB per line |
+| MCP stdio message / HTTP JSON / SSE | 512 MiB (32 MiB cap for `resources/read`) |
 | MCP stdio `stderr` ring buffer / diagnostic tail | 16 KiB / 4 KiB |
-| HTTP JSON response | 512 MiB |
-| HTTP POST / GET SSE | 512 MiB per event |
 | SSE event ID | 8 KiB of UTF-8 bytes |
 | Media cache | 2 GiB total, 60 s retention after writeback |
 | Tool catalog | 256 pages, 10,000 tools, 16 MiB |
+| Remote skills catalog / resource | 64 pages, 1,024 skills, 16 MiB catalog / 16 MiB resource |
 | Global `AGENTS.md` | 1 MiB |
-| Skill manifest / resource | 1 MiB |
+| Local skill manifest / resource | 1 MiB |
 | YAML frontmatter | 64 KiB, with node, depth, and alias budgets |
-| Skills / scanned entries | 1,024 / 4,096 |
+| Local skills / scanned entries | 1,024 / 4,096 |
 | Resource directory depth | 16 |
 
 ## 11. Verification

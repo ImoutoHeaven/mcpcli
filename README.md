@@ -1,8 +1,8 @@
 # mcpcli
 
-A native CLI for MCP tools, MCP Events, OAuth 2.1 HTTP servers, a global `AGENTS.md` file,
-and local [Agent Skills](https://agentskills.io). A local daemon keeps stdio and Streamable HTTP
-connections alive across commands.
+A native CLI for MCP tools, MCP Events, MCP Tasks, OAuth 2.1 HTTP servers, a global `AGENTS.md`
+file, and local or remote [Agent Skills](https://agentskills.io). A local daemon keeps stdio and
+Streamable HTTP connections alive across commands.
 
 ## Install
 
@@ -99,13 +99,26 @@ mcpcli server filesystem
 mcpcli tools filesystem
 mcpcli tools filesystem --filter read --summary
 mcpcli inspect filesystem read_file
+mcpcli inspect filesystem read_file --schema read_file.schema.json --schema-mode compatible
 mcpcli call filesystem read_file --args '{"path":"Cargo.toml"}'
+mcpcli call filesystem read_file path:=Cargo.toml
+mcpcli call filesystem read_file -- -flag:=1
+mcpcli call filesystem read_file --schema read_file.schema.json path:=Cargo.toml
 mcpcli call filesystem long_task --max-timeout 600 --args '{}'
+mcpcli call filesystem long_task --detach --args '{}'
+mcpcli tasks get filesystem task_123 --wait --max-timeout 600
+mcpcli tasks update filesystem task_123 --args '{"confirm":true}'
+mcpcli tasks cancel filesystem task_123
 mcpcli call --inline-media filesystem read_file --args '{"path":"logo.png"}'
+mcpcli skills builtin
 mcpcli skills list
 mcpcli skill show example-skill
 mcpcli skills files example-skill
 mcpcli skills read example-skill references/guide.md
+mcpcli skills list --server remote
+mcpcli skills show --server remote example-skill
+mcpcli skills files --server remote --dir references example-skill
+mcpcli skills read --server remote --inline-media example-skill references/guide.md
 mcpcli events list remote
 mcpcli events poll remote github.pr
 mcpcli events stream remote github.pr --mode auto --cursor-file ./github.cursor
@@ -117,10 +130,58 @@ mcpcli daemon stop
 ~~~
 
 `call` and `events poll` / `events stream` accept `--args JSON`, `--args-file PATH`, or
-`--stdin` (`call` defaults to `{}`). `skill` is an alias for `skills`. Output is JSON on stdout,
-or readable text with `--text`. By default, `call` decodes binary `image`, `audio`, and blob
-`resource` blocks into a private local cache and returns `{result, savedMedia}` with local paths
-in `savedMedia`; pass `--inline-media` to keep Base64 payloads inline.
+`--stdin` (`call` defaults to `{}`). `call` also accepts trailing `KEY:=VALUE` positional
+arguments (mutually exclusive with `--args`, `--args-file`, and `--stdin`). Each item splits on
+the first `:=`, parses valid lossless JSON literals into typed JSON values, and falls back to a
+string otherwise. Pass `--` before keys that start with `-` (for example, `-- -flag:=1`).
+
+`inspect` and `call` accept `--schema <FILE>` and `--schema-mode exact|compatible` (default
+`compatible`). The snapshot file can be a full tool object containing `inputSchema` (and optional
+`outputSchema`) or a raw input schema object. `compatible` checks backward-compatible subschema
+evolution (such as new optional input parameters or widening `integer` to `number`) and fails
+closed on non-core keywords; `exact` requires normalized deep equality. A mismatch exits with
+code `2` (`kind: "schema_mismatch"`) before sending `tools/call`.
+
+Output is JSON on stdout, or readable text with `--text`. By default, `call` decodes binary
+`image`, `audio`, and blob `resource` blocks into a private local cache and returns
+`{result, savedMedia}` with local paths in `savedMedia`; pass `--inline-media` to keep Base64
+payloads inline.
+
+### Skills
+
+`skill` is an alias for `skills`. `mcpcli skills builtin` runs offline without `mcpcli.json` and
+outputs the embedded agent skill guide (`--text` writes raw `SKILL.md`).
+
+Without `--server`, `skills list|show|files|read` reads local directories from `mcpcli.json`.
+With `--server <SERVER>`, `skills` queries remote Skills over MCP (`SEP-2640`) while keeping
+remote skills isolated from local skill roots. `skills files --server <SERVER>` accepts
+`--dir <REL_DIR>` for directory reads, and `skills read --server <SERVER>` accepts
+`--inline-media`. Static remote manifests are verified for clean relative paths under the skill
+root, exact byte length, `sha256:` digests, and YAML frontmatter equality against the manifest
+before any content is written to disk or stdout. Binary remote resources save through `MediaStore`
+by default.
+
+### MCP Tasks
+
+For servers advertising `io.modelcontextprotocol/tasks` (`SEP-2663`), `mcpcli call` polls
+`resultType: "task"` responses until completion by default. Pass `--detach` to return the initial
+`CreateTaskResult` handle immediately without polling.
+
+`tasks` (alias `task`) manages existing tasks:
+
+- `tasks get <SERVER> <TASK_ID> [--wait] [--inline-media] [--max-timeout <SECS>]` fetches a task
+  snapshot or waits for a terminal state, extracting completed binary media into `savedMedia`
+  unless `--inline-media` is set.
+- `tasks update <SERVER> <TASK_ID> (--args <JSON> | --args-file <PATH> | --stdin)` submits
+  `inputResponses` for an `input_required` task.
+- `tasks cancel <SERVER> <TASK_ID>` requests task cancellation.
+
+Once `call` receives a `CreateTaskResult`, any non-`completed` failure (including `failed`,
+`cancelled`, `input_required`, timeout, `SIGINT`/`SIGTERM`, or `session_lost`) sets
+`outcome_unknown: true` and attaches `data.taskId` so callers do not blindly replay side effects.
+Read-only `tasks get` keeps `outcome_unknown: false` on all failure exits.
+
+### Events and daemon
 
 `events stream <SERVER> <EVENT> [--mode auto|push|poll] [--cursor-file <PATH>] [--exec-mode oneshot|stream] [-- <CMD>...]`
 writes unmodified SEP-3415 `EventOccurrence` objects as NDJSON on `stdout`, or delivers each
@@ -134,10 +195,11 @@ The daemon starts on demand. `--session NAME` or `MCPCLI_SESSION` isolates clien
 `--oneshot` opens a single-command connection, and `daemon run` runs in the foreground. Use
 `daemon restart` after configuration changes or binary updates that keep the same IPC version.
 
-When upgrading from v0.6 to v0.7, run `mcpcli daemon stop` with the v0.6 binary before replacing
-it, selecting each active configuration and session. After installing v0.7, `daemon start` or
-the next command starts a new daemon using IPC version 5. If the binary was already replaced,
-use a retained or re-downloaded v0.6 binary to stop the old daemon.
+When upgrading from a previous IPC protocol version (for example, IPC 5 in v0.7 to IPC 6), run
+`mcpcli daemon stop` with the older binary before replacing it, selecting each active
+configuration and session. After installing the new binary, `daemon start` or the next command
+starts a new daemon using IPC version 6. If the binary was already replaced, use a retained or
+re-downloaded copy of the previous binary to stop the old daemon.
 
 See [docs/mcpcli-design.md](docs/mcpcli-design.md) for protocol behavior, security boundaries,
 limits, and exit codes.
