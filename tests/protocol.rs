@@ -61,6 +61,8 @@ impl Fixture {
             env: BTreeMap::new(),
             cwd: None,
             description: None,
+            enabled: true,
+            timeout: None,
         }
     }
     fn http(&mut self, modern: bool, mode: &str) -> ServerConfig {
@@ -82,6 +84,9 @@ impl Fixture {
             url: format!("http://127.0.0.1:{port}/mcp"),
             headers: BTreeMap::new(),
             description: None,
+            enabled: true,
+            timeout: None,
+            oauth: None,
         }
     }
     fn lines(&self) -> Vec<String> {
@@ -383,6 +388,9 @@ async fn http_rejects_oversize_json_and_reserved_header_overrides() {
             url: "http://127.0.0.1:1/mcp".into(),
             headers: BTreeMap::from([(header.into(), "user-supplied".into())]),
             description: None,
+            enabled: true,
+            timeout: None,
+            oauth: None,
         };
         let error = McpConnection::connect(&config, BUDGET).await.err().unwrap();
         assert_eq!(kind(&error), FailureKind::Protocol);
@@ -633,4 +641,199 @@ async fn get_sse_responses_validate_exact_media_types_and_bound_events() {
         );
         connection.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn stdio_progress_timeout_and_stderr_tail_diagnostics() {
+    use mcpcli::budget::ByteBudget;
+    use mcpcli::mcp::CallBudgets;
+    use std::sync::atomic::AtomicBool;
+    use tokio_util::sync::CancellationToken;
+
+    let temp = tempfile::tempdir().unwrap();
+    let script = temp.path().join("stdio_progress_server.py");
+    std::fs::write(
+        &script,
+        r#"import json, sys, threading, time
+
+mode = sys.argv[1]
+if mode == "fail_handshake":
+    sys.stderr.write("startup-failure-你好\n")
+    sys.stderr.flush()
+    sys.exit(1)
+
+sys.stderr.write("startup-noise-ok\n")
+sys.stderr.flush()
+write_lock = threading.Lock()
+
+def send(obj):
+    with write_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+def run_call(msg_id, name, token):
+    if name == "progress_ok":
+        for step in range(1, 6):
+            time.sleep(0.22)
+            send({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": step, "total": 5}
+            })
+        send({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {"content": [{"type": "text", "text": "stdio-ok"}]}
+        })
+    elif name == "progress_silent":
+        time.sleep(2.0)
+    elif name == "progress_forever":
+        for step in range(1, 20):
+            time.sleep(0.2)
+            send({
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": token, "progress": step}
+            })
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    msg_id = msg.get("id")
+    if method == "server/discover":
+        send({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "error": {"code": -32601, "message": "Method not found"}
+        })
+    elif method == "initialize":
+        send({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stdio-progress", "version": "1.0"}
+            }
+        })
+    elif method == "tools/list":
+        send({
+            "jsonrpc": "2.0",
+            "id": msg_id,
+            "result": {
+                "tools": [
+                    {"name": "progress_ok", "inputSchema": {"type": "object"}},
+                    {"name": "progress_silent", "inputSchema": {"type": "object"}},
+                    {"name": "progress_forever", "inputSchema": {"type": "object"}},
+                ]
+            }
+        })
+    elif method == "tools/call":
+        name = msg["params"]["name"]
+        token = msg["params"].get("_meta", {}).get("progressToken")
+        threading.Thread(target=run_call, args=(msg_id, name, token), daemon=True).start()
+"#,
+    )
+    .unwrap();
+
+    // 1. Handshake failure surfaces sanitized stderr_tail and releases ByteBudget.
+    let budget = ByteBudget::new(256 * 1024);
+    let fail_cfg = ServerConfig::Stdio {
+        command: "python3".into(),
+        args: vec![script.display().to_string(), "fail_handshake".into()],
+        env: BTreeMap::new(),
+        cwd: None,
+        description: None,
+        enabled: true,
+        timeout: None,
+    };
+    let limits = McpLimits {
+        budget: budget.clone(),
+        ..McpLimits::default()
+    };
+    let err = match McpConnection::connect_with_limits(&fail_cfg, BUDGET, limits.clone()).await {
+        Ok(_) => panic!("expected handshake failure"),
+        Err(err) => err,
+    };
+    let fail = err.downcast_ref::<McpFailure>().unwrap();
+    assert_eq!(fail.kind, FailureKind::Transport);
+    assert_eq!(fail.stderr_tail.as_deref(), Some("startup-failure-你好\n"));
+    assert_eq!(budget.used(), 0);
+
+    // 2. Stdio progress reset succeeds past idle timeout without hard cap,
+    //    silent tool times out, explicit hard cap cuts off continuous progress,
+    //    and close() releases all budget leases including StderrCapture.
+    let ok_cfg = ServerConfig::Stdio {
+        command: "python3".into(),
+        args: vec![script.display().to_string(), "run".into()],
+        env: BTreeMap::new(),
+        cwd: None,
+        description: None,
+        enabled: true,
+        timeout: None,
+    };
+    let mut conn = McpConnection::connect_with_limits(&ok_cfg, BUDGET, limits)
+        .await
+        .unwrap();
+    let dispatched = AtomicBool::new(false);
+    let (val, lease) = conn
+        .call_with_dispatch_leased(
+            "progress_ok",
+            &Map::new(),
+            CallBudgets {
+                pre_dispatch_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+                idle: Duration::from_millis(600),
+                hard: None,
+            },
+            &dispatched,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(val["content"][0]["text"], "stdio-ok");
+    drop(val);
+    drop(lease);
+
+    let err_silent = conn
+        .call_with_dispatch_leased(
+            "progress_silent",
+            &Map::new(),
+            CallBudgets {
+                pre_dispatch_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+                idle: Duration::from_millis(400),
+                hard: None,
+            },
+            &AtomicBool::new(false),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    let fail_silent = err_silent.downcast_ref::<McpFailure>().unwrap();
+    assert_eq!(fail_silent.kind, FailureKind::Timeout);
+    assert!(fail_silent.outcome_unknown);
+
+    let err_capped = conn
+        .call_with_dispatch_leased(
+            "progress_forever",
+            &Map::new(),
+            CallBudgets {
+                pre_dispatch_deadline: tokio::time::Instant::now() + Duration::from_secs(2),
+                idle: Duration::from_millis(500),
+                hard: Some(Duration::from_millis(900)),
+            },
+            &AtomicBool::new(false),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    let fail_capped = err_capped.downcast_ref::<McpFailure>().unwrap();
+    assert_eq!(fail_capped.kind, FailureKind::Timeout);
+    assert!(fail_capped.outcome_unknown);
+
+    conn.close().await.unwrap();
+    drop(conn);
+    assert_eq!(budget.used(), 0);
 }

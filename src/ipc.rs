@@ -14,7 +14,7 @@ use tokio::{
     time::{Instant, timeout},
 };
 
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 pub const REQUEST_LIMIT: usize = 4 << 20;
 pub const RESPONSE_LIMIT: usize = 512 << 20;
 pub const ARGUMENT_LIMIT: usize = 1 << 20;
@@ -30,6 +30,8 @@ pub struct Request {
     pub build: String,
     pub digest: String,
     pub timeout_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_timeout_ms: Option<u64>,
     pub deadline_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit_deadline_ms: Option<u64>,
@@ -487,8 +489,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ipc_v4_stream_frames_round_trip_and_operation_classification() {
-        assert_eq!(PROTOCOL, 4);
+    async fn ipc_v5_stream_frames_round_trip_and_operation_classification() {
+        assert_eq!(PROTOCOL, 5);
         assert!(
             Operation::EventsStream {
                 server: "s".into(),

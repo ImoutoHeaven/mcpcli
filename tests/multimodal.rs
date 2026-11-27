@@ -129,6 +129,8 @@ for raw in sys.stdin.buffer:
         env: BTreeMap::new(),
         cwd: None,
         description: None,
+        enabled: true,
+        timeout: None,
     };
     let mut connection = McpConnection::connect(&config, BUDGET).await.unwrap();
     assert_eq!(
@@ -202,11 +204,14 @@ for raw in sys.stdin.buffer:
                 env: BTreeMap::new(),
                 cwd: None,
                 description: None,
+                enabled: true,
+                timeout: None,
             };
             let budget = ByteBudget::new(64 * 1024);
             let limits = McpLimits {
                 max_response_bytes: limit,
                 max_tool_catalog_bytes: 16 * 1024,
+                stderr_tail_bytes: 0,
                 budget: budget.clone(),
             };
             let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -234,11 +239,14 @@ for raw in sys.stdin.buffer:
             env: BTreeMap::new(),
             cwd: None,
             description: None,
+            enabled: true,
+            timeout: None,
         };
         let budget = ByteBudget::new(64 * 1024);
         let limits = McpLimits {
             max_response_bytes: limit,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -274,11 +282,14 @@ for raw in sys.stdin.buffer:
         env: BTreeMap::new(),
         cwd: None,
         description: None,
+        enabled: true,
+        timeout: None,
     };
     let tight_budget = ByteBudget::new(2048);
     let limits = McpLimits {
         max_response_bytes: 16 * 1024,
         max_tool_catalog_bytes: 16 * 1024,
+        stderr_tail_bytes: 0,
         budget: tight_budget.clone(),
     };
     let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -667,6 +678,9 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
             url: format!("http://127.0.0.1:{port}/mcp"),
             headers: BTreeMap::new(),
             description: None,
+            enabled: true,
+            timeout: None,
+            oauth: None,
         };
         (cfg, get_count, call_count, handle)
     }
@@ -686,6 +700,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
             let limits = McpLimits {
                 max_response_bytes: limit,
                 max_tool_catalog_bytes: 16 * 1024,
+                stderr_tail_bytes: 0,
                 budget: budget.clone(),
             };
             let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -707,6 +722,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let limits = McpLimits {
             max_response_bytes: limit,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -736,6 +752,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let limits = McpLimits {
             max_response_bytes: limit,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -769,6 +786,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let limits = McpLimits {
             max_response_bytes: 32 * 1024,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -805,6 +823,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let limits = McpLimits {
             max_response_bytes: limit,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -843,6 +862,7 @@ async fn http_json_post_sse_and_get_sse_exact_bounds_and_hard_errors() {
         let limits = McpLimits {
             max_response_bytes: max_resp,
             max_tool_catalog_bytes: 16 * 1024,
+            stderr_tail_bytes: 0,
             budget: budget.clone(),
         };
         let mut conn = McpConnection::connect_with_limits(&cfg, BUDGET, limits)
@@ -984,6 +1004,9 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
         url: format!("http://127.0.0.1:{port}/mcp"),
         headers: BTreeMap::new(),
         description: None,
+        enabled: true,
+        timeout: None,
+        oauth: None,
     };
     // A single response needs 4R during official SDK conversion, after its raw
     // frame is released. Reserve both connections and their small call arguments.
@@ -994,6 +1017,7 @@ async fn tool_catalog_cap_is_separate_and_concurrent_leases_never_deadlock() {
     let limits = McpLimits {
         max_response_bytes: 32_768,
         max_tool_catalog_bytes: 400,
+        stderr_tail_bytes: 0,
         budget: shared_budget.clone(),
     };
     let mut conn1 = McpConnection::connect_with_limits(&cfg, BUDGET, limits.clone())
@@ -1746,6 +1770,9 @@ async fn media_cache_cross_process_inflight_protection_crash_recovery_and_conten
                 url: format!("http://127.0.0.1:{mcp_port}/mcp"),
                 headers: BTreeMap::new(),
                 description: None,
+                enabled: true,
+                timeout: None,
+                oauth: None,
             },
         )]),
         skills: Vec::new(),

@@ -1,7 +1,7 @@
 //! MCP lifecycle and transports. Tool calls are sent once, never replayed.
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     pin::Pin,
     process::Stdio,
@@ -18,11 +18,12 @@ use http::{HeaderName, HeaderValue};
 use rmcp::{
     RoleClient,
     model::{
-        CallToolRequestParams, CallToolResponse, ClientCapabilities, ClientConfig,
-        ClientJsonRpcMessage, ClientRequest, ClientResult, CustomRequest, CustomResult,
-        ElicitResult, ElicitationAction, ErrorCode, ErrorData, ExtensionCapabilities,
-        Implementation, PaginatedRequestParams, ProtocolVersion, ServerJsonRpcMessage,
-        ServerNotification, ServerRequest, ServerResult,
+        CallToolRequest, CallToolRequestParams, CallToolResponse, CancelledNotification,
+        CancelledNotificationParam, ClientCapabilities, ClientConfig, ClientJsonRpcMessage,
+        ClientNotification, ClientRequest, ClientResult, CustomRequest, CustomResult, ElicitResult,
+        ElicitationAction, ErrorCode, ErrorData, ExtensionCapabilities, Implementation,
+        PaginatedRequestParams, ProtocolVersion, ServerJsonRpcMessage, ServerNotification,
+        ServerRequest, ServerResult,
     },
     service::{
         ClientCacheConfig, ClientLifecycleMode, ClientServiceExt, NotificationContext, Peer,
@@ -40,9 +41,9 @@ use rmcp::{
 use serde_json::{Map, Value};
 use sse_stream::Sse;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
-    time::timeout,
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    time::{Instant, timeout},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +67,9 @@ use ingress::{Ingress, IngressError, ObserveOutcome};
 pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_TOOL_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+pub const DEFAULT_STDERR_TAIL_BYTES: usize = 16 * 1024;
+const MAX_STDERR_SNAPSHOT_BYTES: usize = 4096;
+const STDERR_SNAPSHOT_WAIT: Duration = Duration::from_millis(100);
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_TOOLS: usize = 10_000;
 const MAX_TOOL_PAGES: usize = 256;
@@ -80,6 +84,7 @@ const INVALID_REQUEST_REPLY: &[u8] =
 pub struct McpLimits {
     pub max_response_bytes: usize,
     pub max_tool_catalog_bytes: usize,
+    pub stderr_tail_bytes: usize,
     pub budget: Arc<ByteBudget>,
 }
 
@@ -88,14 +93,23 @@ impl Default for McpLimits {
         Self {
             max_response_bytes: MAX_RESPONSE_BYTES,
             max_tool_catalog_bytes: MAX_TOOL_CATALOG_BYTES,
+            stderr_tail_bytes: DEFAULT_STDERR_TAIL_BYTES,
             budget: ByteBudget::global().clone(),
         }
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CallBudgets {
+    pub pre_dispatch_deadline: Instant,
+    pub idle: Duration,
+    pub hard: Option<Duration>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailureKind {
     Timeout,
+    Cancelled,
     Protocol,
     Transport,
     AuthRequired,
@@ -109,6 +123,7 @@ pub struct McpFailure {
     pub outcome_unknown: bool,
     pub rpc_error: Option<Arc<Value>>,
     pub auth: Option<crate::auth::AuthChallengeInfo>,
+    pub stderr_tail: Option<String>,
     pub(crate) lease: Option<Arc<ByteLease>>,
 }
 
@@ -134,6 +149,7 @@ fn failure_with_outcome(
         outcome_unknown,
         rpc_error: None,
         auth: None,
+        stderr_tail: None,
         lease: None,
     }
     .into()
@@ -155,6 +171,7 @@ impl TransportTermination {
                 outcome_unknown: false,
                 rpc_error: None,
                 auth: None,
+                stderr_tail: None,
                 lease: None,
             });
         }
@@ -169,6 +186,7 @@ impl TransportTermination {
             outcome_unknown: false,
             rpc_error: None,
             auth: None,
+            stderr_tail: None,
             lease: None,
         });
     }
@@ -254,6 +272,7 @@ fn record_cleanup_failure(
                     outcome_unknown: false,
                     rpc_error: None,
                     auth: None,
+                    stderr_tail: None,
                     lease: None,
                 },
                 local_confirmed,
@@ -266,6 +285,7 @@ fn record_cleanup_failure(
                 outcome_unknown: false,
                 rpc_error: None,
                 auth: None,
+                stderr_tail: None,
                 lease: None,
             };
             existing.local_confirmed = false;
@@ -334,6 +354,7 @@ fn rpc_failure(code: i32, diagnostic: String, calling: bool, ingress: &Ingress) 
         outcome_unknown: calling,
         rpc_error,
         auth: None,
+        stderr_tail: None,
         lease,
     }
     .into()
@@ -443,6 +464,192 @@ type CloseFuture = Pin<
     Box<dyn Future<Output = std::result::Result<QuitReason, tokio::task::JoinError>> + Send + Sync>,
 >;
 
+struct StderrRing {
+    buf: VecDeque<u8>,
+    cap: usize,
+    lease: ByteLease,
+}
+
+impl StderrRing {
+    fn new(cap: usize, lease: ByteLease) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(cap.min(4096)),
+            cap,
+            lease,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if self.cap == 0 || bytes.is_empty() {
+            return;
+        }
+        if bytes.len() >= self.cap {
+            self.buf.clear();
+            self.buf.extend(&bytes[bytes.len() - self.cap..]);
+            return;
+        }
+        let overflow = self
+            .buf
+            .len()
+            .saturating_add(bytes.len())
+            .saturating_sub(self.cap);
+        if overflow > 0 {
+            self.buf.drain(..overflow);
+        }
+        self.buf.extend(bytes);
+    }
+
+    fn tail_bytes(&self, max_bytes: usize) -> Vec<u8> {
+        let len = self.buf.len();
+        let skip = len.saturating_sub(max_bytes);
+        let (a, b) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(len - skip);
+        if skip < a.len() {
+            out.extend_from_slice(&a[skip..]);
+            out.extend_from_slice(b);
+        } else {
+            out.extend_from_slice(&b[skip - a.len()..]);
+        }
+        out
+    }
+}
+
+fn format_stderr_tail(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let start = bytes
+        .iter()
+        .position(|&b| !(0x80..=0xBF).contains(&b))
+        .unwrap_or(bytes.len());
+    let sliced = &bytes[start..];
+    if sliced.is_empty() {
+        return None;
+    }
+    let decoded = String::from_utf8_lossy(sliced);
+    let sanitized = crate::discovery::safe_text(&decoded);
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+pub(crate) struct StderrCapture {
+    ring: Arc<Mutex<StderrRing>>,
+    done_rx: tokio::sync::watch::Receiver<bool>,
+    abort_handle: tokio::task::AbortHandle,
+}
+
+impl StderrCapture {
+    fn spawn(mut stderr: ChildStderr, cap: usize, lease: ByteLease) -> Arc<Self> {
+        let ring = Arc::new(Mutex::new(StderrRing::new(cap, lease)));
+        let (done_tx, done_rx) = tokio::sync::watch::channel(false);
+        let task_ring = ring.clone();
+        let handle = tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        task_ring
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .push(&buf[..n]);
+                    }
+                }
+            }
+            let _ = done_tx.send(true);
+        });
+        Arc::new(Self {
+            ring,
+            done_rx,
+            abort_handle: handle.abort_handle(),
+        })
+    }
+
+    pub(crate) async fn snapshot_tail(&self, wait: Duration) -> Option<String> {
+        let mut rx = self.done_rx.clone();
+        if !*rx.borrow() {
+            let _ = timeout(wait, rx.wait_for(|&done| done)).await;
+        }
+        let bytes = self
+            .ring
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tail_bytes(MAX_STDERR_SNAPSHOT_BYTES);
+        format_stderr_tail(&bytes)
+    }
+
+    pub(crate) fn abort(&self) {
+        self.abort_handle.abort();
+        let mut ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
+        ring.buf = VecDeque::new();
+        ring.cap = 0;
+        ring.lease.release();
+    }
+}
+
+impl Drop for StderrCapture {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+struct CancelOnDropGuard {
+    peer: Peer<RoleClient>,
+    request_id: Option<rmcp::model::RequestId>,
+}
+
+impl CancelOnDropGuard {
+    fn new(peer: Peer<RoleClient>, request_id: rmcp::model::RequestId) -> Self {
+        Self {
+            peer,
+            request_id: Some(request_id),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for CancelOnDropGuard {
+    fn drop(&mut self) {
+        if let Some(request_id) = self.request_id.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let peer = self.peer.clone();
+            handle.spawn(async move {
+                let notification = CancelledNotification::new(CancelledNotificationParam::new(
+                    Some(request_id),
+                    None,
+                ));
+                let _ = timeout(
+                    Duration::from_secs(2),
+                    peer.send_notification(ClientNotification::CancelledNotification(notification)),
+                )
+                .await;
+            });
+        }
+    }
+}
+
+async fn attach_stderr_tail_and_abort(
+    mut error: anyhow::Error,
+    capture: Option<Arc<StderrCapture>>,
+) -> anyhow::Error {
+    if let Some(capture) = capture {
+        if let Some(failure) = error.downcast_mut::<McpFailure>()
+            && failure.stderr_tail.is_none()
+        {
+            failure.stderr_tail = capture.snapshot_tail(STDERR_SNAPSHOT_WAIT).await;
+        }
+        capture.abort();
+    }
+    error
+}
+
 pub struct McpConnection {
     service: Option<RunningService<RoleClient, Handler>>,
     peer: Peer<RoleClient>,
@@ -450,12 +657,21 @@ pub struct McpConnection {
     event_router: EventRouter,
     event_schemas: EventSchemaCache,
     termination: Arc<TransportTermination>,
+    stderr_capture: Option<Arc<StderrCapture>>,
     limits: McpLimits,
     server: Leased<Vec<u8>>,
     closing: Option<CloseFuture>,
     cleanup: CleanupState,
     tools_changed: Arc<AtomicBool>,
     http: bool,
+}
+
+impl Drop for McpConnection {
+    fn drop(&mut self) {
+        if let Some(capture) = self.stderr_capture.take() {
+            capture.abort();
+        }
+    }
 }
 
 impl McpConnection {
@@ -482,6 +698,7 @@ impl McpConnection {
             preferred_versions: PREFERRED_PROTOCOL_VERSIONS.to_vec(),
             legacy_version: Some(ProtocolVersion::V_2025_11_25),
         };
+        let stderr_slot: Arc<Mutex<Option<Arc<StderrCapture>>>> = Arc::new(Mutex::new(None));
         let connection = async {
             match config {
                 ServerConfig::Stdio {
@@ -496,12 +713,13 @@ impl McpConnection {
                     if let Some(cwd) = cwd {
                         child.current_dir(cwd);
                     }
-                    let transport = ChildTransport::spawn_observed(
+                    let (transport, capture) = ChildTransport::spawn_observed(
                         child,
                         cleanup.clone(),
                         ingress.clone(),
                         termination.clone(),
                         limits.max_response_bytes,
+                        limits.stderr_tail_bytes,
                         limits.budget.clone(),
                     )
                     .map_err(|e| {
@@ -510,6 +728,7 @@ impl McpConnection {
                             format!("Cannot start MCP server: {e}"),
                         )
                     })?;
+                    *stderr_slot.lock().unwrap_or_else(|p| p.into_inner()) = capture;
                     let transport = EventNotificationTransport::new(
                         transport,
                         event_router.clone(),
@@ -522,7 +741,12 @@ impl McpConnection {
                         () = termination.cancelled() => Err(termination.failure(false)),
                     }
                 }
-                ServerConfig::Http { url, headers, .. } => {
+                ServerConfig::Http {
+                    url,
+                    headers,
+                    oauth,
+                    ..
+                } => {
                     let mut parsed_headers = HashMap::new();
                     for (name, value) in headers {
                         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
@@ -568,12 +792,14 @@ impl McpConnection {
                         None
                     } else {
                         Some(
-                            crate::auth::HttpAuthManager::for_server_url(url).map_err(|e| {
-                                failure(
-                                    FailureKind::Protocol,
-                                    format!("Invalid HTTP server URL: {e}"),
-                                )
-                            })?,
+                            crate::auth::HttpAuthManager::for_server(url, oauth.as_ref()).map_err(
+                                |e| {
+                                    failure(
+                                        FailureKind::Protocol,
+                                        format!("Invalid HTTP server URL: {e}"),
+                                    )
+                                },
+                            )?,
                         )
                     };
                     let transport_config =
@@ -608,22 +834,48 @@ impl McpConnection {
                 }
             }
         };
-        let service = timeout(budget, connection)
-            .await
-            .map_err(|_| failure(FailureKind::Timeout, "MCP connection timed out"))??;
+        let service = match timeout(budget, connection).await {
+            Ok(Ok(service)) => service,
+            Ok(Err(error)) => {
+                let capture = stderr_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                return Err(attach_stderr_tail_and_abort(error, capture).await);
+            }
+            Err(_) => {
+                let capture = stderr_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                return Err(attach_stderr_tail_and_abort(
+                    failure(FailureKind::Timeout, "MCP connection timed out"),
+                    capture,
+                )
+                .await);
+            }
+        };
+        let stderr_capture = stderr_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
         // Explicit discovery must not silently return an expired SDK cache entry.
         service
             .peer()
             .set_response_cache_config(ClientCacheConfig::disabled())
             .await;
-        let observed = observed_result(ingress.take(), None, false)?;
+        let observed = match observed_result(ingress.take(), None, false) {
+            Ok(observed) => observed,
+            Err(error) => {
+                drop(service);
+                return Err(attach_stderr_tail_and_abort(error, stderr_capture).await);
+            }
+        };
         // Keep the owner older than the payload through the fallible peer lookup.
         let result_lease = observed.2;
         let (source, result) = (observed.0, observed.1);
-        let protocol = service
-            .peer()
-            .peer_info()
-            .ok_or_else(|| failure(FailureKind::Protocol, "MCP peer info is missing"))?;
+        let protocol = match service.peer().peer_info() {
+            Some(protocol) => protocol,
+            None => {
+                drop(service);
+                return Err(attach_stderr_tail_and_abort(
+                    failure(FailureKind::Protocol, "MCP peer info is missing"),
+                    stderr_capture,
+                )
+                .await);
+            }
+        };
         let mut server = Map::new();
         server.insert("source".into(), Value::String(source.into()));
         server.insert(
@@ -631,8 +883,17 @@ impl McpConnection {
             Value::String(protocol.protocol_version.as_str().into()),
         );
         server.insert("result".into(), result);
-        let (server_bytes, server_lease) =
-            crate::json::encode_json_leased(&server, limits.max_response_bytes, &limits.budget)?;
+        let (server_bytes, server_lease) = match crate::json::encode_json_leased(
+            &server,
+            limits.max_response_bytes,
+            &limits.budget,
+        ) {
+            Ok(pair) => pair,
+            Err(error) => {
+                drop(service);
+                return Err(attach_stderr_tail_and_abort(error.into(), stderr_capture).await);
+            }
+        };
         drop(server);
         drop(result_lease);
         Ok(Self {
@@ -640,6 +901,7 @@ impl McpConnection {
             event_router,
             event_schemas,
             termination,
+            stderr_capture,
             limits,
             server: Leased::new(server_bytes, server_lease),
             peer: service.peer().clone(),
@@ -704,8 +966,19 @@ impl McpConnection {
         Ok(Leased::new(value, lease))
     }
 
+    async fn attach_stderr_tail(&self, mut error: anyhow::Error) -> anyhow::Error {
+        if let Some(capture) = &self.stderr_capture
+            && let Some(failure) = error.downcast_mut::<McpFailure>()
+            && failure.stderr_tail.is_none()
+            && (failure.kind == FailureKind::Transport || self.is_closed())
+        {
+            failure.stderr_tail = capture.snapshot_tail(STDERR_SNAPSHOT_WAIT).await;
+        }
+        error
+    }
+
     pub async fn list_tools(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
-        let (pages, _) = self.walk_tools(budget).await?;
+        let (pages, _) = self.walk_tools(budget, None).await?;
         let (pages, lease) = pages.into_parts();
         Ok(Leased::new(
             pages
@@ -723,16 +996,22 @@ impl McpConnection {
     }
 
     pub async fn list_tool_pages(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
-        self.walk_tools(budget).await.map(|(pages, _)| pages)
+        self.walk_tools(budget, None).await.map(|(pages, _)| pages)
     }
 
     async fn walk_tools(
         &self,
         budget: Duration,
+        call_cancel: Option<&CancellationToken>,
     ) -> Result<(Leased<Vec<Value>>, Leased<HashSet<String>>)> {
+        if call_cancel.is_some_and(CancellationToken::is_cancelled) {
+            return Err(failure(FailureKind::Cancelled, "Tool discovery cancelled"));
+        }
         if self.termination.is_terminated() {
             self.abort_service();
-            return Err(self.termination.failure(false));
+            return Err(self
+                .attach_stderr_tail(self.termination.failure(false))
+                .await);
         }
         self.termination.clear_transient();
         let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
@@ -753,11 +1032,19 @@ impl McpConnection {
                 let list_fut = self.peer.list_tools(Some(params));
                 let mut page = tokio::select! {
                     biased;
-                    res = list_fut => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
                     () = self.termination.cancelled() => {
                         self.abort_service();
                         return Err(self.termination.failure(false));
                     }
+                    () = async {
+                        match call_cancel {
+                            Some(token) => token.cancelled().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        return Err(failure(FailureKind::Cancelled, "Tool discovery cancelled"));
+                    }
+                    res = list_fut => res.map_err(|e| service_failure(e, false, &self.ingress, &self.termination))?,
                 };
                 let (_, raw_page, page_lease) =
                     observed_result(self.ingress.take(), Some("tools/list"), false)?;
@@ -835,9 +1122,13 @@ impl McpConnection {
                 "Tool catalog exceeds the pagination limit",
             ))
         };
-        timeout(budget, listing)
+        let result = timeout(budget, listing)
             .await
-            .map_err(|_| failure(FailureKind::Timeout, "Tool discovery timed out"))?
+            .map_err(|_| failure(FailureKind::Timeout, "Tool discovery timed out"))?;
+        match result {
+            Ok(pair) => Ok(pair),
+            Err(error) => Err(self.attach_stderr_tail(error).await),
+        }
     }
 
     pub async fn call(
@@ -869,23 +1160,56 @@ impl McpConnection {
                 )
             })?;
         let arguments = Leased::new(arguments, input_lease);
-        self.call_with_dispatch_leased(name, &arguments, budget, dispatched)
-            .await
-            .map(|(value, lease)| Leased::new(value, lease))
+        let budgets = CallBudgets {
+            pre_dispatch_deadline: Instant::now() + budget,
+            idle: budget,
+            hard: None,
+        };
+        self.call_with_dispatch_leased(
+            name,
+            &arguments,
+            budgets,
+            dispatched,
+            CancellationToken::new(),
+        )
+        .await
+        .map(|(value, lease)| Leased::new(value, lease))
     }
 
     pub async fn call_with_dispatch_leased(
         &self,
         name: &str,
         arguments: &Map<String, Value>,
-        budget: Duration,
+        budgets: CallBudgets,
         dispatched: &AtomicBool,
+        call_cancel: CancellationToken,
     ) -> Result<(Value, ByteLease)> {
-        let started = tokio::time::Instant::now();
+        enum CallWaitOutcome {
+            Terminated,
+            Cancelled,
+            Response(Box<std::result::Result<ServerResult, ServiceError>>),
+        }
+
+        let started = Instant::now();
+        if call_cancel.is_cancelled() {
+            return Err(failure(
+                FailureKind::Cancelled,
+                "Tool was not dispatched: cancelled before discovery",
+            ));
+        }
+        let discovery_budget = budgets
+            .pre_dispatch_deadline
+            .saturating_duration_since(Instant::now());
+        if discovery_budget.is_zero() {
+            return Err(failure(
+                FailureKind::Timeout,
+                "Tool was not dispatched: pre-dispatch deadline exceeded",
+            ));
+        }
         // HTTP header annotations need the SDK's current catalog; fresh discovery
         // also prevents invoking tools rejected by the transport or withdrawn.
         let (pages, names) = self
-            .walk_tools(budget)
+            .walk_tools(discovery_budget, Some(&call_cancel))
             .await
             .map_err(|error| -> anyhow::Error {
                 let message = format!("Tool was not dispatched: discovery failed: {error}");
@@ -940,13 +1264,41 @@ impl McpConnection {
                     "Tool arguments and headers exceed the active memory limit",
                 )
             })?;
-        let remaining = budget.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
+        if call_cancel.is_cancelled() {
             return Err(failure(
-                FailureKind::Timeout,
-                "Tool was not dispatched: discovery exhausted the call timeout",
+                FailureKind::Cancelled,
+                "Tool was not dispatched: cancelled before dispatch",
             ));
         }
+        let remaining_hard = match budgets.hard {
+            Some(hard) => {
+                let remaining = hard.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(failure(
+                        FailureKind::Timeout,
+                        "Tool was not dispatched: discovery exhausted the call timeout",
+                    ));
+                }
+                Some(remaining)
+            }
+            None => {
+                if budgets
+                    .pre_dispatch_deadline
+                    .saturating_duration_since(Instant::now())
+                    .is_zero()
+                {
+                    return Err(failure(
+                        FailureKind::Timeout,
+                        "Tool was not dispatched: discovery exhausted the call timeout",
+                    ));
+                }
+                None
+            }
+        };
+        let call_idle = match remaining_hard {
+            Some(remaining) => budgets.idle.min(remaining),
+            None => budgets.idle,
+        };
         self.termination.clear_transient();
         // This owner covers the application's request construction and wait.
         // It makes no claim about SDK copies retained after cancellation.
@@ -955,30 +1307,98 @@ impl McpConnection {
         let _capture = self.ingress.capture().ok_or_else(busy_capture)?;
         if self.termination.is_terminated() {
             self.abort_service();
-            return Err(self.termination.failure(false));
+            return Err(self
+                .attach_stderr_tail(self.termination.failure(false))
+                .await);
+        }
+        let mut options = PeerRequestOptions::with_timeout(call_idle).reset_timeout_on_progress();
+        if let Some(remaining_hard) = remaining_hard {
+            options = options.with_max_total_timeout(remaining_hard);
         }
         dispatched.store(true, Ordering::Release);
-        // call_tool_once cancels on future drop; it does not drive interactive MRTR rounds.
-        let response = timeout(remaining, async {
-            let call_fut = self.peer.call_tool_once(request);
-            tokio::pin!(call_fut);
+        let handle = match self
+            .peer
+            .send_cancellable_request(
+                ClientRequest::CallToolRequest(CallToolRequest::new(request)),
+                options,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                let err = service_failure(error, true, &self.ingress, &self.termination);
+                return Err(self.attach_stderr_tail(err).await);
+            }
+        };
+        let request_id = handle.id.clone();
+        let peer = self.peer.clone();
+        let mut cancel_guard = CancelOnDropGuard::new(peer.clone(), request_id.clone());
+        let outcome = {
+            let response_fut = handle.await_response();
+            tokio::pin!(response_fut);
             tokio::select! {
                 biased;
-                () = self.termination.cancelled() => {
-                    self.abort_service();
-                    Err(self.termination.failure(true))
-                }
-                res = &mut call_fut => res.map_err(|e| service_failure(e, true, &self.ingress, &self.termination)),
+                () = self.termination.cancelled() => CallWaitOutcome::Terminated,
+                () = call_cancel.cancelled() => CallWaitOutcome::Cancelled,
+                res = &mut response_fut => CallWaitOutcome::Response(Box::new(res)),
             }
-        })
-        .await
-        .map_err(|_| {
-            failure_with_outcome(
-                FailureKind::Timeout,
-                "MCP call timed out; cancellation requested; outcome unknown, the call was not retried",
-                true,
-            )
-        })??;
+        };
+        let server_result = match outcome {
+            CallWaitOutcome::Terminated => {
+                cancel_guard.disarm();
+                self.abort_service();
+                return Err(self
+                    .attach_stderr_tail(self.termination.failure(true))
+                    .await);
+            }
+            CallWaitOutcome::Cancelled => {
+                cancel_guard.disarm();
+                let notification = CancelledNotification::new(CancelledNotificationParam::new(
+                    Some(request_id),
+                    Some("cancelled by client".into()),
+                ));
+                let _ = timeout(
+                    Duration::from_secs(2),
+                    peer.send_notification(ClientNotification::CancelledNotification(notification)),
+                )
+                .await;
+                return Err(failure_with_outcome(
+                    FailureKind::Cancelled,
+                    "MCP call cancelled; outcome unknown, the call was not retried",
+                    true,
+                ));
+            }
+            CallWaitOutcome::Response(res) => {
+                cancel_guard.disarm();
+                match *res {
+                    Ok(result) => result,
+                    Err(ServiceError::Timeout { .. }) => {
+                        return Err(failure_with_outcome(
+                            FailureKind::Timeout,
+                            "MCP call timed out; cancellation requested; outcome unknown, the call was not retried",
+                            true,
+                        ));
+                    }
+                    Err(error) => {
+                        let err = service_failure(error, true, &self.ingress, &self.termination);
+                        return Err(self.attach_stderr_tail(err).await);
+                    }
+                }
+            }
+        };
+        let response = match server_result {
+            ServerResult::CallToolResult(result) => CallToolResponse::Complete(result),
+            ServerResult::InputRequiredResult(result) => CallToolResponse::InputRequired(result),
+            ServerResult::CreateTaskResult(result) => CallToolResponse::Task(result),
+            _ => {
+                return Err(service_failure(
+                    ServiceError::UnexpectedResponse,
+                    true,
+                    &self.ingress,
+                    &self.termination,
+                ));
+            }
+        };
         match response {
             CallToolResponse::Complete(sdk_result) => {
                 drop(sdk_result);
@@ -1074,6 +1494,9 @@ impl McpConnection {
                     false,
                 );
             }
+        }
+        if let Some(capture) = self.stderr_capture.take() {
+            capture.abort();
         }
         let error = self
             .cleanup
@@ -1174,6 +1597,7 @@ impl McpEventsClient {
             outcome_unknown: false,
             rpc_error: Some(Arc::new(Value::Object(value))),
             auth: None,
+            stderr_tail: None,
             lease: Some(Arc::new(lease)),
         }
         .into()
@@ -1559,6 +1983,7 @@ fn init_failure(
                 outcome_unknown: false,
                 rpc_error,
                 auth: None,
+                stderr_tail: None,
                 lease,
             }
             .into()
@@ -1747,12 +2172,23 @@ impl ChildTransport<ChildStdout, ChildStdin> {
         ingress: Ingress,
         termination: Arc<TransportTermination>,
         max_line_bytes: usize,
+        stderr_tail_bytes: usize,
         budget: Arc<ByteBudget>,
-    ) -> std::io::Result<Self> {
+    ) -> std::io::Result<(Self, Option<Arc<StderrCapture>>)> {
+        let stderr_lease = if stderr_tail_bytes > 0 {
+            budget.try_acquire(stderr_tail_bytes)
+        } else {
+            None
+        };
+        let capture_stderr = stderr_lease.is_some();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if capture_stderr {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(false);
         #[cfg(unix)]
         crate::platform::configure_child_process_group(&mut command);
@@ -1779,24 +2215,33 @@ impl ChildTransport<ChildStdout, ChildStdin> {
         };
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
+        let stderr_capture = match (child.stderr.take(), stderr_lease) {
+            (Some(stderr), Some(lease)) => {
+                Some(StderrCapture::spawn(stderr, stderr_tail_bytes, lease))
+            }
+            _ => None,
+        };
         let line_lease = budget.empty_lease();
-        Ok(Self {
-            read: BufReader::new(stdout),
-            line_buf: Vec::new(),
-            line_lease,
-            max_line_bytes,
-            budget,
-            write: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
-            pending_error_reply: false,
-            ingress,
-            termination,
-            child: Some(child),
-            #[cfg(unix)]
-            group,
-            #[cfg(windows)]
-            job,
-            cleanup,
-        })
+        Ok((
+            Self {
+                read: BufReader::new(stdout),
+                line_buf: Vec::new(),
+                line_lease,
+                max_line_bytes,
+                budget,
+                write: Arc::new(tokio::sync::Mutex::new(Some(stdin))),
+                pending_error_reply: false,
+                ingress,
+                termination,
+                child: Some(child),
+                #[cfg(unix)]
+                group,
+                #[cfg(windows)]
+                job,
+                cleanup,
+            },
+            stderr_capture,
+        ))
     }
 }
 
@@ -2185,6 +2630,7 @@ impl BoundedHttp {
                 outcome_unknown: false,
                 rpc_error: None,
                 auth: Some(info),
+                stderr_tail: None,
                 lease: None,
             });
         }
@@ -2781,12 +3227,13 @@ mod tests {
     async fn observing_exit_does_not_reap_leader_before_group_cleanup() {
         let mut command = Command::new("sh");
         command.args(["-c", "exit 0"]);
-        let mut transport = ChildTransport::spawn_observed(
+        let (mut transport, _) = ChildTransport::spawn_observed(
             command,
             CleanupState::default(),
             Ingress::default(),
             Arc::new(TransportTermination::default()),
             MAX_RESPONSE_BYTES,
+            0,
             ByteBudget::new(MAX_RESPONSE_BYTES),
         )
         .unwrap();
@@ -2803,12 +3250,13 @@ mod tests {
     async fn blocked_stdio_writer_cannot_prevent_owned_child_shutdown() {
         let mut command = Command::new("sh");
         command.args(["-c", "trap '' TERM; sleep 60"]);
-        let mut transport = ChildTransport::spawn_observed(
+        let (mut transport, _) = ChildTransport::spawn_observed(
             command,
             CleanupState::default(),
             Ingress::default(),
             Arc::new(TransportTermination::default()),
             MAX_RESPONSE_BYTES,
+            0,
             ByteBudget::new(MAX_RESPONSE_BYTES),
         )
         .unwrap();
@@ -2832,12 +3280,13 @@ mod tests {
     async fn cancelling_shutdown_keeps_group_owned_until_drop() {
         let mut command = Command::new("sh");
         command.args(["-c", "trap '' TERM; cat >/dev/null; sleep 60"]);
-        let mut transport = ChildTransport::spawn_observed(
+        let (mut transport, _) = ChildTransport::spawn_observed(
             command,
             CleanupState::default(),
             Ingress::default(),
             Arc::new(TransportTermination::default()),
             MAX_RESPONSE_BYTES,
+            0,
             ByteBudget::new(MAX_RESPONSE_BYTES),
         )
         .unwrap();
@@ -3296,6 +3745,9 @@ mod http_tests {
             url: format!("http://127.0.0.1:{port}/mcp"),
             headers: BTreeMap::new(),
             description: None,
+            enabled: true,
+            timeout: None,
+            oauth: None,
         };
         let err = McpConnection::connect(&cfg, Duration::from_secs(5))
             .await
@@ -3541,6 +3993,9 @@ mod http_tests {
             url: format!("http://127.0.0.1:{port}/mcp"),
             headers: BTreeMap::new(),
             description: None,
+            enabled: true,
+            timeout: None,
+            oauth: None,
         };
         let mut conn = McpConnection::connect(&cfg, Duration::from_secs(5))
             .await
@@ -4177,5 +4632,115 @@ mod event_lifecycle_tests {
         assert_eq!(budget.used(), 0);
         assert!(fixture.sent.try_recv().is_err());
         fixture.service.close().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod stderr_capture_tests {
+    use super::*;
+
+    #[test]
+    fn format_stderr_tail_skips_leading_utf8_continuation_bytes_and_sanitizes() {
+        assert_eq!(format_stderr_tail(b""), None);
+        // Simulate slicing inside a 3-byte UTF-8 sequence ("你" = E4 BD A0) followed by valid text and control bytes.
+        let mut raw = vec![0xBD, 0xA0];
+        raw.extend_from_slice("你好\x07\n".as_bytes());
+        let formatted = format_stderr_tail(&raw).unwrap();
+        assert_eq!(formatted, "你好\\u{7}\n");
+
+        // Ring slicing at 4096 bytes across 3-byte characters produces valid UTF-8 with no replacement char.
+        let budget = ByteBudget::new(32 * 1024);
+        let lease = budget.try_acquire(DEFAULT_STDERR_TAIL_BYTES).unwrap();
+        let mut ring = StderrRing::new(DEFAULT_STDERR_TAIL_BYTES, lease);
+        let payload = "你".repeat(2000); // 6000 bytes (> 4096)
+        ring.push(payload.as_bytes());
+        let tail = format_stderr_tail(&ring.tail_bytes(MAX_STDERR_SNAPSHOT_BYTES)).unwrap();
+        assert!(!tail.contains('\u{FFFD}'));
+        assert!(tail.ends_with("你好".chars().next().unwrap()));
+        assert!(tail.len() <= MAX_STDERR_SNAPSHOT_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stderr_capture_fast_exit_large_output_and_abort_lease_release() {
+        // 1. Fast exit returns immediately on EOF without waiting the 500ms snapshot window.
+        let budget = ByteBudget::new(64 * 1024);
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf 'fast_err_line\\n' >&2; exit 1"]);
+        let (mut transport, capture) = ChildTransport::spawn_observed(
+            cmd,
+            CleanupState::default(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+            MAX_RESPONSE_BYTES,
+            DEFAULT_STDERR_TAIL_BYTES,
+            budget.clone(),
+        )
+        .unwrap();
+        let capture = capture.expect("stderr capture enabled");
+        let _ = transport.wait_unreaped().await.unwrap();
+        let started = Instant::now();
+        let tail = capture.snapshot_tail(Duration::from_millis(500)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(150),
+            "fast exit should not wait full timeout, elapsed={:?}",
+            started.elapsed()
+        );
+        assert_eq!(tail.as_deref(), Some("fast_err_line\n"));
+        capture.abort();
+        assert_eq!(budget.used(), 0);
+        transport.shutdown().await.unwrap();
+
+        // 2. Large (>1 MiB) stderr output drains continuously without deadlocking the child.
+        let mut big_cmd = Command::new("python3");
+        big_cmd.args([
+            "-c",
+            "import sys; sys.stderr.buffer.write(b'A'*1200000 + b'TAIL_END\\n'); sys.stderr.flush()",
+        ]);
+        let (mut big_transport, big_capture) = ChildTransport::spawn_observed(
+            big_cmd,
+            CleanupState::default(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+            MAX_RESPONSE_BYTES,
+            DEFAULT_STDERR_TAIL_BYTES,
+            budget.clone(),
+        )
+        .unwrap();
+        let big_capture = big_capture.expect("stderr capture enabled");
+        assert!(
+            timeout(Duration::from_secs(5), big_transport.wait_unreaped())
+                .await
+                .expect("noisy child must not deadlock on stderr pipe")
+                .unwrap()
+        );
+        let big_tail = big_capture
+            .snapshot_tail(Duration::from_millis(500))
+            .await
+            .unwrap();
+        assert!(big_tail.ends_with("TAIL_END\n"));
+        assert!(big_tail.len() <= MAX_STDERR_SNAPSHOT_BYTES);
+        big_capture.abort();
+        assert_eq!(budget.used(), 0);
+        big_transport.shutdown().await.unwrap();
+
+        // 3. Detached grandchild holding stderr open does not leak ByteLease after abort().
+        let mut grand_cmd = Command::new("sh");
+        grand_cmd.args(["-c", "printf 'parent_msg\\n' >&2; (sleep 30) &"]);
+        let (mut grand_transport, grand_capture) = ChildTransport::spawn_observed(
+            grand_cmd,
+            CleanupState::default(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+            MAX_RESPONSE_BYTES,
+            DEFAULT_STDERR_TAIL_BYTES,
+            budget.clone(),
+        )
+        .unwrap();
+        let grand_capture = grand_capture.expect("stderr capture enabled");
+        assert_eq!(budget.used(), DEFAULT_STDERR_TAIL_BYTES);
+        grand_capture.abort();
+        assert_eq!(budget.used(), 0);
+        grand_transport.shutdown().await.unwrap();
     }
 }

@@ -12,7 +12,7 @@ use mcpcli::{
     },
     ipc::{self, Failure, Operation},
     json as input,
-    mcp::{McpConnection, PollEventsParams},
+    mcp::{CallBudgets, McpConnection, PollEventsParams},
     media::{InflightBatch, MediaStore},
     runtime::{self, Paths},
     skills,
@@ -595,6 +595,12 @@ async fn remote(
         .servers
         .get(server)
         .ok_or_else(|| usage("unknown_server", format!("unknown server {server:?}")))?;
+    if !config.enabled() {
+        return Err(usage(
+            "server_disabled",
+            format!("server {server:?} is disabled"),
+        ));
+    }
     cli.validate_request_timeout()?;
     let budget = Duration::from_secs(cli.timeout_secs());
     let started = Instant::now();
@@ -625,8 +631,19 @@ async fn remote(
                     Operation::Call {
                         tool, arguments, ..
                     } => {
+                        let budgets = CallBudgets {
+                            pre_dispatch_deadline: started + budget,
+                            idle: budget,
+                            hard: None,
+                        };
                         connection
-                            .call_with_dispatch_leased(tool, arguments, remaining, uncertain)
+                            .call_with_dispatch_leased(
+                                tool,
+                                arguments,
+                                budgets,
+                                uncertain,
+                                tokio_util::sync::CancellationToken::new(),
+                            )
                             .await
                     }
                     Operation::EventsList { .. } => {
@@ -701,6 +718,9 @@ async fn remote(
                 }
             }
         };
+        if operation.is_call() {
+            return oneshot_fut.await;
+        }
         return timeout(budget + Duration::from_secs(10), oneshot_fut)
             .await
             .map_err(|_| {
@@ -734,12 +754,16 @@ async fn remote(
         let (operation, lease) = operation.into_parts();
         (lease, operation)
     };
-    let request = paths.request_with_explicit(
-        &loaded.digest,
-        operation,
-        remaining,
-        cli.has_explicit_timeout(),
-    )?;
+    let request = if operation.is_call() {
+        paths.request_call_with_budgets(&loaded.digest, operation, remaining, None)?
+    } else {
+        paths.request_with_explicit(
+            &loaded.digest,
+            operation,
+            remaining,
+            cli.has_explicit_timeout(),
+        )?
+    };
     let request = Leased::new(request, input_lease);
     let (response_lease, response) = runtime::exchange_tracked(&paths, &request, uncertain)
         .await
@@ -1371,65 +1395,92 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             }
             EventsCommand::Stream { .. } => unreachable!("handled by run_events_stream"),
         },
-        Command::Auth { command } => {
-            match command {
-                AuthCommand::Status { server } => {
-                    let (value, text) = auth::status(&loaded.config.servers, server.as_deref())?;
-                    Ok(Output::with_text(value, text))
-                }
-                AuthCommand::Login {
-                    server,
-                    scopes,
-                    client_id,
-                    no_browser,
-                } => {
-                    cli.validate_request_timeout()?;
-                    let cfg = loaded.config.servers.get(server).ok_or_else(|| {
-                        usage("unknown_server", format!("unknown server {server:?}"))
-                    })?;
-                    let ServerConfig::Http { url, .. } = cfg else {
-                        return Err(usage(
-                            "invalid_transport",
-                            format!(
-                                "server {server:?} uses stdio transport; OAuth applies only to http servers"
-                            ),
-                        ));
-                    };
-                    let budget = Duration::from_secs(cli.timeout_secs());
-                    let deadline = Instant::now() + budget;
-                    let (value, text) = auth::login(auth::LoginOptions {
-                        server_name: server,
-                        server_url: url,
-                        scopes,
-                        client_id: client_id.as_deref(),
-                        no_browser: *no_browser,
-                        budget,
-                    })
-                    .await?;
-                    notify_daemon_reset(cli, &loaded, server, deadline).await;
-                    Ok(Output::with_text(value, text))
-                }
-                AuthCommand::Logout { server } => {
-                    cli.validate_request_timeout()?;
-                    let cfg = loaded.config.servers.get(server).ok_or_else(|| {
-                        usage("unknown_server", format!("unknown server {server:?}"))
-                    })?;
-                    let ServerConfig::Http { url, .. } = cfg else {
-                        return Err(usage(
-                            "invalid_transport",
-                            format!(
-                                "server {server:?} uses stdio transport; OAuth applies only to http servers"
-                            ),
-                        ));
-                    };
-                    let budget = Duration::from_secs(cli.timeout_secs());
-                    let deadline = Instant::now() + budget;
-                    let (value, text) = auth::logout(server, url, budget).await?;
-                    notify_daemon_reset(cli, &loaded, server, deadline).await;
-                    Ok(Output::with_text(value, text))
-                }
+        Command::Auth { command } => match command {
+            AuthCommand::Status { server } => {
+                let (value, text) = auth::status(&loaded.config.servers, server.as_deref())?;
+                Ok(Output::with_text(value, text))
             }
-        }
+            AuthCommand::Login {
+                server,
+                scopes,
+                client_id,
+                no_browser,
+            } => {
+                cli.validate_request_timeout()?;
+                let cfg =
+                    loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                if !cfg.enabled() {
+                    return Err(usage(
+                        "server_disabled",
+                        format!("server {server:?} is disabled"),
+                    ));
+                }
+                let ServerConfig::Http { url, oauth, .. } = cfg else {
+                    return Err(usage(
+                        "invalid_transport",
+                        format!(
+                            "server {server:?} uses stdio transport; OAuth applies only to http servers"
+                        ),
+                    ));
+                };
+                let budget = Duration::from_secs(cli.timeout_secs());
+                let deadline = Instant::now() + budget;
+                let configured_scopes = oauth.as_ref().map_or(&[][..], |o| o.scopes.as_slice());
+                let (value, text) = auth::login(auth::LoginOptions {
+                    server_name: server,
+                    server_url: url,
+                    scopes,
+                    configured_scopes,
+                    client_id: client_id.as_deref(),
+                    configured_client_id: oauth.as_ref().and_then(|o| o.client_id.as_deref()),
+                    client_secret: oauth.as_ref().and_then(|o| o.client_secret.as_deref()),
+                    client_name: None,
+                    configured_client_name: oauth.as_ref().and_then(|o| o.client_name.as_deref()),
+                    callback_port: oauth.as_ref().and_then(|o| o.callback_port),
+                    callback_path: oauth.as_ref().and_then(|o| o.callback_path.as_deref()),
+                    auth_server_metadata_url: oauth
+                        .as_ref()
+                        .and_then(|o| o.auth_server_metadata_url.as_deref()),
+                    account: oauth.as_ref().and_then(|o| o.account.as_deref()),
+                    no_browser: *no_browser,
+                    budget,
+                })
+                .await?;
+                notify_daemon_reset(cli, &loaded, server, deadline).await;
+                Ok(Output::with_text(value, text))
+            }
+            AuthCommand::Logout { server } => {
+                cli.validate_request_timeout()?;
+                let cfg =
+                    loaded.config.servers.get(server).ok_or_else(|| {
+                        usage("unknown_server", format!("unknown server {server:?}"))
+                    })?;
+                let ServerConfig::Http {
+                    url,
+                    enabled,
+                    oauth,
+                    ..
+                } = cfg
+                else {
+                    return Err(usage(
+                        "invalid_transport",
+                        format!(
+                            "server {server:?} uses stdio transport; OAuth applies only to http servers"
+                        ),
+                    ));
+                };
+                let budget = Duration::from_secs(cli.timeout_secs());
+                let deadline = Instant::now() + budget;
+                let (value, text) =
+                    auth::logout(server, url, oauth.as_ref(), *enabled, budget).await?;
+                if *enabled {
+                    notify_daemon_reset(cli, &loaded, server, deadline).await;
+                }
+                Ok(Output::with_text(value, text))
+            }
+        },
         Command::Daemon { .. } => unreachable!(),
     }
 }

@@ -163,8 +163,38 @@ impl Paths {
             build: self.build.clone(),
             digest: digest.into(),
             timeout_ms,
+            max_timeout_ms: None,
             deadline_ms,
             explicit_deadline_ms: explicit_deadline.then_some(deadline_ms),
+            operation,
+        })
+    }
+    pub fn request_call_with_budgets(
+        &self,
+        digest: &str,
+        operation: Operation,
+        timeout: Duration,
+        max_timeout: Option<Duration>,
+    ) -> Result<Request> {
+        let timeout_ms = timeout.as_millis().min(3_600_000) as u64;
+        let now_ms = platform::monotonic_millis()?;
+        let (max_timeout_ms, deadline_ms, explicit_deadline_ms) = match max_timeout {
+            Some(max) => {
+                let max_ms = max.as_millis().min(86_400_000) as u64;
+                let deadline_ms = now_ms.saturating_add(max_ms);
+                (Some(max_ms), deadline_ms, Some(deadline_ms))
+            }
+            None => (None, now_ms.saturating_add(timeout_ms), None),
+        };
+        Ok(Request {
+            protocol: ipc::PROTOCOL,
+            namespace: self.namespace.clone(),
+            build: self.build.clone(),
+            digest: digest.into(),
+            timeout_ms,
+            max_timeout_ms,
+            deadline_ms,
+            explicit_deadline_ms,
             operation,
         })
     }
@@ -259,20 +289,32 @@ pub async fn exchange_tracked_with_options(
     budget: &Arc<ByteBudget>,
 ) -> Result<(Response, ByteLease)> {
     let is_call = request.operation.is_call();
+    let unbounded_call = is_call && request.max_timeout_ms.is_none();
     let now_ms = platform::monotonic_millis()?;
-    let remaining = request
+    let total_budget_cap_ms = if is_call {
+        request.max_timeout_ms.unwrap_or(request.timeout_ms)
+    } else {
+        request.timeout_ms
+    };
+    let remaining_total = request
         .deadline_ms
         .saturating_sub(now_ms)
-        .min(request.timeout_ms);
-    if remaining == 0 {
+        .min(total_budget_cap_ms);
+    let remaining_admission = remaining_total.min(request.timeout_ms);
+    if remaining_admission == 0 {
         return Err(
             Failure::new(5, "timeout", "request expired before connecting to daemon").into(),
         );
     }
     let started = Instant::now();
-    let exec_deadline = started + Duration::from_millis(remaining);
+    let admission_deadline = started + Duration::from_millis(remaining_admission);
+    let stage1b_deadline = if unbounded_call {
+        None
+    } else {
+        Some(started + Duration::from_millis(remaining_total))
+    };
     let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        started + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(request.timeout_ms))
+        started + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_budget_cap_ms))
     });
     if hard_deadline.is_some_and(|dl| Instant::now() >= dl) {
         return Err(
@@ -283,8 +325,8 @@ pub async fn exchange_tracked_with_options(
     let ignored = AtomicBool::new(false);
     let write_tracker = if is_call { dispatched } else { &ignored };
 
-    // Stage 1: connect, send request, and await validated 4-byte response header under operation budget.
-    let stage1 = async {
+    // Stage 1a: connect and write the request frame under the admission deadline.
+    let stage1a = async {
         let socket = if request.operation.management() {
             &paths.control_socket
         } else {
@@ -321,41 +363,42 @@ pub async fn exchange_tracked_with_options(
             &mut stream,
             &req_frame,
             idle_timeout,
-            Some(exec_deadline),
+            Some(admission_deadline),
             write_tracker,
         )
         .await?;
         drop(req_frame);
         drop(req_lease);
-        let len = ipc::read_frame_header(&mut stream, ipc::RESPONSE_LIMIT)
-            .await?
-            .context("daemon disconnected before returning a result")?;
-        Ok::<_, anyhow::Error>((stream, len))
+        Ok::<_, anyhow::Error>(stream)
     };
 
-    let (mut stream, response_len) = match timeout_at(exec_deadline, stage1).await {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(error)) if error.downcast_ref::<Failure>().is_some() => return Err(error),
-        Ok(Err(error)) => {
-            if let Some(io_err) = error.downcast_ref::<io::Error>()
-                && io_err.kind() == io::ErrorKind::TimedOut
-            {
-                return Err(Failure::new(
-                    5,
-                    "timeout",
-                    "daemon deadline exceeded; cancellation is not rollback",
-                )
-                .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-                .into());
-            }
-            return Err(Failure::new(
-                4,
-                "daemon_transport",
-                "daemon communication failed; tool calls are never replayed",
+    let map_stage1_err = |error: anyhow::Error| -> anyhow::Error {
+        if error.downcast_ref::<Failure>().is_some() {
+            return error;
+        }
+        if let Some(io_err) = error.downcast_ref::<io::Error>()
+            && io_err.kind() == io::ErrorKind::TimedOut
+        {
+            return Failure::new(
+                5,
+                "timeout",
+                "daemon deadline exceeded; cancellation is not rollback",
             )
             .uncertain(is_call && write_tracker.load(Ordering::Acquire))
-            .into());
+            .into();
         }
+        Failure::new(
+            4,
+            "daemon_transport",
+            "daemon communication failed; tool calls are never replayed",
+        )
+        .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+        .into()
+    };
+
+    let mut stream = match timeout_at(admission_deadline, stage1a).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return Err(map_stage1_err(error)),
         Err(_) => {
             return Err(Failure::new(
                 5,
@@ -365,6 +408,30 @@ pub async fn exchange_tracked_with_options(
             .uncertain(is_call && write_tracker.load(Ordering::Acquire))
             .into());
         }
+    };
+
+    // Stage 1b: await the 4-byte response frame header. Unbounded tool calls wait
+    // without a client-side wall-clock cap until the daemon replies, closes, or errors.
+    let read_header = async {
+        ipc::read_frame_header(&mut stream, ipc::RESPONSE_LIMIT)
+            .await?
+            .context("daemon disconnected before returning a result")
+    };
+    let response_len = match stage1b_deadline {
+        Some(deadline) => match timeout_at(deadline, read_header).await {
+            Ok(Ok(len)) => len,
+            Ok(Err(error)) => return Err(map_stage1_err(error)),
+            Err(_) => {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "daemon deadline exceeded; cancellation is not rollback",
+                )
+                .uncertain(is_call && write_tracker.load(Ordering::Acquire))
+                .into());
+            }
+        },
+        None => read_header.await.map_err(map_stage1_err)?,
     };
 
     // Stage 2: read validated response body using local 60s idle clock capped by explicit deadline.

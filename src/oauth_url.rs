@@ -115,6 +115,37 @@ pub fn validate_oauth_endpoint_url(
     }
 }
 
+/// Validate that `metadata_url` belongs to `issuer_url` per RFC 8414 §3.3 or OIDC Discovery 1.0.
+pub fn validate_metadata_url_for_issuer(
+    metadata_url: &reqwest::Url,
+    issuer_url: &reqwest::Url,
+) -> Result<()> {
+    if issuer_url.query().is_some() || issuer_url.fragment().is_some() {
+        bail!("authorization server issuer must not include query or fragment");
+    }
+    if metadata_url.scheme() != issuer_url.scheme()
+        || metadata_url.host_str() != issuer_url.host_str()
+        || metadata_url.port_or_known_default() != issuer_url.port_or_known_default()
+    {
+        bail!("authorization server metadata URL origin does not match issuer");
+    }
+    let issuer_path = issuer_url.path().trim_end_matches('/');
+    let metadata_path = metadata_url.path().trim_end_matches('/');
+    let expected_oauth = format!("/.well-known/oauth-authorization-server{issuer_path}");
+    let expected_oidc_prefix = format!("/.well-known/openid-configuration{issuer_path}");
+    let expected_oidc_suffix = format!("{issuer_path}/.well-known/openid-configuration");
+    if metadata_path == expected_oauth
+        || metadata_path == expected_oidc_prefix
+        || metadata_path == expected_oidc_suffix
+    {
+        Ok(())
+    } else {
+        bail!(
+            "authorization server metadata URL path does not match RFC 8414 or OpenID Connect discovery for issuer"
+        );
+    }
+}
+
 /// Validate a local OAuth callback path: leading `/`, printable ASCII without `?`, `#`,
 /// whitespace, or control characters, and at most 256 bytes.
 pub fn validate_callback_path(path: &str) -> Result<()> {
@@ -221,6 +252,94 @@ mod tests {
             &too_long,
         ] {
             assert!(validate_callback_path(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn validate_metadata_url_for_issuer_enforces_rfc8414_and_oidc_ownership() {
+        let valid_cases = [
+            (
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                "https://auth.example.com",
+            ),
+            (
+                "https://auth.example.com:443/.well-known/oauth-authorization-server/",
+                "https://auth.example.com/",
+            ),
+            (
+                "https://auth.example.com/.well-known/openid-configuration",
+                "https://auth.example.com",
+            ),
+            (
+                "https://auth.example.com/.well-known/oauth-authorization-server/tenant/v1",
+                "https://auth.example.com/tenant/v1",
+            ),
+            (
+                "https://auth.example.com/.well-known/openid-configuration/tenant/v1",
+                "https://auth.example.com/tenant/v1/",
+            ),
+            (
+                "https://auth.example.com/tenant/v1/.well-known/openid-configuration",
+                "https://auth.example.com/tenant/v1",
+            ),
+            (
+                "http://127.0.0.1:8080/realm/.well-known/openid-configuration",
+                "http://127.0.0.1:8080/realm/",
+            ),
+        ];
+        for (meta, issuer) in valid_cases {
+            let meta_url = reqwest::Url::parse(meta).unwrap();
+            let issuer_url = reqwest::Url::parse(issuer).unwrap();
+            assert!(
+                validate_metadata_url_for_issuer(&meta_url, &issuer_url).is_ok(),
+                "expected ok for meta={meta} issuer={issuer}"
+            );
+        }
+
+        let invalid_cases = [
+            // Cross-origin host, scheme, or port
+            (
+                "https://auth.example.com/.well-known/openid-configuration",
+                "https://other.example.com",
+            ),
+            (
+                "https://auth.example.com:8443/.well-known/openid-configuration",
+                "https://auth.example.com",
+            ),
+            (
+                "http://127.0.0.1:8080/.well-known/openid-configuration",
+                "https://127.0.0.1:8080",
+            ),
+            // Path mismatch
+            (
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                "https://auth.example.com/tenant",
+            ),
+            (
+                "https://auth.example.com/.well-known/oauth-authorization-server/other",
+                "https://auth.example.com/tenant",
+            ),
+            (
+                "https://auth.example.com/tenant/.well-known/oauth-authorization-server",
+                "https://auth.example.com/tenant",
+            ),
+            (
+                "https://auth.example.com/custom/metadata.json",
+                "https://auth.example.com",
+            ),
+            // Query in issuer
+            (
+                "https://auth.example.com/.well-known/openid-configuration",
+                "https://auth.example.com?foo=bar",
+            ),
+        ];
+        for (meta, issuer) in invalid_cases {
+            let meta_url = reqwest::Url::parse(meta).unwrap();
+            let issuer_url = reqwest::Url::parse(issuer).unwrap();
+            assert!(
+                validate_metadata_url_for_issuer(&meta_url, &issuer_url).is_err(),
+                "expected err for meta={meta} issuer={issuer}"
+            );
         }
     }
 }

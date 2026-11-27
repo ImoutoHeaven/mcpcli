@@ -2,7 +2,7 @@ use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 use crate::config::LoadedConfig;
 use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
 use crate::mcp::{
-    FailureKind, MAX_CONNECT, McpConnection, McpEventsClient, McpFailure, McpLimits,
+    CallBudgets, FailureKind, MAX_CONNECT, McpConnection, McpEventsClient, McpFailure, McpLimits,
     PollEventsParams, StreamEventsParams,
 };
 use crate::media::{InflightBatch, MediaStore};
@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use tokio::time::{Instant, timeout};
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::sync::CancellationToken;
 
 const MAX_CONNECTIONS: usize = 32;
@@ -80,12 +80,40 @@ impl Default for ServerState {
     }
 }
 
+type CallCancelSlot = Arc<std::sync::Mutex<Option<CancellationToken>>>;
+
+struct CallCancelRegistration {
+    slot: CallCancelSlot,
+}
+
+impl CallCancelRegistration {
+    fn register(slot: &CallCancelSlot) -> (Self, CancellationToken) {
+        let token = CancellationToken::new();
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(token.clone());
+        (Self { slot: slot.clone() }, token)
+    }
+}
+
+impl Drop for CallCancelRegistration {
+    fn drop(&mut self) {
+        *self.slot.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ExecuteDeadlines {
+    pre_dispatch: Instant,
+    call_idle: Duration,
+    call_hard: Option<Instant>,
+}
+
 struct App {
     paths: Paths,
     config: LoadedConfig,
     state: State,
     options: DaemonOptions,
     servers: BTreeMap<String, Arc<Mutex<ServerState>>>,
+    call_cancels: BTreeMap<String, CallCancelSlot>,
     work: Semaphore,
     event_streams: Semaphore,
     shutdown: CancellationToken,
@@ -99,6 +127,7 @@ pub fn mcp_error_for_server(error: anyhow::Error, calling: bool, server: Option<
     if let Ok(error) = error.downcast::<McpFailure>() {
         let (code, kind) = match error.kind {
             FailureKind::Timeout => (5, "timeout"),
+            FailureKind::Cancelled => (4, "cancelled"),
             FailureKind::Protocol => (4, "mcp_protocol"),
             FailureKind::Transport => (4, "mcp_transport"),
             FailureKind::AuthRequired => (4, "auth_required"),
@@ -115,8 +144,15 @@ pub fn mcp_error_for_server(error: anyhow::Error, calling: bool, server: Option<
         };
         let mut failure = Failure::new(code, kind, message).uncertain(error.outcome_unknown);
         failure.rpc_error = error.rpc_error;
-        if let Some(auth) = &error.auth {
-            failure.data = Some(auth.to_data_value(server));
+        let mut data_map = match error.auth.as_ref().map(|auth| auth.to_data_value(server)) {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        if let Some(stderr_tail) = error.stderr_tail {
+            data_map.insert("stderr_tail".into(), Value::String(stderr_tail));
+        }
+        if !data_map.is_empty() {
+            failure.data = Some(Value::Object(data_map));
         }
         failure.lease = error.lease;
         failure
@@ -147,20 +183,30 @@ impl App {
             .servers
             .iter()
             .map(|(name, state)| {
-                let value = match state.try_lock() {
-                    Ok(state) => json!({
-                        "state": if state.lost {
-                            "lost"
-                        } else {
-                            match &state.connection {
-                                Some(c) if c.is_closed() => "lost",
-                                Some(_) => "connected",
-                                None => "lazy",
-                            }
-                        },
-                        "calls": state.calls
-                    }),
-                    Err(_) => json!({"state": "busy"}),
+                let value = if self
+                    .config
+                    .config
+                    .servers
+                    .get(name)
+                    .is_some_and(|cfg| !cfg.enabled())
+                {
+                    json!({"state": "disabled", "calls": 0})
+                } else {
+                    match state.try_lock() {
+                        Ok(state) => json!({
+                            "state": if state.lost {
+                                "lost"
+                            } else {
+                                match &state.connection {
+                                    Some(c) if c.is_closed() => "lost",
+                                    Some(_) => "connected",
+                                    None => "lazy",
+                                }
+                            },
+                            "calls": state.calls
+                        }),
+                        Err(_) => json!({"state": "busy"}),
+                    }
                 };
                 (name.clone(), value)
             })
@@ -193,6 +239,38 @@ impl App {
                 2,
                 "invalid_timeout",
                 "timeout must be between 1ms and one hour",
+            ));
+        }
+        if let Some(max_timeout_ms) = request.max_timeout_ms {
+            if !request.operation.is_call() {
+                return Err(Failure::new(
+                    2,
+                    "invalid_timeout",
+                    "max_timeout_ms is only valid for tool calls",
+                ));
+            }
+            if max_timeout_ms < request.timeout_ms || max_timeout_ms > 86_400_000 {
+                return Err(Failure::new(
+                    2,
+                    "invalid_timeout",
+                    "max_timeout_ms must be between timeout_ms and 24 hours",
+                ));
+            }
+        }
+        if let Operation::Server { server }
+        | Operation::Tools { server }
+        | Operation::Call { server, .. }
+        | Operation::Reset { server, .. }
+        | Operation::EventsList { server }
+        | Operation::EventsPoll { server, .. }
+        | Operation::EventsStream { server, .. } = &request.operation
+            && let Some(cfg) = self.config.config.servers.get(server)
+            && !cfg.enabled()
+        {
+            return Err(Failure::new(
+                2,
+                "server_disabled",
+                format!("server {server:?} is disabled"),
             ));
         }
         if let Operation::Call {
@@ -339,9 +417,10 @@ impl App {
     async fn execute(
         &self,
         operation: &Operation,
-        deadline: Instant,
+        deadlines: ExecuteDeadlines,
         dispatched: &AtomicBool,
     ) -> ExecutionOutcome {
+        let deadline = deadlines.pre_dispatch;
         let empty = || self.options.budget.empty_lease();
         match operation {
             Operation::Status => return Ok((self.status(), empty(), None)),
@@ -423,12 +502,61 @@ impl App {
         let state = self.servers.get(server).ok_or_else(|| {
             Failure::new(2, "unknown_server", format!("unknown server {server:?}"))
         })?;
-        let mut state = state.lock().await;
-        let _work = self
-            .work
-            .acquire()
-            .await
-            .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))?;
+        if matches!(operation, Operation::Reset { force: true, .. })
+            && let Some(slot) = self.call_cancels.get(server)
+            && let Some(token) = slot.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        {
+            token.cancel();
+        }
+        let mut state = match timeout_at(deadline, state.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "request deadline exceeded while queued",
+                ));
+            }
+        };
+        let _call_cancel_reg;
+        let call_cancel = if operation.is_call() {
+            let (reg, token) = CallCancelRegistration::register(&self.call_cancels[server]);
+            _call_cancel_reg = Some(reg);
+            Some(token)
+        } else {
+            _call_cancel_reg = None;
+            None
+        };
+        let _work = match timeout_at(deadline, async {
+            if let Some(cancel) = &call_cancel {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(Failure::new(
+                        4,
+                        "cancelled",
+                        "MCP call cancelled while queued",
+                    )),
+                    res = self.work.acquire() => res.map_err(|_| Failure::new(1, "stopping", "daemon is stopping")),
+                }
+            } else {
+                self.work
+                    .acquire()
+                    .await
+                    .map_err(|_| Failure::new(1, "stopping", "daemon is stopping"))
+            }
+        })
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(failure)) => return Err(failure),
+            Err(_) => {
+                return Err(Failure::new(
+                    5,
+                    "timeout",
+                    "request deadline exceeded while queued",
+                ));
+            }
+        };
         if Instant::now() >= deadline {
             return Err(Failure::new(
                 5,
@@ -500,11 +628,26 @@ impl App {
                 ));
             }
             let config = &self.config.config.servers[server];
-            state.connection = Some(
-                McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone())
+            let connect =
+                McpConnection::connect_with_limits(config, budget, self.options.mcp_limits.clone());
+            let connection = if let Some(cancel) = &call_cancel {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {
+                        return Err(Failure::new(
+                            4,
+                            "cancelled",
+                            "MCP call cancelled before connection completed",
+                        ));
+                    }
+                    res = connect => res.map_err(|e| mcp_error_for_server(e, false, Some(server)))?,
+                }
+            } else {
+                connect
                     .await
-                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))?,
-            );
+                    .map_err(|e| mcp_error_for_server(e, false, Some(server)))?
+            };
+            state.connection = Some(connection);
         }
         let budget = deadline.saturating_duration_since(Instant::now());
         if budget.is_zero() {
@@ -556,8 +699,24 @@ impl App {
                 inline_media,
                 ..
             } => {
+                let remaining_hard = deadlines
+                    .call_hard
+                    .map(|hard| hard.saturating_duration_since(Instant::now()));
+                if remaining_hard.is_some_and(|d| d.is_zero()) {
+                    return Err(Failure::new(
+                        5,
+                        "timeout",
+                        "request deadline exceeded before dispatch",
+                    ));
+                }
+                let budgets = CallBudgets {
+                    pre_dispatch_deadline: deadline,
+                    idle: deadlines.call_idle,
+                    hard: remaining_hard,
+                };
+                let cancel = call_cancel.expect("call cancellation token registered");
                 let result = connection
-                    .call_with_dispatch_leased(tool, arguments, budget, dispatched)
+                    .call_with_dispatch_leased(tool, arguments, budgets, dispatched, cancel)
                     .await;
                 let closed = connection.is_closed();
                 if closed {
@@ -970,11 +1129,16 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         Ok(now) => now,
         Err(_) => return,
     };
-    let remaining = request
-        .deadline_ms
-        .saturating_sub(now_ms)
-        .min(request.timeout_ms);
-    if remaining == 0 {
+    let is_call = request.operation.is_call();
+    let unbounded_call = is_call && request.max_timeout_ms.is_none();
+    let total_cap_ms = if is_call {
+        request.max_timeout_ms.unwrap_or(request.timeout_ms)
+    } else {
+        request.timeout_ms
+    };
+    let remaining_total = request.deadline_ms.saturating_sub(now_ms).min(total_cap_ms);
+    let remaining_admission = remaining_total.min(request.timeout_ms);
+    if remaining_admission == 0 {
         send(
             &mut stream,
             &app,
@@ -991,7 +1155,7 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
     }
     let admitted = Instant::now();
     let hard_deadline = request.explicit_deadline_ms.map(|exp_ms| {
-        admitted + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(request.timeout_ms))
+        admitted + Duration::from_millis(exp_ms.saturating_sub(now_ms).min(total_cap_ms))
     });
     if matches!(request.operation, Operation::Stop) {
         send(
@@ -1009,24 +1173,46 @@ async fn handle(mut stream: Conn, app: Arc<App>, control: bool, conn_permit: Own
         app.shutdown.cancel();
         return;
     }
-    let deadline = admitted + Duration::from_millis(remaining);
-    let dispatched = AtomicBool::new(false);
-    let execute = timeout(
-        Duration::from_millis(remaining),
-        app.execute(&request.operation, deadline, &dispatched),
-    );
-    let mut extra = [0u8; 1];
-    let result = tokio::select! {
-        biased;
-        _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
-            .uncertain(dispatched.load(Ordering::Acquire))),
-        // One request per connection; EOF or extra input abandons the in-flight operation.
-        _ = stream.read(&mut extra) => return,
-        result = execute => match result {
-            Ok(result)=>result,
-            Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
-                .uncertain(dispatched.load(Ordering::Acquire))),
+    let deadlines = ExecuteDeadlines {
+        pre_dispatch: admitted + Duration::from_millis(remaining_admission),
+        call_idle: Duration::from_millis(request.timeout_ms),
+        call_hard: if is_call {
+            request
+                .max_timeout_ms
+                .map(|_| admitted + Duration::from_millis(remaining_total))
+        } else {
+            None
         },
+    };
+    let dispatched = AtomicBool::new(false);
+    let mut extra = [0u8; 1];
+    let result = if unbounded_call {
+        let execute = app.execute(&request.operation, deadlines, &dispatched);
+        tokio::select! {
+            biased;
+            _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
+                .uncertain(dispatched.load(Ordering::Acquire))),
+            // One request per connection; EOF or extra input abandons the in-flight operation.
+            _ = stream.read(&mut extra) => return,
+            result = execute => result,
+        }
+    } else {
+        let execute = timeout(
+            Duration::from_millis(remaining_total),
+            app.execute(&request.operation, deadlines, &dispatched),
+        );
+        tokio::select! {
+            biased;
+            _ = app.shutdown.cancelled() => Err(Failure::new(4,"stopping","daemon is stopping; interrupted calls are not replayed")
+                .uncertain(dispatched.load(Ordering::Acquire))),
+            // One request per connection; EOF or extra input abandons the in-flight operation.
+            _ = stream.read(&mut extra) => return,
+            result = execute => match result {
+                Ok(result)=>result,
+                Err(_)=>Err(Failure::new(5,"timeout","request deadline exceeded, including queue and connection time; cancellation is not rollback")
+                    .uncertain(dispatched.load(Ordering::Acquire))),
+            },
+        }
     };
     let send_deadline = hard_deadline.filter(|_| result.is_ok());
     send(
@@ -1064,12 +1250,19 @@ pub async fn run_with_options(
         .keys()
         .map(|name| (name.clone(), Arc::new(Mutex::new(ServerState::default()))))
         .collect();
+    let call_cancels = config
+        .config
+        .servers
+        .keys()
+        .map(|name| (name.clone(), Arc::new(std::sync::Mutex::new(None))))
+        .collect();
     let app = Arc::new(App {
         paths: paths.clone(),
         config,
         state: state.clone(),
         options,
         servers,
+        call_cancels,
         work: Semaphore::new(MAX_IN_FLIGHT),
         event_streams: Semaphore::new(MAX_EVENT_STREAMS),
         shutdown: CancellationToken::new(),
@@ -1495,11 +1688,17 @@ mod tests {
             state: State::fresh(),
             options: DaemonOptions::default(),
             servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
+            call_cancels: BTreeMap::from([("srv".into(), Arc::new(std::sync::Mutex::new(None)))]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
             shutdown: CancellationToken::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
+        let deadlines = ExecuteDeadlines {
+            pre_dispatch: deadline,
+            call_idle: Duration::from_secs(10),
+            call_hard: None,
+        };
         app.ensure_events_client("srv", deadline).await.unwrap();
         let state = app.servers["srv"].lock().await;
         let running = app.work.acquire().await.unwrap();
@@ -1507,7 +1706,7 @@ mod tests {
             server: "srv".into(),
         };
         let dispatched = AtomicBool::new(false);
-        let mut ordinary = Box::pin(app.execute(&operation, deadline, &dispatched));
+        let mut ordinary = Box::pin(app.execute(&operation, deadlines, &dispatched));
         assert!(futures_util::poll!(ordinary.as_mut()).is_pending());
         let operations: Vec<_> = (0..MAX_IN_FLIGHT)
             .map(|_| Operation::EventsList {
@@ -1516,7 +1715,7 @@ mod tests {
             .collect();
         let mut events: Vec<_> = operations
             .iter()
-            .map(|op| Box::pin(app.execute(op, deadline, &dispatched)))
+            .map(|op| Box::pin(app.execute(op, deadlines, &dispatched)))
             .collect();
         for event in &mut events {
             assert!(futures_util::poll!(event.as_mut()).is_pending());
@@ -1668,11 +1867,17 @@ mod tests {
             state: State::fresh(),
             options: DaemonOptions::default(),
             servers: BTreeMap::from([("srv".into(), Arc::new(Mutex::new(ServerState::default())))]),
+            call_cancels: BTreeMap::from([("srv".into(), Arc::new(std::sync::Mutex::new(None)))]),
             work: Semaphore::new(MAX_IN_FLIGHT),
             event_streams: Semaphore::new(MAX_EVENT_STREAMS),
             shutdown: CancellationToken::new(),
         };
         let deadline = Instant::now() + Duration::from_secs(10);
+        let deadlines = ExecuteDeadlines {
+            pre_dispatch: deadline,
+            call_idle: Duration::from_secs(10),
+            call_hard: None,
+        };
         let (_, stream_cancel) = app.ensure_events_client("srv", deadline).await.unwrap();
         assert!(!stream_cancel.is_cancelled());
 
@@ -1682,7 +1887,7 @@ mod tests {
                 &Operation::Tools {
                     server: "srv".into(),
                 },
-                deadline,
+                deadlines,
                 &dispatched,
             )
             .await
@@ -1698,7 +1903,7 @@ mod tests {
                 &Operation::Server {
                     server: "srv".into(),
                 },
-                deadline,
+                deadlines,
                 &dispatched,
             )
             .await
@@ -1707,5 +1912,598 @@ mod tests {
         assert_eq!(next_err.code, 6);
         assert_eq!(next_err.kind, "session_lost");
         srv.abort();
+    }
+
+    #[test]
+    fn validate_enforces_max_timeout_ms_bounds_and_call_only() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(&cfg_path, r#"{"servers":{}}"#).unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "valtest", &base_path.join("run")).unwrap();
+        let app = App {
+            paths: paths.clone(),
+            config: config.clone(),
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::new(),
+            call_cancels: BTreeMap::new(),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            shutdown: CancellationToken::new(),
+        };
+
+        // max_timeout_ms on non-Call operation is rejected.
+        let mut req = paths
+            .request(
+                &config.digest,
+                Operation::Tools {
+                    server: "srv".into(),
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        req.max_timeout_ms = Some(10_000);
+        let err = app.validate(&req).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid_timeout");
+
+        // max_timeout_ms < timeout_ms is rejected.
+        let mut call_req = paths
+            .request_call_with_budgets(
+                &config.digest,
+                Operation::Call {
+                    server: "srv".into(),
+                    tool: "t".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_secs(10),
+                Some(Duration::from_secs(5)),
+            )
+            .unwrap();
+        let err = app.validate(&call_req).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid_timeout");
+
+        // max_timeout_ms > 86_400_000 is rejected.
+        call_req.max_timeout_ms = Some(86_400_001);
+        let err = app.validate(&call_req).unwrap_err();
+        assert_eq!(err.code, 2);
+        assert_eq!(err.kind, "invalid_timeout");
+
+        // Valid bounds succeed.
+        call_req.max_timeout_ms = Some(10_000);
+        app.validate(&call_req).unwrap();
+        call_req.max_timeout_ms = Some(86_400_000);
+        app.validate(&call_req).unwrap();
+    }
+
+    #[test]
+    fn mcp_error_maps_cancelled_and_merges_auth_and_stderr_tail() {
+        let cancelled = McpFailure {
+            kind: FailureKind::Cancelled,
+            message: "MCP call cancelled".into(),
+            outcome_unknown: true,
+            rpc_error: None,
+            auth: None,
+            stderr_tail: None,
+            lease: None,
+        };
+        let failure = mcp_error_for_server(cancelled.into(), true, Some("srv"));
+        assert_eq!(failure.code, 4);
+        assert_eq!(failure.kind, "cancelled");
+        assert!(failure.outcome_unknown);
+        assert!(failure.data.is_none());
+
+        let auth = crate::auth::AuthChallengeInfo::from_response(
+            http::StatusCode::UNAUTHORIZED,
+            &http::HeaderMap::new(),
+        );
+        let combined = McpFailure {
+            kind: FailureKind::AuthRequired,
+            message: "auth required".into(),
+            outcome_unknown: false,
+            rpc_error: None,
+            auth: Some(auth),
+            stderr_tail: Some("trace line\n".into()),
+            lease: None,
+        };
+        let failure = mcp_error_for_server(combined.into(), false, Some("srv"));
+        let data = failure.data.expect("merged data object");
+        assert_eq!(data["status"], 401);
+        assert_eq!(data["stderr_tail"], "trace line\n");
+    }
+
+    async fn start_mock_progress_http_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/mcp");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = socket.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    let mut content_len = 0usize;
+                    let mut is_delete = false;
+                    let mut line = String::new();
+                    let mut first = true;
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        if first {
+                            is_delete = line.starts_with("DELETE ");
+                            first = false;
+                        }
+                        if line == "\r\n" || line == "\n" {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    if is_delete {
+                        let _ = write_half
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                            .await;
+                        return;
+                    }
+                    let mut body = vec![0u8; content_len];
+                    if reader.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    let Ok(req) = serde_json::from_slice::<Value>(&body) else {
+                        return;
+                    };
+                    let id = req.get("id").cloned().unwrap_or(json!(1));
+                    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                    match method {
+                        "server/discover" => {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "resultType": "complete",
+                                    "supportedVersions": ["2026-07-28"],
+                                    "capabilities": { "tools": {} },
+                                    "ttlMs": 60000,
+                                    "cacheScope": "public",
+                                    "_meta": {
+                                        "io.modelcontextprotocol/serverInfo": {
+                                            "name": "mock-progress",
+                                            "version": "1.0"
+                                        }
+                                    }
+                                }
+                            });
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let _ = write_half.write_all(&payload).await;
+                        }
+                        "tools/list" => {
+                            let resp = json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "tools": [
+                                        { "name": "progress_ok", "inputSchema": { "type": "object" } },
+                                        { "name": "progress_silent", "inputSchema": { "type": "object" } },
+                                        { "name": "progress_forever", "inputSchema": { "type": "object" } }
+                                    ]
+                                }
+                            });
+                            let payload = serde_json::to_vec(&resp).unwrap();
+                            let header = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            let _ = write_half.write_all(&payload).await;
+                        }
+                        "tools/call" => {
+                            let tool = req["params"]["name"].as_str().unwrap_or("");
+                            let token = req["params"]["_meta"]["progressToken"].clone();
+                            let header = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                            match tool {
+                                "progress_ok" => {
+                                    for step in 1..=6 {
+                                        tokio::time::sleep(Duration::from_millis(220)).await;
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": {
+                                                "progressToken": token,
+                                                "progress": step,
+                                                "total": 6
+                                            }
+                                        });
+                                        let sse = format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&notif).unwrap()
+                                        );
+                                        if write_half.write_all(sse.as_bytes()).await.is_err() {
+                                            return;
+                                        }
+                                        let _ = write_half.flush().await;
+                                    }
+                                    let done = json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": {
+                                            "content": [{ "type": "text", "text": "completed" }]
+                                        }
+                                    });
+                                    let sse = format!(
+                                        "data: {}\n\n",
+                                        serde_json::to_string(&done).unwrap()
+                                    );
+                                    let _ = write_half.write_all(sse.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                }
+                                "progress_silent" => {
+                                    tokio::time::sleep(Duration::from_millis(150)).await;
+                                    let notif = json!({
+                                        "jsonrpc": "2.0",
+                                        "method": "notifications/progress",
+                                        "params": {
+                                            "progressToken": token,
+                                            "progress": 1
+                                        }
+                                    });
+                                    let sse = format!(
+                                        "data: {}\n\n",
+                                        serde_json::to_string(&notif).unwrap()
+                                    );
+                                    let _ = write_half.write_all(sse.as_bytes()).await;
+                                    let _ = write_half.flush().await;
+                                    tokio::time::sleep(Duration::from_secs(5)).await;
+                                }
+                                "progress_forever" => {
+                                    for step in 1..=30 {
+                                        tokio::time::sleep(Duration::from_millis(200)).await;
+                                        let notif = json!({
+                                            "jsonrpc": "2.0",
+                                            "method": "notifications/progress",
+                                            "params": {
+                                                "progressToken": token,
+                                                "progress": step
+                                            }
+                                        });
+                                        let sse = format!(
+                                            "data: {}\n\n",
+                                            serde_json::to_string(&notif).unwrap()
+                                        );
+                                        if write_half.write_all(sse.as_bytes()).await.is_err() {
+                                            return;
+                                        }
+                                        let _ = write_half.flush().await;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {
+                            let header = "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                            let _ = write_half.write_all(header.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn dual_clock_call_progress_timeout_queue_timeout_and_force_reset() {
+        let (url, server_task) = start_mock_progress_http_server().await;
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_string(&json!({
+                "servers": {
+                    "mock": {
+                        "transport": "http",
+                        "url": url
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&cfg_path).unwrap();
+        let root = base_path.join("runtime");
+        let paths = Paths::with_root(loaded.path.clone(), "dualclk", &root).unwrap();
+
+        let daemon_paths = paths.clone();
+        let daemon_loaded = loaded.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_with_options(daemon_paths, daemon_loaded, DaemonOptions::default()).await
+        });
+
+        for _ in 0..80 {
+            if paths.running().unwrap_or(false)
+                && runtime::exchange(
+                    &paths,
+                    &paths
+                        .request("", Operation::Status, Duration::from_millis(200))
+                        .unwrap(),
+                )
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // 1. Unbounded Call (max_timeout_ms: None) runs past idle timeout (600ms) to ~1.3s when progress arrives.
+        let req_ok = paths
+            .request_call_with_budgets(
+                &loaded.digest,
+                Operation::Call {
+                    server: "mock".into(),
+                    tool: "progress_ok".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_millis(600),
+                None,
+            )
+            .unwrap();
+        let (resp_ok, _) = runtime::exchange(&paths, &req_ok).await.unwrap();
+        let val = resp_ok.result.unwrap();
+        assert_eq!(
+            val["result"]["content"][0]["text"], "completed",
+            "got: {val}"
+        );
+
+        // 2. Silent tool times out at ~500ms with exit 5 and outcome_unknown = true.
+        let started = Instant::now();
+        let req_silent = paths
+            .request_call_with_budgets(
+                &loaded.digest,
+                Operation::Call {
+                    server: "mock".into(),
+                    tool: "progress_silent".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_millis(500),
+                None,
+            )
+            .unwrap();
+        let err_silent = runtime::exchange(&paths, &req_silent).await.unwrap_err();
+        let fail_silent = err_silent.downcast_ref::<Failure>().unwrap();
+        assert_eq!(fail_silent.code, 5);
+        assert_eq!(fail_silent.kind, "timeout");
+        assert!(fail_silent.outcome_unknown);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 3. Explicit max_timeout_ms caps a continuously progressing tool at ~900ms.
+        let started = Instant::now();
+        let req_capped = paths
+            .request_call_with_budgets(
+                &loaded.digest,
+                Operation::Call {
+                    server: "mock".into(),
+                    tool: "progress_forever".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_millis(500),
+                Some(Duration::from_millis(900)),
+            )
+            .unwrap();
+        let err_capped = runtime::exchange(&paths, &req_capped).await.unwrap_err();
+        let fail_capped = err_capped.downcast_ref::<Failure>().unwrap();
+        assert_eq!(fail_capped.code, 5);
+        assert_eq!(fail_capped.kind, "timeout");
+        assert!(fail_capped.outcome_unknown);
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        // 4. Queued Call times out promptly instead of hanging behind a long unbounded Call,
+        //    and reset --force interrupts the in-flight long Call immediately.
+        let long_paths = paths.clone();
+        let long_digest = loaded.digest.clone();
+        let long_call = tokio::spawn(async move {
+            let req = long_paths
+                .request_call_with_budgets(
+                    &long_digest,
+                    Operation::Call {
+                        server: "mock".into(),
+                        tool: "progress_forever".into(),
+                        arguments: serde_json::Map::new(),
+                        inline_media: false,
+                    },
+                    Duration::from_millis(800),
+                    None,
+                )
+                .unwrap();
+            runtime::exchange(&long_paths, &req).await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let q_started = Instant::now();
+        let req_queued = paths
+            .request_call_with_budgets(
+                &loaded.digest,
+                Operation::Call {
+                    server: "mock".into(),
+                    tool: "progress_ok".into(),
+                    arguments: serde_json::Map::new(),
+                    inline_media: false,
+                },
+                Duration::from_millis(350),
+                None,
+            )
+            .unwrap();
+        let err_queued = runtime::exchange(&paths, &req_queued).await.unwrap_err();
+        let fail_queued = err_queued.downcast_ref::<Failure>().unwrap();
+        assert_eq!(fail_queued.code, 5);
+        assert_eq!(fail_queued.kind, "timeout");
+        assert!(!fail_queued.outcome_unknown);
+        assert!(fail_queued.message.contains("queued"));
+        assert!(q_started.elapsed() < Duration::from_secs(2));
+
+        let r_started = Instant::now();
+        let req_reset = paths
+            .request(
+                &loaded.digest,
+                Operation::Reset {
+                    server: "mock".into(),
+                    force: true,
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        let (reset_resp, _) = runtime::exchange(&paths, &req_reset).await.unwrap();
+        assert_eq!(reset_resp.result.unwrap()["reset"], true);
+        assert!(r_started.elapsed() < Duration::from_secs(2));
+
+        let long_err = long_call.await.unwrap().unwrap_err();
+        let long_fail = long_err.downcast_ref::<Failure>().unwrap();
+        assert_eq!(long_fail.code, 4);
+        assert_eq!(long_fail.kind, "cancelled");
+        assert!(long_fail.outcome_unknown);
+
+        let _ = runtime::stop(&paths).await;
+        let _ = daemon_task.await;
+        server_task.abort();
+    }
+
+    #[test]
+    fn disabled_server_reports_disabled_status_and_fails_validate() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let cfg_path = base_path.join("mcpcli.json");
+        std::fs::write(
+            &cfg_path,
+            serde_json::to_vec(&json!({
+                "servers": {
+                    "on": {"transport": "http", "url": "http://127.0.0.1:9001/mcp"},
+                    "off": {"transport": "http", "url": "http://127.0.0.1:9002/mcp", "enabled": false}
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let config = LoadedConfig::load(&cfg_path).unwrap();
+        let paths =
+            Paths::with_root(config.path.clone(), "disabled", &base_path.join("run")).unwrap();
+        let app = App {
+            paths,
+            config,
+            state: State::fresh(),
+            options: DaemonOptions::default(),
+            servers: BTreeMap::from([
+                ("on".into(), Arc::new(Mutex::new(ServerState::default()))),
+                ("off".into(), Arc::new(Mutex::new(ServerState::default()))),
+            ]),
+            call_cancels: BTreeMap::from([
+                ("on".into(), Arc::new(std::sync::Mutex::new(None))),
+                ("off".into(), Arc::new(std::sync::Mutex::new(None))),
+            ]),
+            work: Semaphore::new(MAX_IN_FLIGHT),
+            event_streams: Semaphore::new(MAX_EVENT_STREAMS),
+            shutdown: CancellationToken::new(),
+        };
+
+        let status = app.status();
+        assert_eq!(status["servers"]["on"]["state"], "lazy");
+        assert_eq!(status["servers"]["off"]["state"], "disabled");
+
+        let ops = [
+            Operation::Server {
+                server: "off".into(),
+            },
+            Operation::Tools {
+                server: "off".into(),
+            },
+            Operation::Call {
+                server: "off".into(),
+                tool: "ping".into(),
+                arguments: serde_json::Map::new(),
+                inline_media: false,
+            },
+            Operation::Reset {
+                server: "off".into(),
+                force: false,
+            },
+            Operation::EventsList {
+                server: "off".into(),
+            },
+            Operation::EventsPoll {
+                server: "off".into(),
+                event: "tick".into(),
+                arguments: None,
+                cursor: None,
+                max_age_ms: None,
+                max_events: None,
+            },
+            Operation::EventsStream {
+                server: "off".into(),
+                event: "tick".into(),
+                arguments: None,
+                cursor: None,
+                max_age_ms: None,
+                heartbeat_ms: None,
+            },
+        ];
+        for op in ops {
+            let req = Request {
+                protocol: ipc::PROTOCOL,
+                namespace: app.paths.namespace.clone(),
+                build: app.paths.build.clone(),
+                digest: app.config.digest.clone(),
+                timeout_ms: 5_000,
+                max_timeout_ms: None,
+                deadline_ms: 5_000,
+                explicit_deadline_ms: None,
+                operation: op,
+            };
+            let err = app.validate(&req).unwrap_err();
+            assert_eq!(err.code, 2);
+            assert_eq!(err.kind, "server_disabled");
+        }
+
+        let enabled_req = Request {
+            protocol: ipc::PROTOCOL,
+            namespace: app.paths.namespace.clone(),
+            build: app.paths.build.clone(),
+            digest: app.config.digest.clone(),
+            timeout_ms: 5_000,
+            max_timeout_ms: None,
+            deadline_ms: 5_000,
+            explicit_deadline_ms: None,
+            operation: Operation::Tools {
+                server: "on".into(),
+            },
+        };
+        assert!(app.validate(&enabled_req).is_ok());
     }
 }

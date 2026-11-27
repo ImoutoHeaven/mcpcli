@@ -533,6 +533,7 @@ mod tests {
             build: "test".into(),
             digest: "test".into(),
             timeout_ms: 1000,
+            max_timeout_ms: None,
             deadline_ms: 1000,
             explicit_deadline_ms: None,
             operation: crate::ipc::Operation::Call {
@@ -577,6 +578,7 @@ mod tests {
                 build: "test".into(),
                 digest: "test".into(),
                 timeout_ms: 1000,
+                max_timeout_ms: None,
                 deadline_ms: 1000,
                 explicit_deadline_ms: None,
                 operation: crate::ipc::Operation::Call {

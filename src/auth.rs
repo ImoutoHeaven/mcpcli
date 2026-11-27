@@ -1,12 +1,12 @@
 //! OAuth 2.1 PKCE client flow, RFC 9728/8414 discovery, `WWW-Authenticate` diagnostics,
 //! private credential persistence, and singleflight refresh rotation.
 use crate::{
-    config::ServerConfig,
+    config::{OAuthConfig, ServerConfig, validate_client_name},
     discovery::safe_text,
     ipc::Failure,
     oauth_url::{
         is_disallowed_remote_oauth_ip, is_loopback_literal_host, parse_url_host_ip,
-        validate_oauth_endpoint_url,
+        validate_callback_path, validate_metadata_url_for_issuer, validate_oauth_endpoint_url,
     },
     platform,
     runtime::Lock,
@@ -55,6 +55,8 @@ pub struct StoredCredential {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revocation_endpoint: Option<String>,
     pub client_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
@@ -232,6 +234,14 @@ pub fn canonical_resource_url(raw: &str) -> Result<String> {
         canonical.push_str(&q);
     }
     Ok(canonical)
+}
+
+/// Map a canonical resource URL and optional account name to a `credentials.json` v1 key.
+pub fn credential_storage_key(canonical_resource_url: &str, account: Option<&str>) -> String {
+    match account {
+        Some(acct) => format!("{canonical_resource_url}#account={acct}"),
+        None => canonical_resource_url.to_owned(),
+    }
 }
 
 fn validate_mcp_server_url(raw: &str) -> Result<(reqwest::Url, bool)> {
@@ -846,6 +856,105 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+fn base64_standard(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = u32::from(*chunk.get(1).unwrap_or(&0));
+        let b2 = u32::from(*chunk.get(2).unwrap_or(&0));
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((triple >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((triple >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((triple >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(triple & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn form_urlencode_component(value: &str) -> String {
+    let mut url = reqwest::Url::parse("http://127.0.0.1/").expect("static loopback URL");
+    url.query_pairs_mut().append_pair("k", value);
+    url.query()
+        .and_then(|q| q.strip_prefix("k="))
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn select_token_endpoint_auth_method(
+    has_client_secret: bool,
+    supported: Option<&[String]>,
+) -> Result<&'static str> {
+    if !has_client_secret {
+        return Ok("none");
+    }
+    match supported {
+        None => Ok("client_secret_basic"),
+        Some(methods) if methods.iter().any(|m| m == "client_secret_basic") => {
+            Ok("client_secret_basic")
+        }
+        Some(methods) if methods.iter().any(|m| m == "client_secret_post") => {
+            Ok("client_secret_post")
+        }
+        Some(_) => Err(Failure::new(
+            4,
+            "mcp_protocol",
+            "authorization server does not support client_secret_basic or client_secret_post",
+        )
+        .into()),
+    }
+}
+
+fn apply_client_auth<'a>(
+    builder: reqwest::RequestBuilder,
+    form_pairs: &mut Vec<(&'a str, &'a str)>,
+    client_id: &'a str,
+    client_secret: Option<&'a str>,
+    auth_method: Option<&str>,
+) -> Result<reqwest::RequestBuilder> {
+    match auth_method.unwrap_or("none") {
+        "client_secret_basic" => {
+            let secret = client_secret
+                .context("client_secret is required for client_secret_basic authentication")?;
+            let encoded = base64_standard(
+                format!(
+                    "{}:{}",
+                    form_urlencode_component(client_id),
+                    form_urlencode_component(secret)
+                )
+                .as_bytes(),
+            );
+            let mut header = http::HeaderValue::from_str(&format!("Basic {encoded}"))
+                .map_err(|_| anyhow::anyhow!("invalid client Basic authorization header"))?;
+            header.set_sensitive(true);
+            Ok(builder.header(http::header::AUTHORIZATION, header))
+        }
+        "client_secret_post" => {
+            let secret = client_secret
+                .context("client_secret is required for client_secret_post authentication")?;
+            form_pairs.push(("client_id", client_id));
+            form_pairs.push(("client_secret", secret));
+            Ok(builder)
+        }
+        "none" => {
+            form_pairs.push(("client_id", client_id));
+            Ok(builder)
+        }
+        other => bail!(
+            "unsupported OAuth token_endpoint_auth_method {}",
+            safe_text(other)
+        ),
+    }
+}
+
 fn encode_form(pairs: &[(&str, &str)]) -> String {
     let mut url = reqwest::Url::parse("http://127.0.0.1/").expect("static loopback URL");
     {
@@ -961,7 +1070,7 @@ fn validate_bearer_token_string(token: &str) -> Result<()> {
     Ok(())
 }
 
-async fn credential_lock(resource: &str) -> Result<Lock> {
+async fn credential_lock(storage_key: &str) -> Result<Lock> {
     let location = prepare_store_location_writable()?;
     let parent = location
         .file_path
@@ -970,24 +1079,30 @@ async fn credential_lock(resource: &str) -> Result<Lock> {
     // Keep one lock across filename aliases and the first store creation.
     let path = parent.join(format!(
         ".oauth-{}.lock",
-        crate::platform::digest(resource.as_bytes())
+        crate::platform::digest(storage_key.as_bytes())
     ));
     // A refresh may take 15 seconds before committing its rotated token.
     Lock::acquire(&path, Duration::from_secs(30)).await
 }
 
 pub struct HttpAuthManager {
-    canonical_resource: String,
+    storage_key: String,
     allow_loopback: bool,
+    client_id: Option<String>,
+    client_secret: Option<String>,
     oauth_client: Option<reqwest::Client>,
 }
 
 impl HttpAuthManager {
-    pub fn for_server_url(url: &str) -> Result<Arc<Self>> {
+    pub fn for_server(url: &str, oauth: Option<&OAuthConfig>) -> Result<Arc<Self>> {
         let parsed =
             reqwest::Url::parse(url).map_err(|_| anyhow::anyhow!("invalid resource URL"))?;
         let allow_loopback = is_loopback_literal_host(parsed.host_str());
         let canonical = canonical_resource_url(url)?;
+        let storage_key =
+            credential_storage_key(&canonical, oauth.and_then(|o| o.account.as_deref()));
+        let client_id = oauth.and_then(|o| o.client_id.clone());
+        let client_secret = oauth.and_then(|o| o.client_secret.clone());
         let oauth_client = if allow_loopback {
             None
         } else {
@@ -998,8 +1113,10 @@ impl HttpAuthManager {
             )?)
         };
         Ok(Arc::new(Self {
-            canonical_resource: canonical,
+            storage_key,
             allow_loopback,
+            client_id,
+            client_secret,
             oauth_client,
         }))
     }
@@ -1008,7 +1125,7 @@ impl HttpAuthManager {
         let Ok(store) = read_store_readonly() else {
             return (None, false);
         };
-        let Some(cred) = store.resources.get(&self.canonical_resource) else {
+        let Some(cred) = store.resources.get(&self.storage_key) else {
             return (None, false);
         };
         if validate_bearer_token_string(&cred.access_token).is_err() {
@@ -1027,7 +1144,7 @@ impl HttpAuthManager {
         if !needs_proactive {
             return (Some(cred.access_token.clone()), false);
         }
-        let Ok(_guard) = credential_lock(&self.canonical_resource).await else {
+        let Ok(_guard) = credential_lock(&self.storage_key).await else {
             return (
                 cred.expires_at
                     .is_none_or(|exp| exp > now_unix_secs())
@@ -1041,7 +1158,7 @@ impl HttpAuthManager {
             }
             return (Some(cred.access_token.clone()), true);
         };
-        let Some(reloaded) = reloaded_store.resources.get(&self.canonical_resource) else {
+        let Some(reloaded) = reloaded_store.resources.get(&self.storage_key) else {
             return (None, true);
         };
         let now_locked = now_unix_secs();
@@ -1078,13 +1195,13 @@ impl HttpAuthManager {
         if !read_store_readonly()
             .ok()?
             .resources
-            .contains_key(&self.canonical_resource)
+            .contains_key(&self.storage_key)
         {
             return None;
         }
-        let _guard = credential_lock(&self.canonical_resource).await.ok()?;
+        let _guard = credential_lock(&self.storage_key).await.ok()?;
         let store = read_store_readonly().ok()?;
-        let cred = store.resources.get(&self.canonical_resource)?;
+        let cred = store.resources.get(&self.storage_key)?;
         if validate_bearer_token_string(&cred.access_token).is_err() {
             return None;
         }
@@ -1137,27 +1254,34 @@ impl HttpAuthManager {
                 build_oauth_http_client(&cred.token_endpoint, false, Duration::from_secs(10))?;
             &owned_client
         };
-        let form = encode_form(&[
+        let mut form_pairs = vec![
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
-            ("client_id", &cred.client_id),
-            ("resource", &cred.resource),
-        ]);
-        let response = timeout(
-            Duration::from_secs(15),
+            ("resource", cred.resource.as_str()),
+        ];
+        let runtime_secret = if self.client_id.as_deref() == Some(cred.client_id.as_str()) {
+            self.client_secret.as_deref()
+        } else {
+            None
+        };
+        let request = apply_client_auth(
             http_client
                 .post(endpoint)
                 .header(
                     http::header::CONTENT_TYPE,
                     "application/x-www-form-urlencoded",
                 )
-                .header(http::header::ACCEPT, "application/json")
-                .body(form)
-                .send(),
-        )
-        .await
-        .map_err(|_| anyhow::anyhow!("OAuth token refresh timed out"))?
-        .map_err(|e| anyhow::anyhow!("OAuth token refresh failed: {}", e.without_url()))?;
+                .header(http::header::ACCEPT, "application/json"),
+            &mut form_pairs,
+            &cred.client_id,
+            runtime_secret,
+            cred.token_endpoint_auth_method.as_deref(),
+        )?;
+        let form = encode_form(&form_pairs);
+        let response = timeout(Duration::from_secs(15), request.body(form).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("OAuth token refresh timed out"))?
+            .map_err(|e| anyhow::anyhow!("OAuth token refresh failed: {}", e.without_url()))?;
         let status = response.status();
         if !status.is_success() {
             if let Ok(err_json) = read_bounded_json(response).await
@@ -1167,7 +1291,7 @@ impl HttpAuthManager {
                     "invalid_grant" | "invalid_client" | "unauthorized_client"
                 )
             {
-                let key = self.canonical_resource.clone();
+                let key = self.storage_key.clone();
                 let expected_rt = refresh_token.to_owned();
                 let _ = mutate_store(|store| {
                     if let Some(entry) = store.resources.get_mut(&key)
@@ -1199,6 +1323,7 @@ impl HttpAuthManager {
             token_endpoint: cred.token_endpoint.clone(),
             revocation_endpoint: cred.revocation_endpoint.clone(),
             client_id: cred.client_id.clone(),
+            token_endpoint_auth_method: cred.token_endpoint_auth_method.clone(),
             access_token: parsed.access_token.clone(),
             refresh_token: parsed.refresh_token.or_else(|| cred.refresh_token.clone()),
             expires_at: parsed
@@ -1210,7 +1335,7 @@ impl HttpAuthManager {
                 .map(split_scopes)
                 .unwrap_or_else(|| cred.scopes.clone()),
         };
-        let key = self.canonical_resource.clone();
+        let key = self.storage_key.clone();
         mutate_store(|store| {
             store.resources.insert(key, updated);
             Ok(())
@@ -1239,6 +1364,8 @@ struct AuthorizationServerMetadata {
     revocation_endpoint: Option<String>,
     #[serde(default)]
     code_challenge_methods_supported: Vec<String>,
+    #[serde(default)]
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1496,34 +1623,7 @@ async fn discover_authorization_server(
                 .into());
             }
         }
-        if !meta
-            .code_challenge_methods_supported
-            .iter()
-            .any(|m| m == "S256")
-        {
-            return Err(Failure::new(
-                4,
-                "mcp_protocol",
-                "authorization server does not support PKCE S256",
-            )
-            .into());
-        }
-        validate_oauth_endpoint_url(
-            &meta.authorization_endpoint,
-            "authorization_endpoint",
-            allow_loopback,
-        )
-        .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-        validate_oauth_endpoint_url(&meta.token_endpoint, "token_endpoint", allow_loopback)
-            .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-        if let Some(ref reg) = meta.registration_endpoint {
-            validate_oauth_endpoint_url(reg, "registration_endpoint", allow_loopback)
-                .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-        }
-        if let Some(ref rev) = meta.revocation_endpoint {
-            validate_oauth_endpoint_url(rev, "revocation_endpoint", allow_loopback)
-                .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-        }
+        validate_authorization_server_endpoints(&meta, allow_loopback)?;
         return Ok(meta);
     }
     let detail = match last_status {
@@ -1538,10 +1638,127 @@ async fn discover_authorization_server(
     .into())
 }
 
+fn validate_authorization_server_endpoints(
+    meta: &AuthorizationServerMetadata,
+    allow_loopback: bool,
+) -> Result<()> {
+    if !meta
+        .code_challenge_methods_supported
+        .iter()
+        .any(|m| m == "S256")
+    {
+        return Err(Failure::new(
+            4,
+            "mcp_protocol",
+            "authorization server does not support PKCE S256",
+        )
+        .into());
+    }
+    validate_oauth_endpoint_url(
+        &meta.authorization_endpoint,
+        "authorization_endpoint",
+        allow_loopback,
+    )
+    .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    validate_oauth_endpoint_url(&meta.token_endpoint, "token_endpoint", allow_loopback)
+        .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    if let Some(ref reg) = meta.registration_endpoint {
+        validate_oauth_endpoint_url(reg, "registration_endpoint", allow_loopback)
+            .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    }
+    if let Some(ref rev) = meta.revocation_endpoint {
+        validate_oauth_endpoint_url(rev, "revocation_endpoint", allow_loopback)
+            .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn fetch_explicit_authorization_server_metadata(
+    client: &reqwest::Client,
+    metadata_url: &reqwest::Url,
+    allow_loopback: bool,
+    deadline: Instant,
+) -> Result<(AuthorizationServerMetadata, String)> {
+    ensure_resolved_host_allowed(metadata_url, "auth_server_metadata_url", allow_loopback)
+        .await
+        .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    let rem = deadline.saturating_duration_since(Instant::now());
+    if rem.is_zero() {
+        return Err(Failure::new(5, "timeout", "OAuth discovery timed out").into());
+    }
+    let resp = timeout(
+        rem,
+        client
+            .get(metadata_url.clone())
+            .header(http::header::ACCEPT, "application/json")
+            .send(),
+    )
+    .await
+    .map_err(|_| Failure::new(5, "timeout", "OAuth discovery timed out"))?
+    .map_err(|e| {
+        Failure::new(
+            4,
+            "mcp_transport",
+            format!(
+                "authorization server metadata request failed: {}",
+                e.without_url()
+            ),
+        )
+    })?;
+    if !resp.status().is_success() {
+        return Err(Failure::new(
+            4,
+            "mcp_protocol",
+            format!(
+                "cannot fetch OAuth authorization server metadata (HTTP {})",
+                resp.status().as_u16()
+            ),
+        )
+        .into());
+    }
+    let json = read_bounded_json(resp)
+        .await
+        .map_err(|e| Failure::new(4, "mcp_protocol", format!("{e:#}")))?;
+    let meta: AuthorizationServerMetadata = serde_json::from_value(json).map_err(|_| {
+        Failure::new(
+            4,
+            "mcp_protocol",
+            "invalid OAuth authorization server metadata document",
+        )
+    })?;
+    let raw_issuer = meta
+        .issuer
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            Failure::new(
+                4,
+                "mcp_protocol",
+                "authorization server metadata document is missing issuer",
+            )
+        })?;
+    let issuer_url =
+        validate_oauth_endpoint_url(raw_issuer, "authorization server issuer", allow_loopback)
+            .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    validate_metadata_url_for_issuer(metadata_url, &issuer_url)
+        .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    let canonical_issuer = canonical_resource_url(raw_issuer).map_err(|e| {
+        Failure::new(
+            4,
+            "mcp_protocol",
+            format!("invalid authorization server issuer: {e}"),
+        )
+    })?;
+    validate_authorization_server_endpoints(&meta, allow_loopback)?;
+    Ok((meta, canonical_issuer))
+}
+
 async fn register_public_client(
     client: &reqwest::Client,
     registration_endpoint: &str,
     redirect_uri: &str,
+    client_name: &str,
     allow_loopback: bool,
     deadline: Instant,
 ) -> Result<String> {
@@ -1556,7 +1773,7 @@ async fn register_public_client(
         return Err(Failure::new(5, "timeout", "dynamic client registration timed out").into());
     }
     let payload = json!({
-        "client_name": "mcpcli",
+        "client_name": client_name,
         "redirect_uris": [redirect_uri],
         "token_endpoint_auth_method": "none",
         "grant_types": ["authorization_code", "refresh_token"],
@@ -1721,6 +1938,7 @@ async fn write_loopback_http(socket: &mut tokio::net::TcpStream, status: &str, b
 
 async fn accept_loopback_callback(
     listener: &TcpListener,
+    callback_path: &str,
     expected_state: &str,
     canonical_issuer: &str,
 ) -> Result<String> {
@@ -1764,7 +1982,7 @@ async fn accept_loopback_callback(
             write_loopback_http(&mut socket, "400 Bad Request", "Bad Request\n").await;
             continue;
         };
-        if parsed.path() != "/callback" {
+        if parsed.path() != callback_path {
             write_loopback_http(&mut socket, "404 Not Found", "Not Found\n").await;
             continue;
         }
@@ -1930,7 +2148,16 @@ pub struct LoginOptions<'a> {
     pub server_name: &'a str,
     pub server_url: &'a str,
     pub scopes: &'a [String],
+    pub configured_scopes: &'a [String],
     pub client_id: Option<&'a str>,
+    pub configured_client_id: Option<&'a str>,
+    pub client_secret: Option<&'a str>,
+    pub client_name: Option<&'a str>,
+    pub configured_client_name: Option<&'a str>,
+    pub callback_port: Option<u16>,
+    pub callback_path: Option<&'a str>,
+    pub auth_server_metadata_url: Option<&'a str>,
+    pub account: Option<&'a str>,
     pub no_browser: bool,
     pub budget: Duration,
 }
@@ -1979,63 +2206,135 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
     let canonical_server_resource = canonical_resource_url(opts.server_url)
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
+
+    let cli_client_id = opts.client_id.map(str::trim).filter(|s| !s.is_empty());
+    let cfg_client_id = opts
+        .configured_client_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(cli_name) = opts.client_name {
+        validate_client_name(cli_name).map_err(|e| Failure::new(2, "arguments", e.to_string()))?;
+        if cli_client_id.is_some() || cfg_client_id.is_some() {
+            return Err(Failure::new(
+                2,
+                "arguments",
+                "--client-name cannot be used when client_id is set",
+            )
+            .into());
+        }
+    }
+    let effective_client_id = cli_client_id.or(cfg_client_id);
+    // Switching client_id via CLI clears any configured client_secret so a secret
+    // for one client is never sent under another client ID.
+    let effective_client_secret = if cli_client_id.is_some() && cli_client_id != cfg_client_id {
+        None
+    } else {
+        opts.client_secret.filter(|s| !s.is_empty())
+    };
+    if effective_client_secret.is_some() && effective_client_id.is_none() {
+        return Err(
+            Failure::new(2, "configuration", "oauth.client_secret requires client_id").into(),
+        );
+    }
+    let effective_client_name = opts
+        .client_name
+        .or(opts.configured_client_name)
+        .unwrap_or("mcpcli");
+    validate_client_name(effective_client_name)
+        .map_err(|e| Failure::new(2, "arguments", e.to_string()))?;
+    if let Some(0) = opts.callback_port {
+        return Err(Failure::new(2, "arguments", "callback_port must be 1..=65535").into());
+    }
+    let callback_path = opts.callback_path.unwrap_or("/callback");
+    validate_callback_path(callback_path)
+        .map_err(|e| Failure::new(2, "arguments", e.to_string()))?;
+
     let connect_cap = opts.budget.min(Duration::from_secs(15));
-    let probe_client = build_oauth_http_client(opts.server_url, true, connect_cap)
-        .map_err(|e| Failure::new(4, "mcp_transport", e.to_string()))?;
     let oauth_client = build_oauth_http_client(opts.server_url, allow_loopback, connect_cap)
         .map_err(|e| Failure::new(4, "mcp_transport", e.to_string()))?;
 
-    let probe_budget = deadline
-        .saturating_duration_since(Instant::now())
-        .min(Duration::from_secs(10));
-    if probe_budget.is_zero() {
-        return Err(Failure::new(5, "timeout", "OAuth login timed out").into());
-    }
-    let challenge = probe_mcp_server_challenge(&probe_client, &server_url, probe_budget).await?;
+    let (asm, canonical_issuer, resource, challenge) = if let Some(meta_raw) =
+        opts.auth_server_metadata_url
+    {
+        let meta_url =
+            validate_oauth_endpoint_url(meta_raw, "auth_server_metadata_url", allow_loopback)
+                .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
+        let (asm, canonical_issuer) = fetch_explicit_authorization_server_metadata(
+            &oauth_client,
+            &meta_url,
+            allow_loopback,
+            deadline,
+        )
+        .await?;
+        (
+            asm,
+            canonical_issuer,
+            canonical_server_resource.clone(),
+            BearerChallenge::default(),
+        )
+    } else {
+        let probe_client = build_oauth_http_client(opts.server_url, true, connect_cap)
+            .map_err(|e| Failure::new(4, "mcp_transport", e.to_string()))?;
+        let probe_budget = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(10));
+        if probe_budget.is_zero() {
+            return Err(Failure::new(5, "timeout", "OAuth login timed out").into());
+        }
+        let challenge =
+            probe_mcp_server_challenge(&probe_client, &server_url, probe_budget).await?;
 
-    let prm_urls =
-        protected_resource_metadata_urls(&server_url, challenge.resource_metadata.as_deref())
+        let prm_urls =
+            protected_resource_metadata_urls(&server_url, challenge.resource_metadata.as_deref())
+                .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+        let prm = discover_protected_resource(
+            &oauth_client,
+            &prm_urls,
+            &canonical_server_resource,
+            deadline,
+        )
+        .await?;
+
+        let issuer_raw = &prm.authorization_servers[0];
+        let issuer_url =
+            validate_oauth_endpoint_url(issuer_raw, "authorization server issuer", allow_loopback)
+                .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+        let canonical_issuer = canonical_resource_url(issuer_raw)
             .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-    let prm = discover_protected_resource(
-        &oauth_client,
-        &prm_urls,
-        &canonical_server_resource,
-        deadline,
-    )
-    .await?;
+        let asm = discover_authorization_server(
+            &oauth_client,
+            &issuer_url,
+            &canonical_issuer,
+            allow_loopback,
+            deadline,
+        )
+        .await?;
+        (asm, canonical_issuer, prm.resource, challenge)
+    };
 
-    let issuer_raw = &prm.authorization_servers[0];
-    let issuer_url =
-        validate_oauth_endpoint_url(issuer_raw, "authorization server issuer", allow_loopback)
-            .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-    let canonical_issuer = canonical_resource_url(issuer_raw)
-        .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-    let asm = discover_authorization_server(
-        &oauth_client,
-        &issuer_url,
-        &canonical_issuer,
-        allow_loopback,
-        deadline,
-    )
-    .await?;
+    let token_auth_method = select_token_endpoint_auth_method(
+        effective_client_secret.is_some(),
+        asm.token_endpoint_auth_methods_supported.as_deref(),
+    )?;
 
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let bind_port = opts.callback_port.unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", bind_port))
         .await
         .map_err(|e| Failure::new(1, "runtime", format!("cannot bind loopback port: {e}")))?;
     let callback_port = listener
         .local_addr()
         .map_err(|e| Failure::new(1, "runtime", format!("cannot inspect loopback port: {e}")))?
         .port();
-    let redirect_uri = format!("http://127.0.0.1:{callback_port}/callback");
+    let redirect_uri = format!("http://127.0.0.1:{callback_port}{callback_path}");
 
-    let client_id = if let Some(explicit) = opts.client_id.map(str::trim).filter(|s| !s.is_empty())
-    {
+    let client_id = if let Some(explicit) = effective_client_id {
         explicit.to_owned()
     } else if let Some(ref reg_endpoint) = asm.registration_endpoint {
         register_public_client(
             &oauth_client,
             reg_endpoint,
             &redirect_uri,
+            effective_client_name,
             allow_loopback,
             deadline,
         )
@@ -2060,9 +2359,9 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         .map_err(|e| Failure::new(1, "runtime", format!("CSPRNG failure: {e}")))?;
     let state = base64url_nopad(&state_bytes);
 
-    let requested_scopes = if !opts.scopes.is_empty() {
+    let requested_scopes = if !opts.configured_scopes.is_empty() || !opts.scopes.is_empty() {
         let mut out = Vec::new();
-        for item in opts.scopes {
+        for item in opts.configured_scopes.iter().chain(opts.scopes.iter()) {
             for token in item.split_whitespace() {
                 if !token.is_empty() && !out.iter().any(|s| s == token) {
                     out.push(token.to_owned());
@@ -2095,7 +2394,7 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         qp.append_pair("code_challenge", &code_challenge);
         qp.append_pair("code_challenge_method", "S256");
         qp.append_pair("state", &state);
-        qp.append_pair("resource", &prm.resource);
+        qp.append_pair("resource", &resource);
         if !requested_scopes.is_empty() {
             qp.append_pair("scope", &requested_scopes.join(" "));
         }
@@ -2122,11 +2421,11 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
     let code = timeout(wait_rem, async {
         if opts.no_browser {
             tokio::select! {
-                res = accept_loopback_callback(&listener, &state, &canonical_issuer) => res,
+                res = accept_loopback_callback(&listener, callback_path, &state, &canonical_issuer) => res,
                 res = read_stdin_callback(&state, &canonical_issuer) => res,
             }
         } else {
-            accept_loopback_callback(&listener, &state, &canonical_issuer).await
+            accept_loopback_callback(&listener, callback_path, &state, &canonical_issuer).await
         }
     })
     .await
@@ -2140,35 +2439,38 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
     let token_url =
         validate_oauth_endpoint_url(&asm.token_endpoint, "token_endpoint", allow_loopback)
             .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
-    let form = encode_form(&[
+    let mut form_pairs = vec![
         ("grant_type", "authorization_code"),
-        ("code", &code),
-        ("redirect_uri", &redirect_uri),
-        ("client_id", &client_id),
-        ("code_verifier", &code_verifier),
-        ("resource", &prm.resource),
-    ]);
-    let token_resp = timeout(
-        exchange_rem,
+        ("code", code.as_str()),
+        ("redirect_uri", redirect_uri.as_str()),
+        ("code_verifier", code_verifier.as_str()),
+        ("resource", resource.as_str()),
+    ];
+    let token_req = apply_client_auth(
         oauth_client
             .post(token_url)
             .header(
                 http::header::CONTENT_TYPE,
                 "application/x-www-form-urlencoded",
             )
-            .header(http::header::ACCEPT, "application/json")
-            .body(form)
-            .send(),
+            .header(http::header::ACCEPT, "application/json"),
+        &mut form_pairs,
+        &client_id,
+        effective_client_secret,
+        Some(token_auth_method),
     )
-    .await
-    .map_err(|_| Failure::new(5, "timeout", "OAuth token exchange timed out"))?
-    .map_err(|e| {
-        Failure::new(
-            4,
-            "mcp_transport",
-            format!("OAuth token exchange failed: {}", e.without_url()),
-        )
-    })?;
+    .map_err(|e| Failure::new(4, "mcp_protocol", e.to_string()))?;
+    let form = encode_form(&form_pairs);
+    let token_resp = timeout(exchange_rem, token_req.body(form).send())
+        .await
+        .map_err(|_| Failure::new(5, "timeout", "OAuth token exchange timed out"))?
+        .map_err(|e| {
+            Failure::new(
+                4,
+                "mcp_transport",
+                format!("OAuth token exchange failed: {}", e.without_url()),
+            )
+        })?;
     if !token_resp.status().is_success() {
         return Err(Failure::new(
             4,
@@ -2212,57 +2514,71 @@ async fn login_inner(opts: LoginOptions<'_>) -> Result<(Value, String)> {
         .map(split_scopes)
         .unwrap_or(requested_scopes);
     let stored = StoredCredential {
-        resource: prm.resource,
+        resource,
         issuer: canonical_issuer.clone(),
         token_endpoint: asm.token_endpoint,
         revocation_endpoint: asm.revocation_endpoint,
         client_id,
+        token_endpoint_auth_method: Some(token_auth_method.to_owned()),
         access_token: parsed_tok.access_token,
         refresh_token: parsed_tok.refresh_token,
         expires_at,
         scopes: granted_scopes.clone(),
     };
-    let _guard = credential_lock(&canonical_server_resource)
+    let storage_key = credential_storage_key(&canonical_server_resource, opts.account);
+    let _guard = credential_lock(&storage_key)
         .await
         .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?;
-    let key = canonical_server_resource.clone();
     mutate_store(|store| {
-        store.resources.insert(key, stored);
+        store.resources.insert(storage_key, stored);
         Ok(())
     })
     .await
     .map_err(|e| Failure::new(1, "runtime", format!("{e:#}")))?;
 
-    let summary_json = json!({
-        "server": opts.server_name,
-        "authenticated": true,
-        "issuer": canonical_issuer,
-        "expiresAt": expires_at,
-        "scopes": granted_scopes,
-    });
-    let summary_text = format!(
-        "authenticated {} (issuer: {})",
-        opts.server_name, canonical_issuer
-    );
+    let mut summary_map = Map::new();
+    summary_map.insert("server".into(), json!(opts.server_name));
+    if let Some(acct) = opts.account {
+        summary_map.insert("account".into(), json!(acct));
+    }
+    summary_map.insert("authenticated".into(), json!(true));
+    summary_map.insert("issuer".into(), json!(canonical_issuer));
+    summary_map.insert("expiresAt".into(), json!(expires_at));
+    summary_map.insert("scopes".into(), json!(granted_scopes));
+    let summary_json = Value::Object(summary_map);
+    let summary_text = match opts.account {
+        Some(acct) => format!(
+            "authenticated {} (account: {}, issuer: {})",
+            opts.server_name, acct, canonical_issuer
+        ),
+        None => format!(
+            "authenticated {} (issuer: {})",
+            opts.server_name, canonical_issuer
+        ),
+    };
     Ok((summary_json, summary_text))
 }
 
 fn server_status_entry(
     name: &str,
     url: &str,
+    account: Option<&str>,
     store: &CredentialsStoreFile,
     now: u64,
 ) -> Result<(Value, String)> {
     let canonical = canonical_resource_url(url)?;
-    if let Some(cred) = store.resources.get(&canonical) {
+    let storage_key = credential_storage_key(&canonical, account);
+    if let Some(cred) = store.resources.get(&storage_key) {
         let valid = cred.expires_at.is_none_or(|exp| exp > now) || cred.refresh_token.is_some();
-        let entry = json!({
-            "server": name,
-            "authenticated": valid,
-            "expiresAt": cred.expires_at,
-            "scopes": cred.scopes,
-            "issuer": cred.issuer,
-        });
+        let mut entry = Map::new();
+        entry.insert("server".into(), json!(name));
+        if let Some(acct) = account {
+            entry.insert("account".into(), json!(acct));
+        }
+        entry.insert("authenticated".into(), json!(valid));
+        entry.insert("expiresAt".into(), json!(cred.expires_at));
+        entry.insert("scopes".into(), json!(cred.scopes));
+        entry.insert("issuer".into(), json!(cred.issuer));
         let exp_text = cred
             .expires_at
             .map_or_else(|| "none".to_owned(), |v| v.to_string());
@@ -2272,21 +2588,32 @@ fn server_status_entry(
             cred.scopes.join(",")
         };
         let state_label = if valid { "authenticated" } else { "expired" };
-        let line = format!(
-            "{name}\t{state_label}\tissuer={}\texpiresAt={exp_text}\tscopes={scopes_text}",
-            cred.issuer
-        );
-        Ok((entry, line))
+        let line = match account {
+            Some(acct) => format!(
+                "{name}\t{state_label}\taccount={acct}\tissuer={}\texpiresAt={exp_text}\tscopes={scopes_text}",
+                cred.issuer
+            ),
+            None => format!(
+                "{name}\t{state_label}\tissuer={}\texpiresAt={exp_text}\tscopes={scopes_text}",
+                cred.issuer
+            ),
+        };
+        Ok((Value::Object(entry), line))
     } else {
-        let entry = json!({
-            "server": name,
-            "authenticated": false,
-            "expiresAt": Value::Null,
-            "scopes": Vec::<String>::new(),
-            "issuer": Value::Null,
-        });
-        let line = format!("{name}\tunauthenticated");
-        Ok((entry, line))
+        let mut entry = Map::new();
+        entry.insert("server".into(), json!(name));
+        if let Some(acct) = account {
+            entry.insert("account".into(), json!(acct));
+        }
+        entry.insert("authenticated".into(), json!(false));
+        entry.insert("expiresAt".into(), Value::Null);
+        entry.insert("scopes".into(), json!(Vec::<String>::new()));
+        entry.insert("issuer".into(), Value::Null);
+        let line = match account {
+            Some(acct) => format!("{name}\tunauthenticated\taccount={acct}"),
+            None => format!("{name}\tunauthenticated"),
+        };
+        Ok((Value::Object(entry), line))
     }
 }
 
@@ -2300,7 +2627,7 @@ pub fn status(
         let cfg = servers
             .get(name)
             .ok_or_else(|| Failure::new(2, "unknown_server", format!("unknown server {name:?}")))?;
-        let ServerConfig::Http { url, .. } = cfg else {
+        let ServerConfig::Http { url, oauth, .. } = cfg else {
             return Err(Failure::new(
                 2,
                 "invalid_transport",
@@ -2308,15 +2635,27 @@ pub fn status(
             )
             .into());
         };
-        return server_status_entry(name, url, &store, now)
-            .map_err(|e| Failure::new(2, "configuration", format!("{e:#}")).into());
+        return server_status_entry(
+            name,
+            url,
+            oauth.as_ref().and_then(|o| o.account.as_deref()),
+            &store,
+            now,
+        )
+        .map_err(|e| Failure::new(2, "configuration", format!("{e:#}")).into());
     }
     let mut entries = Vec::new();
     let mut lines = Vec::new();
     for (name, cfg) in servers {
-        if let ServerConfig::Http { url, .. } = cfg {
-            let (entry, line) = server_status_entry(name, url, &store, now)
-                .map_err(|e| Failure::new(2, "configuration", format!("{e:#}")))?;
+        if let ServerConfig::Http { url, oauth, .. } = cfg {
+            let (entry, line) = server_status_entry(
+                name,
+                url,
+                oauth.as_ref().and_then(|o| o.account.as_deref()),
+                &store,
+                now,
+            )
+            .map_err(|e| Failure::new(2, "configuration", format!("{e:#}")))?;
             entries.push(entry);
             lines.push(line);
         }
@@ -2327,6 +2666,8 @@ pub fn status(
 pub async fn logout(
     server_name: &str,
     server_url: &str,
+    oauth: Option<&OAuthConfig>,
+    server_enabled: bool,
     budget: Duration,
 ) -> Result<(Value, String)> {
     let deadline = Instant::now() + budget;
@@ -2335,15 +2676,16 @@ pub async fn logout(
     let server_loopback = is_loopback_literal_host(parsed_server.host_str());
     let canonical = canonical_resource_url(server_url)
         .map_err(|e| Failure::new(2, "configuration", e.to_string()))?;
+    let storage_key = credential_storage_key(&canonical, oauth.and_then(|o| o.account.as_deref()));
     let (_guard, existing) = timeout_at(deadline, async {
         if resolve_store_location_readonly()?.is_none() {
             return Ok::<_, anyhow::Error>((None, None));
         }
-        let guard = credential_lock(&canonical).await?;
-        let existing = read_store_readonly()?.resources.get(&canonical).cloned();
+        let guard = credential_lock(&storage_key).await?;
+        let existing = read_store_readonly()?.resources.get(&storage_key).cloned();
         if existing.is_some() {
             mutate_store(|store| {
-                store.resources.remove(&canonical);
+                store.resources.remove(&storage_key);
                 Ok(())
             })
             .await?;
@@ -2359,6 +2701,17 @@ pub async fn logout(
         if let Some(ref cred) = existing
             && let Some(ref rev_raw) = cred.revocation_endpoint
         {
+            let auth_method = cred.token_endpoint_auth_method.as_deref().unwrap_or("none");
+            // Disabled servers do not expand ${VAR} templates, so skip confidential-client
+            // remote revocation to avoid transmitting unexpanded literals.
+            if auth_method != "none" && !server_enabled {
+                return;
+            }
+            let client_secret = oauth.and_then(|o| {
+                (o.client_id.as_deref() == Some(cred.client_id.as_str()))
+                    .then_some(o.client_secret.as_deref())
+                    .flatten()
+            });
             let resource_loopback = reqwest::Url::parse(&cred.resource)
                 .ok()
                 .is_some_and(|u| is_loopback_literal_host(u.host_str()));
@@ -2373,23 +2726,21 @@ pub async fn logout(
                     (Some(cred.access_token.as_str()), "access_token"),
                 ] {
                     let Some(token) = token else { continue };
-                    let form = encode_form(&[
-                        ("token", token),
-                        ("token_type_hint", hint),
-                        ("client_id", &cred.client_id),
-                    ]);
-                    let _ = timeout(
-                        Duration::from_secs(5),
-                        client
-                            .post(rev_url.clone())
-                            .header(
-                                http::header::CONTENT_TYPE,
-                                "application/x-www-form-urlencoded",
-                            )
-                            .body(form)
-                            .send(),
-                    )
-                    .await;
+                    let mut form_pairs = vec![("token", token), ("token_type_hint", hint)];
+                    let Ok(req) = apply_client_auth(
+                        client.post(rev_url.clone()).header(
+                            http::header::CONTENT_TYPE,
+                            "application/x-www-form-urlencoded",
+                        ),
+                        &mut form_pairs,
+                        &cred.client_id,
+                        client_secret,
+                        Some(auth_method),
+                    ) else {
+                        return;
+                    };
+                    let form = encode_form(&form_pairs);
+                    let _ = timeout(Duration::from_secs(5), req.body(form).send()).await;
                 }
             }
         }
@@ -2694,7 +3045,16 @@ mod tests {
                 server_name: "slow-metadata",
                 server_url: &resource,
                 scopes: &[],
+                configured_scopes: &[],
                 client_id: None,
+                configured_client_id: None,
+                client_secret: None,
+                client_name: None,
+                configured_client_name: None,
+                callback_port: None,
+                callback_path: None,
+                auth_server_metadata_url: None,
+                account: None,
                 no_browser: true,
                 budget: Duration::from_secs(1),
             })
@@ -2729,13 +3089,14 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let refresh = tokio::spawn(async move {
-            let manager = HttpAuthManager::for_server_url("http://127.0.0.1/mcp").unwrap();
+            let manager = HttpAuthManager::for_server("http://127.0.0.1/mcp", None).unwrap();
             let credential = StoredCredential {
                 resource: "http://127.0.0.1/mcp".into(),
                 issuer: "http://127.0.0.1".into(),
                 token_endpoint,
                 revocation_endpoint: None,
                 client_id: "client".into(),
+                token_endpoint_auth_method: None,
                 access_token: "access".into(),
                 refresh_token: Some("refresh".into()),
                 expires_at: Some(0),
@@ -2812,6 +3173,7 @@ mod tests {
                     token_endpoint,
                     revocation_endpoint: None,
                     client_id: "cli-test".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "expired_tok".into(),
                     refresh_token: Some("initial_rt".into()),
                     expires_at: Some(now_unix_secs().saturating_add(5)),
@@ -2829,7 +3191,7 @@ mod tests {
             std::env::set_var("MCPCLI_CREDENTIALS", &cred_path);
         }
 
-        let mgr = HttpAuthManager::for_server_url("http://127.0.0.1:7777/mcp").unwrap();
+        let mgr = HttpAuthManager::for_server("http://127.0.0.1:7777/mcp", None).unwrap();
         let client =
             build_oauth_http_client("http://127.0.0.1:7777/mcp", true, Duration::from_secs(5))
                 .unwrap();
@@ -2919,7 +3281,7 @@ mod tests {
         // An empty store makes logout a no-op even while a first login is in progress.
         let empty = timeout(
             Duration::from_secs(1),
-            logout("server", resource, Duration::from_secs(1)),
+            logout("server", resource, None, true, Duration::from_secs(1)),
         )
         .await
         .unwrap()
@@ -2939,6 +3301,7 @@ mod tests {
                     token_endpoint: "http://127.0.0.1/token".into(),
                     revocation_endpoint: Some(revocation),
                     client_id: "client".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "access".into(),
                     refresh_token: Some("refresh".into()),
                     expires_at: None,
@@ -2952,7 +3315,7 @@ mod tests {
         let guard = credential_lock(resource).await.unwrap();
         let waiting = timeout(
             Duration::from_secs(2),
-            logout("server", resource, Duration::from_millis(100)),
+            logout("server", resource, None, true, Duration::from_millis(100)),
         )
         .await
         .unwrap()
@@ -2978,7 +3341,7 @@ mod tests {
         });
         let logged_out = timeout(
             Duration::from_secs(3),
-            logout("server", resource, Duration::from_secs(1)),
+            logout("server", resource, None, true, Duration::from_secs(1)),
         )
         .await
         .unwrap()
@@ -3020,6 +3383,7 @@ mod tests {
                     token_endpoint: endpoint,
                     revocation_endpoint: None,
                     client_id: "client".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "expired-access".into(),
                     refresh_token: Some("refresh".into()),
                     expires_at: Some(0),
@@ -3044,7 +3408,7 @@ mod tests {
             ).as_bytes()).await.unwrap();
         });
         let refresh = tokio::spawn(async move {
-            HttpAuthManager::for_server_url(resource)
+            HttpAuthManager::for_server(resource, None)
                 .unwrap()
                 .prepare_token(&reqwest::Client::new())
                 .await
@@ -3053,7 +3417,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut logout = tokio::spawn(super::logout("server", resource, Duration::from_secs(5)));
+        let mut logout = tokio::spawn(super::logout(
+            "server",
+            resource,
+            None,
+            true,
+            Duration::from_secs(5),
+        ));
         let finished_early = timeout(Duration::from_millis(100), &mut logout)
             .await
             .is_ok();
@@ -3112,6 +3482,7 @@ mod tests {
                     token_endpoint: format!("https://127.0.0.1:{port}/oauth/token"),
                     revocation_endpoint: Some(format!("https://127.0.0.1:{port}/oauth/revoke")),
                     client_id: "cli-remote".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "stale_at".into(),
                     refresh_token: Some("stale_rt".into()),
                     expires_at: Some(now_unix_secs().saturating_sub(10)),
@@ -3129,7 +3500,7 @@ mod tests {
             std::env::set_var("MCPCLI_CREDENTIALS", &cred_path);
         }
 
-        let mgr = HttpAuthManager::for_server_url("https://remote.example/mcp").unwrap();
+        let mgr = HttpAuthManager::for_server("https://remote.example/mcp", None).unwrap();
         let fallback = reqwest::Client::new();
         assert_eq!(mgr.prepare_token(&fallback).await, (None, true));
         assert_eq!(
@@ -3139,6 +3510,8 @@ mod tests {
         let (logout_json, _) = logout(
             "remote",
             "https://remote.example/mcp",
+            None,
+            true,
             Duration::from_secs(2),
         )
         .await
@@ -3196,6 +3569,7 @@ mod tests {
                     token_endpoint: token_endpoint.clone(),
                     revocation_endpoint: None,
                     client_id: "cli-test".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "expired_access_tok".into(),
                     refresh_token: Some("revoked_refresh_tok".into()),
                     expires_at: Some(now_unix_secs().saturating_sub(15)),
@@ -3219,6 +3593,9 @@ mod tests {
                 url: resource_url.to_owned(),
                 headers: BTreeMap::new(),
                 description: None,
+                enabled: true,
+                timeout: None,
+                oauth: None,
             },
         )]);
         assert_eq!(
@@ -3226,7 +3603,7 @@ mod tests {
             true
         );
 
-        let mgr = HttpAuthManager::for_server_url(resource_url).unwrap();
+        let mgr = HttpAuthManager::for_server(resource_url, None).unwrap();
         let client = build_oauth_http_client(resource_url, true, Duration::from_secs(5)).unwrap();
         assert_eq!(mgr.prepare_token(&client).await, (None, true));
         assert_eq!(refresh_hits.load(Ordering::SeqCst), 1);
@@ -3252,6 +3629,7 @@ mod tests {
                     token_endpoint,
                     revocation_endpoint: None,
                     client_id: "cli-test".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "revoked_upstream_tok".into(),
                     refresh_token: Some("revoked_refresh_tok_2".into()),
                     expires_at: Some(now_unix_secs().saturating_add(3600)),
@@ -3312,6 +3690,7 @@ mod tests {
                     token_endpoint: "https://auth.example.com/token".into(),
                     revocation_endpoint: None,
                     client_id: "cid".into(),
+                    token_endpoint_auth_method: None,
                     access_token: "tok".into(),
                     refresh_token: None,
                     expires_at: Some(now_unix_secs().saturating_add(600)),
@@ -3371,5 +3750,689 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+    }
+
+    async fn read_http_request(
+        socket: &mut tokio::net::TcpStream,
+    ) -> (String, Vec<(String, String)>, Vec<u8>) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let mut reader = BufReader::new(socket);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await.unwrap();
+        let mut headers = Vec::new();
+        let mut length = 0usize;
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            if n == 0 || line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                let key = k.trim().to_ascii_lowercase();
+                let val = v.trim().to_owned();
+                if key == "content-length" {
+                    length = val.parse().unwrap_or(0);
+                }
+                headers.push((key, val));
+            }
+        }
+        let mut body = vec![0u8; length];
+        if length > 0 {
+            reader.read_exact(&mut body).await.unwrap();
+        }
+        (request_line.trim().to_owned(), headers, body)
+    }
+
+    #[tokio::test]
+    async fn confidential_client_basic_and_post_across_login_refresh_and_logout() {
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().canonicalize().unwrap().join("credentials.json");
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", &cred_path) };
+
+        for (auth_method, supported_methods) in [
+            ("client_secret_basic", None::<Vec<&str>>),
+            ("client_secret_post", Some(vec!["client_secret_post"])),
+        ] {
+            let _ = std::fs::remove_file(&cred_path);
+            let as_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let as_port = as_listener.local_addr().unwrap().port();
+            let issuer = format!("http://127.0.0.1:{as_port}/tenant");
+            let expected_basic = format!(
+                "Basic {}",
+                base64_standard(
+                    format!(
+                        "{}:{}",
+                        form_urlencode_component("cid-conf"),
+                        form_urlencode_component("sec:ret+1")
+                    )
+                    .as_bytes()
+                )
+            );
+            let seen_token_auth =
+                Arc::new(std::sync::Mutex::new(
+                    Vec::<(String, Option<String>, String)>::new(),
+                ));
+            let seen_clone = seen_token_auth.clone();
+            let as_srv = tokio::spawn(async move {
+                while let Ok((mut sock, _)) = as_listener.accept().await {
+                    let seen_clone = seen_clone.clone();
+                    tokio::spawn(async move {
+                        let (req_line, headers, body) = read_http_request(&mut sock).await;
+                        let auth_hdr = headers
+                            .iter()
+                            .find(|(k, _)| k == "authorization")
+                            .map(|(_, v)| v.clone());
+                        let body_str = String::from_utf8_lossy(&body).into_owned();
+                        let (status, resp_body) = if req_line.starts_with("POST /tenant/token") {
+                            seen_clone.lock().unwrap().push((
+                                "token".into(),
+                                auth_hdr,
+                                body_str.clone(),
+                            ));
+                            let tok = if body_str.contains("grant_type=refresh_token") {
+                                "refreshed_tok"
+                            } else {
+                                "initial_tok"
+                            };
+                            (
+                                "200 OK",
+                                json!({
+                                    "access_token": tok,
+                                    "token_type": "Bearer",
+                                    "refresh_token": "rt_1",
+                                    "expires_in": 10
+                                })
+                                .to_string(),
+                            )
+                        } else if req_line.starts_with("POST /tenant/revoke") {
+                            seen_clone
+                                .lock()
+                                .unwrap()
+                                .push(("revoke".into(), auth_hdr, body_str));
+                            ("200 OK", String::new())
+                        } else {
+                            ("404 Not Found", String::new())
+                        };
+                        let resp = format!(
+                            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                            resp_body.len()
+                        );
+                        let _ = sock.write_all(resp.as_bytes()).await;
+                    });
+                }
+            });
+
+            let resource = "http://127.0.0.1:9999/mcp";
+
+            // Verify method selection directly.
+            assert_eq!(
+                select_token_endpoint_auth_method(
+                    true,
+                    supported_methods
+                        .as_ref()
+                        .map(|v| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
+                        .as_deref(),
+                )
+                .unwrap(),
+                auth_method
+            );
+
+            // Seed stored credential as produced by login (without client_secret on disk).
+            let storage_key = credential_storage_key(resource, Some("acct1"));
+            mutate_store(|store| {
+                store.resources.insert(
+                    storage_key.clone(),
+                    StoredCredential {
+                        resource: resource.into(),
+                        issuer: issuer.clone(),
+                        token_endpoint: format!("{issuer}/token"),
+                        revocation_endpoint: Some(format!("{issuer}/revoke")),
+                        client_id: "cid-conf".into(),
+                        token_endpoint_auth_method: Some(auth_method.into()),
+                        access_token: "initial_tok".into(),
+                        refresh_token: Some("rt_1".into()),
+                        expires_at: Some(now_unix_secs().saturating_add(5)),
+                        scopes: vec!["mcp:read".into(), "mcp:tools".into(), "mcp:write".into()],
+                    },
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+            // Verify client_secret is never on disk.
+            let raw_disk = std::fs::read_to_string(&cred_path).unwrap();
+            assert!(!raw_disk.contains("sec:ret+1"));
+
+            // Mismatched client_id withholds client_secret on refresh (no request sent).
+            let mismatched_oauth = OAuthConfig {
+                client_id: Some("other-cid".into()),
+                client_secret: Some("other-secret".into()),
+                account: Some("acct1".into()),
+                ..OAuthConfig::default()
+            };
+            let mgr_mismatch =
+                HttpAuthManager::for_server(resource, Some(&mismatched_oauth)).unwrap();
+            let client = build_oauth_http_client(resource, true, Duration::from_secs(5)).unwrap();
+            let (tok_mismatch, attempted_mismatch) = mgr_mismatch.prepare_token(&client).await;
+            assert!(attempted_mismatch);
+            assert_eq!(tok_mismatch.as_deref(), Some("initial_tok"));
+            assert!(seen_token_auth.lock().unwrap().is_empty());
+
+            // Refresh uses runtime client_secret with matching Basic or Post auth.
+            let oauth_cfg = OAuthConfig {
+                client_id: Some("cid-conf".into()),
+                client_secret: Some("sec:ret+1".into()),
+                account: Some("acct1".into()),
+                ..OAuthConfig::default()
+            };
+            let mgr = HttpAuthManager::for_server(resource, Some(&oauth_cfg)).unwrap();
+            let (fresh, attempted) = mgr.prepare_token(&client).await;
+            assert!(attempted);
+            assert_eq!(fresh.as_deref(), Some("refreshed_tok"));
+
+            // Logout sends RFC 7009 revocation with matching Basic or Post auth.
+            let (out_json, _) = logout(
+                "conf-srv",
+                resource,
+                Some(&oauth_cfg),
+                true,
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+            assert_eq!(out_json["loggedOut"], true);
+            assert!(read_store_at(&cred_path).unwrap().resources.is_empty());
+
+            let recorded = seen_token_auth.lock().unwrap().clone();
+            assert!(recorded.iter().any(|(kind, _, _)| kind == "token"));
+            assert!(recorded.iter().any(|(kind, _, _)| kind == "revoke"));
+            for (_, hdr, body) in &recorded {
+                if auth_method == "client_secret_basic" {
+                    assert_eq!(hdr.as_deref(), Some(expected_basic.as_str()));
+                    assert!(!body.contains("client_secret="));
+                    assert!(!body.contains("client_id="));
+                } else {
+                    assert!(hdr.is_none());
+                    assert!(body.contains("client_id=cid-conf"));
+                    assert!(body.contains("client_secret=sec%3Aret%2B1"));
+                }
+            }
+
+            as_srv.abort();
+        }
+
+        // Unsupported token_endpoint_auth_methods_supported fails with mcp_protocol.
+        let err =
+            select_token_endpoint_auth_method(true, Some(&["private_key_jwt".into()])).unwrap_err();
+        assert_eq!(err.downcast_ref::<Failure>().unwrap().kind, "mcp_protocol");
+
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("MCPCLI_CREDENTIALS", v),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn login_conflict_rules_and_explicit_metadata_url_validation() {
+        // --client-name conflicts with CLI --client-id or configured oauth.client_id.
+        for (cli_cid, cfg_cid) in [(Some("cli-cid"), None), (None, Some("cfg-cid"))] {
+            let err = super::login(LoginOptions {
+                server_name: "srv",
+                server_url: "http://127.0.0.1:9000/mcp",
+                scopes: &[],
+                configured_scopes: &[],
+                client_id: cli_cid,
+                configured_client_id: cfg_cid,
+                client_secret: None,
+                client_name: Some("my-app"),
+                configured_client_name: None,
+                callback_port: None,
+                callback_path: None,
+                auth_server_metadata_url: None,
+                account: None,
+                no_browser: true,
+                budget: Duration::from_secs(2),
+            })
+            .await
+            .unwrap_err();
+            let failure = err.downcast_ref::<Failure>().unwrap();
+            assert_eq!(failure.code, 2);
+            assert_eq!(failure.kind, "arguments");
+        }
+
+        // Non-loopback MCP server rejects loopback/private auth_server_metadata_url.
+        for bad_meta in [
+            "http://127.0.0.1:8080/.well-known/openid-configuration",
+            "https://169.254.169.254/.well-known/openid-configuration",
+        ] {
+            let err = super::login(LoginOptions {
+                server_name: "remote",
+                server_url: "https://mcp.example.com/mcp",
+                scopes: &[],
+                configured_scopes: &[],
+                client_id: Some("cid"),
+                configured_client_id: None,
+                client_secret: None,
+                client_name: None,
+                configured_client_name: None,
+                callback_port: None,
+                callback_path: None,
+                auth_server_metadata_url: Some(bad_meta),
+                account: None,
+                no_browser: true,
+                budget: Duration::from_secs(2),
+            })
+            .await
+            .unwrap_err();
+            assert_eq!(err.downcast_ref::<Failure>().unwrap().code, 2);
+        }
+
+        // Explicit auth_server_metadata_url rejects mismatched issuer from server.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let _ = read_http_request(&mut sock).await;
+            let body = json!({
+                "issuer": format!("http://127.0.0.1:{port}/other-tenant"),
+                "authorization_endpoint": format!("http://127.0.0.1:{port}/authorize"),
+                "token_endpoint": format!("http://127.0.0.1:{port}/token"),
+                "code_challenge_methods_supported": ["S256"]
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+        let meta_url = format!("http://127.0.0.1:{port}/tenant/.well-known/openid-configuration");
+        let err = super::login(LoginOptions {
+            server_name: "srv",
+            server_url: "http://127.0.0.1:9999/mcp",
+            scopes: &[],
+            configured_scopes: &[],
+            client_id: Some("cid"),
+            configured_client_id: None,
+            client_secret: None,
+            client_name: None,
+            configured_client_name: None,
+            callback_port: None,
+            callback_path: None,
+            auth_server_metadata_url: Some(&meta_url),
+            account: None,
+            no_browser: true,
+            budget: Duration::from_secs(3),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.downcast_ref::<Failure>().unwrap().kind, "mcp_protocol");
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn multi_account_credentials_locks_and_status_are_isolated() {
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().canonicalize().unwrap().join("credentials.json");
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", &cred_path) };
+
+        let url = "http://127.0.0.1:8123/mcp";
+        assert_eq!(credential_storage_key(url, None), url);
+        assert_eq!(
+            credential_storage_key(url, Some("work")),
+            "http://127.0.0.1:8123/mcp#account=work"
+        );
+
+        let exp = now_unix_secs().saturating_add(3600);
+        mutate_store(|store| {
+            for (acct, tok) in [
+                (None, "tok_default"),
+                (Some("work"), "tok_work"),
+                (Some("personal"), "tok_personal"),
+            ] {
+                store.resources.insert(
+                    credential_storage_key(url, acct),
+                    StoredCredential {
+                        resource: url.into(),
+                        issuer: "http://127.0.0.1:9000".into(),
+                        token_endpoint: "http://127.0.0.1:9000/token".into(),
+                        revocation_endpoint: None,
+                        client_id: "cid".into(),
+                        token_endpoint_auth_method: Some("none".into()),
+                        access_token: tok.into(),
+                        refresh_token: None,
+                        expires_at: Some(exp),
+                        scopes: vec!["mcp:read".into()],
+                    },
+                );
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        // Independent token retrieval per account.
+        let client = reqwest::Client::new();
+        let mgr_default = HttpAuthManager::for_server(url, None).unwrap();
+        let work_oauth = OAuthConfig {
+            account: Some("work".into()),
+            ..OAuthConfig::default()
+        };
+        let personal_oauth = OAuthConfig {
+            account: Some("personal".into()),
+            ..OAuthConfig::default()
+        };
+        let mgr_work = HttpAuthManager::for_server(url, Some(&work_oauth)).unwrap();
+        let mgr_personal = HttpAuthManager::for_server(url, Some(&personal_oauth)).unwrap();
+        assert_eq!(
+            mgr_default.prepare_token(&client).await.0.as_deref(),
+            Some("tok_default")
+        );
+        assert_eq!(
+            mgr_work.prepare_token(&client).await.0.as_deref(),
+            Some("tok_work")
+        );
+        assert_eq!(
+            mgr_personal.prepare_token(&client).await.0.as_deref(),
+            Some("tok_personal")
+        );
+
+        // Locks are isolated by storage_key.
+        let lock_work = credential_lock(&credential_storage_key(url, Some("work")))
+            .await
+            .unwrap();
+        let lock_personal = timeout(
+            Duration::from_secs(1),
+            credential_lock(&credential_storage_key(url, Some("personal"))),
+        )
+        .await
+        .expect("personal lock should not block on work lock")
+        .unwrap();
+        drop(lock_personal);
+        drop(lock_work);
+
+        // auth::status includes account when present and omits it when absent.
+        let servers = BTreeMap::from([
+            (
+                "default".to_owned(),
+                ServerConfig::Http {
+                    url: url.into(),
+                    headers: BTreeMap::new(),
+                    description: None,
+                    enabled: true,
+                    timeout: None,
+                    oauth: None,
+                },
+            ),
+            (
+                "work".to_owned(),
+                ServerConfig::Http {
+                    url: url.into(),
+                    headers: BTreeMap::new(),
+                    description: None,
+                    enabled: true,
+                    timeout: None,
+                    oauth: Some(work_oauth.clone()),
+                },
+            ),
+        ]);
+        let (default_json, default_text) = status(&servers, Some("default")).unwrap();
+        assert!(default_json.get("account").is_none());
+        assert!(!default_text.contains("account="));
+        let (work_json, work_text) = status(&servers, Some("work")).unwrap();
+        assert_eq!(work_json["account"], "work");
+        assert!(work_text.contains("account=work"));
+
+        // Logging out work leaves personal and default intact.
+        logout("work", url, Some(&work_oauth), true, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(mgr_work.prepare_token(&client).await.0, None);
+        assert_eq!(
+            mgr_personal.prepare_token(&client).await.0.as_deref(),
+            Some("tok_personal")
+        );
+        assert_eq!(
+            mgr_default.prepare_token(&client).await.0.as_deref(),
+            Some("tok_default")
+        );
+
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("MCPCLI_CREDENTIALS", v),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_server_logout_skips_confidential_remote_revocation() {
+        use std::sync::atomic::AtomicUsize;
+
+        let _env_guard = test_env_lock().lock().await;
+        #[cfg(unix)]
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().canonicalize().unwrap().join("credentials.json");
+        let previous = std::env::var_os("MCPCLI_CREDENTIALS");
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe { std::env::set_var("MCPCLI_CREDENTIALS", &cred_path) };
+
+        let rev_hits = Arc::new(AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rev_url = format!("http://{}/revoke", listener.local_addr().unwrap());
+        let hits_clone = rev_hits.clone();
+        let srv = tokio::spawn(async move {
+            while listener.accept().await.is_ok() {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let resource = "http://127.0.0.1:8124/mcp";
+        mutate_store(|store| {
+            store.resources.insert(
+                resource.into(),
+                StoredCredential {
+                    resource: resource.into(),
+                    issuer: "http://127.0.0.1:9000".into(),
+                    token_endpoint: "http://127.0.0.1:9000/token".into(),
+                    revocation_endpoint: Some(rev_url),
+                    client_id: "cid".into(),
+                    token_endpoint_auth_method: Some("client_secret_basic".into()),
+                    access_token: "at".into(),
+                    refresh_token: Some("rt".into()),
+                    expires_at: None,
+                    scopes: vec![],
+                },
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let oauth = OAuthConfig {
+            client_id: Some("cid".into()),
+            client_secret: Some("${UNEXPANDED_SECRET}".into()),
+            ..OAuthConfig::default()
+        };
+        let (out, _) = logout(
+            "disabled-srv",
+            resource,
+            Some(&oauth),
+            false,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(out["loggedOut"], true);
+        assert!(read_store_at(&cred_path).unwrap().resources.is_empty());
+        assert_eq!(rev_hits.load(Ordering::SeqCst), 0);
+
+        srv.abort();
+        // SAFETY: serialized across tests in this module via `test_env_lock`.
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("MCPCLI_CREDENTIALS", v),
+                None => std::env::remove_var("MCPCLI_CREDENTIALS"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_dcr_client_name_callback_path_and_client_id_override_clears_secret() {
+        // 1. Custom DCR client_name and custom redirect_uri path.
+        let reg_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reg_url = format!("http://{}/register", reg_listener.local_addr().unwrap());
+        let seen_dcr = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let seen_dcr_srv = seen_dcr.clone();
+        let reg_srv = tokio::spawn(async move {
+            let (mut sock, _) = reg_listener.accept().await.unwrap();
+            let (_, _, body) = read_http_request(&mut sock).await;
+            *seen_dcr_srv.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
+            let resp_body = r#"{"client_id":"dcr_custom_id"}"#;
+            let resp = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+        let client = reqwest::Client::new();
+        let cid = register_public_client(
+            &client,
+            &reg_url,
+            "http://127.0.0.1:8765/custom/cb",
+            "My Custom App",
+            true,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cid, "dcr_custom_id");
+        let payload = seen_dcr.lock().unwrap().clone().unwrap();
+        assert_eq!(payload["client_name"], "My Custom App");
+        assert_eq!(
+            payload["redirect_uris"],
+            json!(["http://127.0.0.1:8765/custom/cb"])
+        );
+        reg_srv.abort();
+
+        // 2. Custom callback_path rejects /callback with 404 and accepts configured path.
+        let cb_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cb_port = cb_listener.local_addr().unwrap().port();
+        let cb_task = tokio::spawn(async move {
+            accept_loopback_callback(&cb_listener, "/custom/cb", "st_1", "http://127.0.0.1:9000")
+                .await
+        });
+        let wrong_resp = client
+            .get(format!(
+                "http://127.0.0.1:{cb_port}/callback?code=c1&state=st_1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_resp.status(), http::StatusCode::NOT_FOUND);
+        let ok_resp = client
+            .get(format!(
+                "http://127.0.0.1:{cb_port}/custom/cb?code=c_ok&state=st_1"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_resp.status(), http::StatusCode::OK);
+        assert_eq!(cb_task.await.unwrap().unwrap(), "c_ok");
+
+        // 3. CLI --client-id overriding configured oauth.client_id clears client_secret:
+        //    AS only supports private_key_jwt (which fails if client_secret is still active),
+        //    so overriding client_id proceeds past method selection to timeout waiting for callback.
+        let as_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let as_port = as_listener.local_addr().unwrap().port();
+        let issuer = format!("http://127.0.0.1:{as_port}");
+        let meta_url = format!("{issuer}/.well-known/openid-configuration");
+        let as_srv = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = as_listener.accept().await {
+                let issuer = issuer.clone();
+                tokio::spawn(async move {
+                    let _ = read_http_request(&mut sock).await;
+                    let body = json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "code_challenge_methods_supported": ["S256"],
+                        "token_endpoint_auth_methods_supported": ["private_key_jwt"]
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        // Same client_id keeps client_secret -> fails with mcp_protocol due to private_key_jwt.
+        let same_err = super::login(LoginOptions {
+            server_name: "srv",
+            server_url: "http://127.0.0.1:9999/mcp",
+            scopes: &[],
+            configured_scopes: &[],
+            client_id: Some("cfg-cid"),
+            configured_client_id: Some("cfg-cid"),
+            client_secret: Some("cfg-secret"),
+            client_name: None,
+            configured_client_name: None,
+            callback_port: None,
+            callback_path: None,
+            auth_server_metadata_url: Some(&meta_url),
+            account: None,
+            no_browser: true,
+            budget: Duration::from_millis(500),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            same_err.downcast_ref::<Failure>().unwrap().kind,
+            "mcp_protocol"
+        );
+
+        // Different CLI client_id clears client_secret -> passes method selection and times out waiting for callback.
+        let diff_err = super::login(LoginOptions {
+            server_name: "srv",
+            server_url: "http://127.0.0.1:9999/mcp",
+            scopes: &[],
+            configured_scopes: &[],
+            client_id: Some("override-cid"),
+            configured_client_id: Some("cfg-cid"),
+            client_secret: Some("cfg-secret"),
+            client_name: None,
+            configured_client_name: None,
+            callback_port: None,
+            callback_path: None,
+            auth_server_metadata_url: Some(&meta_url),
+            account: None,
+            no_browser: true,
+            budget: Duration::from_millis(300),
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(diff_err.downcast_ref::<Failure>().unwrap().kind, "timeout");
+        as_srv.abort();
     }
 }
