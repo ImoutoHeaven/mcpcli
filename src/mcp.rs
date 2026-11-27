@@ -180,6 +180,8 @@ fn failure_with_outcome(
 pub(super) struct TransportTermination {
     reason: Mutex<Option<McpFailure>>,
     cancelled: CancellationToken,
+    // EOF must not cancel a response the SDK has already delivered.
+    closed: AtomicBool,
 }
 
 impl TransportTermination {
@@ -230,6 +232,14 @@ impl TransportTermination {
 
     pub(super) fn is_terminated(&self) -> bool {
         self.cancelled.is_cancelled()
+    }
+
+    pub(super) fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    pub(super) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire) || self.is_terminated()
     }
 
     pub(super) async fn cancelled(&self) {
@@ -957,7 +967,7 @@ impl McpConnection {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.termination.is_terminated()
+        self.termination.is_closed()
             || self.service.as_ref().is_none_or(RunningService::is_closed)
             || self.peer.is_transport_closed()
     }
@@ -1640,7 +1650,7 @@ impl McpEventsClient {
     }
 
     pub fn is_closed(&self) -> bool {
-        self.termination.is_terminated() || self.peer.is_transport_closed()
+        self.termination.is_closed() || self.peer.is_transport_closed()
     }
 
     async fn attach_stderr_tail(&self, error: anyhow::Error) -> anyhow::Error {
@@ -3379,6 +3389,138 @@ mod call_budget_tests {
 mod stdio_transport_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn complete_tool_responses_remain_successful_after_transport_eof() {
+        use rmcp::model::{InitializeResult, ServerCapabilities, ServerPeerInfo};
+        use serde_json::json;
+
+        async fn request(server: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+            let mut line = String::new();
+            assert!(server.read_line(&mut line).await.unwrap() > 0);
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn respond(
+            server: &mut BufReader<tokio::io::DuplexStream>,
+            request: &Value,
+            result: &Value,
+        ) {
+            let mut bytes = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0", "id": request["id"], "result": result
+            }))
+            .unwrap();
+            bytes.push(b'\n');
+            server.get_mut().write_all(&bytes).await.unwrap();
+        }
+
+        for method in ["tools/list", "tools/call"] {
+            let budget = ByteBudget::new(64 * 1024);
+            let ingress = Ingress::default();
+            let termination = Arc::new(TransportTermination::default());
+            let router = EventRouter::new(budget.clone());
+            let tools_changed = Arc::new(AtomicBool::new(false));
+            let (client, server) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(client);
+            let mut capabilities = ServerCapabilities::default();
+            capabilities.tools = Some(Default::default());
+            let mut info = ServerPeerInfo::from(InitializeResult::new(capabilities));
+            info.protocol_version = ProtocolVersion::V_2026_07_28;
+            let service = rmcp::service::serve_directly(
+                Handler {
+                    tools_changed: tools_changed.clone(),
+                },
+                EventNotificationTransport::new(
+                    ChildTransport::from_parts(
+                        read,
+                        write,
+                        ingress.clone(),
+                        termination.clone(),
+                        4096,
+                        budget.clone(),
+                    ),
+                    router.clone(),
+                    termination.clone(),
+                ),
+                Some(info),
+            );
+            let mut connection = McpConnection {
+                peer: service.peer().clone(),
+                service: Some(service),
+                ingress,
+                event_router: router,
+                event_schemas: EventSchemaCache::default(),
+                termination: termination.clone(),
+                stderr_capture: None,
+                limits: McpLimits {
+                    budget: budget.clone(),
+                    ..McpLimits::default()
+                },
+                server: Leased::new(Vec::new(), budget.empty_lease()),
+                closing: None,
+                cleanup: CleanupState::default(),
+                tools_changed,
+                http: false,
+            };
+            let mut server = BufReader::new(server);
+            let catalog = json!({
+                "resultType": "complete",
+                "tools": [{"name": "echo", "inputSchema": {"type": "object"}}]
+            });
+            let mut operation = Box::pin(async {
+                if method == "tools/list" {
+                    connection
+                        .list_tool_pages(Duration::from_secs(5))
+                        .await
+                        .map(|pages| Value::Array(pages.to_vec()))
+                } else {
+                    connection
+                        .call("echo", Map::new(), Duration::from_secs(5))
+                        .await
+                        .map(|result| (*result).clone())
+                }
+            });
+            let mut received = tokio::select! {
+                result = &mut operation => panic!("request completed before its reply: {result:?}"),
+                request = request(&mut server) => request,
+            };
+            assert_eq!(received["method"], "tools/list");
+            if method == "tools/call" {
+                respond(&mut server, &received, &catalog).await;
+                received = tokio::select! {
+                    result = &mut operation => panic!("call completed before its reply: {result:?}"),
+                    request = request(&mut server) => request,
+                };
+                assert_eq!(received["method"], "tools/call");
+            }
+            let result = if method == "tools/list" {
+                catalog
+            } else {
+                json!({"content": [{"type": "text", "text": "finished"}], "isError": false})
+            };
+            respond(&mut server, &received, &result).await;
+            server.get_mut().shutdown().await.unwrap();
+
+            // Leave the application future unpolled until the SDK has received EOF.
+            timeout(Duration::from_secs(5), async {
+                while !termination.is_closed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!termination.is_terminated());
+            let result = operation.await.unwrap();
+            if method == "tools/list" {
+                assert_eq!(result[0]["tools"][0]["name"], "echo");
+            } else {
+                assert_eq!(result["content"][0]["text"], "finished");
+            }
+            assert!(connection.is_closed());
+            assert!(connection.events_client().is_closed());
+            connection.close().await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn fragmented_stdio_line_charges_capacity_until_release() {

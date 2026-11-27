@@ -452,6 +452,7 @@ where
     async fn receive(&mut self) -> Option<ServerJsonRpcMessage> {
         loop {
             let Some(message) = self.inner.receive().await else {
+                self.termination.mark_closed();
                 self.router.complete_all();
                 return None;
             };
@@ -479,6 +480,7 @@ where
     }
 
     async fn close(&mut self) -> std::result::Result<(), Self::Error> {
+        self.termination.mark_closed();
         self.router.complete_all();
         self.inner.close().await
     }
@@ -1290,6 +1292,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_close_is_visible_when_subscribers_are_woken() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::{Context, Wake, Waker};
+
+        struct ObserveClose {
+            termination: Arc<TransportTermination>,
+            woke: AtomicBool,
+        }
+
+        impl Wake for ObserveClose {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                assert!(self.termination.is_closed());
+                assert!(!self.termination.is_terminated());
+                self.woke.store(true, Ordering::Release);
+            }
+        }
+
+        for explicit in [false, true] {
+            let router = EventRouter::new(ByteBudget::new(4096));
+            let mut receiver = router.take_receiver(&RequestId::Number(1));
+            let termination = Arc::new(TransportTermination::default());
+            let observer = Arc::new(ObserveClose {
+                termination: termination.clone(),
+                woke: AtomicBool::new(false),
+            });
+            let waker = Waker::from(observer.clone());
+            let mut waiting = Box::pin(receiver.recv());
+            assert!(
+                waiting
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+            let mut transport = EventNotificationTransport::new(
+                MockTransport {
+                    sent: Arc::new(Mutex::new(Vec::new())),
+                    incoming: VecDeque::new(),
+                },
+                router,
+                termination,
+            );
+            if explicit {
+                transport.close().await.unwrap();
+            } else {
+                assert!(transport.receive().await.is_none());
+            }
+            assert!(observer.woke.load(Ordering::Acquire));
+            assert!(waiting.await.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn completed_streams_keep_pending_notifications_until_receiver_drains() {
         for ending in ["result", "error", "eof"] {
             let budget = ByteBudget::new(4096);
@@ -1314,15 +1372,18 @@ mod tests {
                 };
                 incoming.push_back(serde_json::from_value(final_message).unwrap());
             }
+            let termination = Arc::new(TransportTermination::default());
             let mut transport = EventNotificationTransport::new(
                 MockTransport {
                     sent: Arc::new(Mutex::new(Vec::new())),
                     incoming,
                 },
                 router.clone(),
-                Arc::new(TransportTermination::default()),
+                termination.clone(),
             );
             assert_eq!(transport.receive().await.is_some(), ending != "eof");
+            assert_eq!(termination.is_closed(), ending == "eof");
+            assert!(!termination.is_terminated());
             let mut receiver = router.take_receiver(&id);
             for method in ["active", "event"] {
                 let notification = receiver.recv().await.unwrap();
