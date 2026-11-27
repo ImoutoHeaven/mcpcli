@@ -392,14 +392,14 @@ pub fn resolve_skill_relative_uri(skill_uri: &str, rel_path: &str) -> Result<Str
     Ok(format!("{root}/{rel_path}"))
 }
 
-pub fn validate_manifest_entry_uri(skill_uri: &str, entry_uri: &str) -> Result<String> {
+pub fn validate_manifest_entry_uri<'a>(skill_uri: &str, entry_uri: &'a str) -> Result<&'a str> {
     let root = skill_root_from_uri(skill_uri)?;
     let rel_path = entry_uri
         .strip_prefix(root)
         .and_then(|rest| rest.strip_prefix('/'))
         .context("manifest entry URI escapes skill root")?;
     validate_clean_skill_rel_path(rel_path)?;
-    Ok(rel_path.to_owned())
+    Ok(rel_path)
 }
 
 fn remote_yaml_frontmatter_options() -> serde_saphyr::Options {
