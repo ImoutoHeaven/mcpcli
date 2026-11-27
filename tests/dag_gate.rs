@@ -37,6 +37,7 @@ const MODULE_LAYERS: &[(&str, u8)] = &[
 const L0_MODULES: &[&str] = &["budget", "discovery", "platform", "oauth_url"];
 const RMCP_ALLOWED: &[&str] = &["mcp"];
 const SERDE_SAPHYR_ALLOWED: &[&str] = &["skills"];
+const SKILLS_ALLOWED: &[&str] = &["platform"];
 
 /// Lateral dependency allowlist among `src/mcp/*.rs` sibling submodules.
 const MCP_SUBMODULE_DAG: &[(&str, &[&str])] = &[
@@ -630,6 +631,11 @@ fn layer_map() -> BTreeMap<&'static str, u8> {
     MODULE_LAYERS.iter().copied().collect()
 }
 
+fn skills_dependencies_allowed(deps: &BTreeSet<String>) -> bool {
+    deps.iter()
+        .all(|dependency| SKILLS_ALLOWED.contains(&dependency.as_str()))
+}
+
 #[test]
 fn all_src_modules_are_registered_in_layer_table() {
     let (discovered, _) = scan_production_graph();
@@ -693,7 +699,7 @@ fn production_dependencies_form_strict_lower_triangular_dag() {
 }
 
 #[test]
-fn l0_modules_have_zero_internal_crate_dependencies() {
+fn foundational_modules_keep_their_dependency_contracts() {
     let (_, graph) = scan_production_graph();
     for &module in L0_MODULES {
         let deps = graph.get(module).cloned().unwrap_or_default();
@@ -706,6 +712,11 @@ fn l0_modules_have_zero_internal_crate_dependencies() {
     assert!(
         schema_deps.is_empty(),
         "L1 module `schema` must have zero internal crate:: dependencies, found: {schema_deps:?}"
+    );
+    let skills_deps = graph.get("skills").cloned().unwrap_or_default();
+    assert!(
+        skills_dependencies_allowed(&skills_deps),
+        "L1 module `skills` may depend only on {SKILLS_ALLOWED:?}, found: {skills_deps:?}"
     );
 }
 
@@ -1149,7 +1160,21 @@ fn scanner_keeps_self_qualified_crate_paths_for_l0() {
 }
 
 #[test]
-fn external_crate_gate_rejects_disallowed_modules_and_ignores_cfg_test() {
+fn dependency_gates_reject_disallowed_modules_and_ignore_cfg_test() {
+    for dependency in ["platform", "budget", "discovery", "oauth_url"] {
+        let source = format!("use crate::{dependency}::Item;");
+        let deps = extract_dependencies(&source, "crate", "skills");
+        assert_eq!(
+            skills_dependencies_allowed(&deps),
+            dependency == "platform",
+            "skills -> {dependency}"
+        );
+    }
+    let test_only = "#[cfg(test)] mod tests { use crate::budget::ByteBudget; }";
+    assert!(skills_dependencies_allowed(&extract_dependencies(
+        test_only, "crate", "skills"
+    )));
+
     let uses_rmcp = "use rmcp::model::Tool;";
     assert!(!check_external_crate_allowed(
         "schema",
