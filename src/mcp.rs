@@ -106,6 +106,27 @@ pub struct CallBudgets {
     pub hard: Option<Duration>,
 }
 
+impl CallBudgets {
+    fn request_options(self, started: Instant) -> Result<PeerRequestOptions> {
+        let now = Instant::now();
+        let remaining_hard = self
+            .hard
+            .map(|hard| hard.saturating_sub(now.saturating_duration_since(started)));
+        if now >= self.pre_dispatch_deadline || remaining_hard.is_some_and(|hard| hard.is_zero()) {
+            return Err(failure(
+                FailureKind::Timeout,
+                "Tool was not dispatched: discovery exhausted the call timeout",
+            ));
+        }
+        let idle = remaining_hard.map_or(self.idle, |hard| self.idle.min(hard));
+        let mut options = PeerRequestOptions::with_timeout(idle).reset_timeout_on_progress();
+        if let Some(hard) = remaining_hard {
+            options = options.with_max_total_timeout(hard);
+        }
+        Ok(options)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FailureKind {
     Timeout,
@@ -1272,41 +1293,6 @@ impl McpConnection {
                     "Tool arguments and headers exceed the active memory limit",
                 )
             })?;
-        if call_cancel.is_cancelled() {
-            return Err(failure(
-                FailureKind::Cancelled,
-                "Tool was not dispatched: cancelled before dispatch",
-            ));
-        }
-        let remaining_hard = match budgets.hard {
-            Some(hard) => {
-                let remaining = hard.saturating_sub(started.elapsed());
-                if remaining.is_zero() {
-                    return Err(failure(
-                        FailureKind::Timeout,
-                        "Tool was not dispatched: discovery exhausted the call timeout",
-                    ));
-                }
-                Some(remaining)
-            }
-            None => {
-                if budgets
-                    .pre_dispatch_deadline
-                    .saturating_duration_since(Instant::now())
-                    .is_zero()
-                {
-                    return Err(failure(
-                        FailureKind::Timeout,
-                        "Tool was not dispatched: discovery exhausted the call timeout",
-                    ));
-                }
-                None
-            }
-        };
-        let call_idle = match remaining_hard {
-            Some(remaining) => budgets.idle.min(remaining),
-            None => budgets.idle,
-        };
         self.termination.clear_transient();
         // This owner covers the application's request construction and wait.
         // It makes no claim about SDK copies retained after cancellation.
@@ -1319,10 +1305,13 @@ impl McpConnection {
                 .attach_stderr_tail(self.termination.failure(false))
                 .await);
         }
-        let mut options = PeerRequestOptions::with_timeout(call_idle).reset_timeout_on_progress();
-        if let Some(remaining_hard) = remaining_hard {
-            options = options.with_max_total_timeout(remaining_hard);
+        if call_cancel.is_cancelled() {
+            return Err(failure(
+                FailureKind::Cancelled,
+                "Tool was not dispatched: cancelled before dispatch",
+            ));
         }
+        let options = budgets.request_options(started)?;
         dispatched.store(true, Ordering::Release);
         let handle = match self
             .peer
@@ -3342,6 +3331,63 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod call_budget_tests {
+    use super::*;
+
+    #[test]
+    fn dispatch_checks_pre_dispatch_deadline_with_and_without_hard_cap() {
+        let now = Instant::now();
+        for hard in [None, Some(Duration::from_secs(10))] {
+            let budgets = CallBudgets {
+                pre_dispatch_deadline: now - Duration::from_millis(1),
+                idle: Duration::from_secs(1),
+                hard,
+            };
+            let error = budgets.request_options(now).unwrap_err();
+            let failure = error.downcast_ref::<McpFailure>().unwrap();
+            assert_eq!(failure.kind, FailureKind::Timeout);
+            assert!(!failure.outcome_unknown);
+        }
+
+        let budgets = CallBudgets {
+            pre_dispatch_deadline: now + Duration::from_secs(10),
+            idle: Duration::from_secs(1),
+            hard: Some(Duration::from_secs(1)),
+        };
+        let error = budgets
+            .request_options(now - Duration::from_secs(2))
+            .unwrap_err();
+        let failure = error.downcast_ref::<McpFailure>().unwrap();
+        assert_eq!(failure.kind, FailureKind::Timeout);
+        assert!(!failure.outcome_unknown);
+    }
+
+    #[test]
+    fn dispatch_keeps_progress_idle_independent_of_admission_time() {
+        let now = Instant::now();
+        let budgets = CallBudgets {
+            pre_dispatch_deadline: now + Duration::from_secs(10),
+            idle: Duration::from_secs(60),
+            hard: None,
+        };
+        let options = budgets.request_options(now).unwrap();
+        assert_eq!(options.timeout, Some(Duration::from_secs(60)));
+        assert!(options.reset_timeout_on_progress);
+        assert_eq!(options.max_total_timeout, None);
+
+        let options = CallBudgets {
+            hard: Some(Duration::from_secs(30)),
+            ..budgets
+        }
+        .request_options(now)
+        .unwrap();
+        assert!(options.max_total_timeout.unwrap() <= Duration::from_secs(30));
+        assert_eq!(options.timeout, options.max_total_timeout);
+        assert!(options.reset_timeout_on_progress);
     }
 }
 
