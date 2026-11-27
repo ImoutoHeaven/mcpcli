@@ -131,8 +131,13 @@ inactivity timeout for `call` (with optional `--max-timeout` in `1` to `86400` s
 when omitted), and sets the run deadline budget in milliseconds for `events stream`.
 
 The daemon starts on demand. `--session NAME` or `MCPCLI_SESSION` isolates client sessions,
-`--oneshot` opens a single-command connection, and `daemon run` runs in the foreground. Restart
-the daemon after changing `mcpcli.json` or the `mcpcli` binary.
+`--oneshot` opens a single-command connection, and `daemon run` runs in the foreground. Use
+`daemon restart` after configuration changes or binary updates that keep the same IPC version.
+
+When upgrading from v0.6 to v0.7, run `mcpcli daemon stop` with the v0.6 binary before replacing
+it, selecting each active configuration and session. After installing v0.7, `daemon start` or
+the next command starts a new daemon using IPC version 5. If the binary was already replaced,
+use a retained or re-downloaded v0.6 binary to stop the old daemon.
 
 See [docs/mcpcli-design.md](docs/mcpcli-design.md) for protocol behavior, security boundaries,
 limits, and exit codes.

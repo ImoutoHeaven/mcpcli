@@ -240,7 +240,14 @@ executable SHA-256 (`/proc/self/exe` on Linux, native executable path
 elsewhere), configuration digest, timeout budget (`timeout_ms`), optional
 `max_timeout_ms` (valid only for `Operation::Call`, `timeout_ms..=86_400_000`),
 monotonic deadline, and optional explicit deadline. Version, binary, or
-configuration mismatches fail with exit status `6` until `daemon restart`.
+configuration mismatches fail with exit status `6`. Within the same IPC version,
+`daemon restart` clears binary or configuration mismatches.
+
+Before upgrading from v0.6 (IPC 4) to v0.7 (IPC 5), use the v0.6 binary to run
+`daemon stop` for each active configuration and session. Then install v0.7 and
+run `daemon start`, or let the next command start the daemon. If v0.7 is already
+installed while a v0.6 daemon is running, use a retained or re-downloaded v0.6
+binary to stop it first.
 
 For calls, `timeout_ms` and `max_timeout_ms` retain the original idle and hard
 budgets. The absolute deadline includes time already spent starting the daemon.

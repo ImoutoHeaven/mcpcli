@@ -486,7 +486,7 @@ pub async fn exchange_tracked_with_options(
         return Err(Failure::new(
             6,
             "daemon_mismatch",
-            "daemon protocol does not match; run daemon restart",
+            "daemon protocol does not match; use the matching mcpcli version to run daemon stop, then use the current version to run daemon start",
         )
         .uncertain(is_call && write_tracker.load(Ordering::Acquire))
         .into());
@@ -575,7 +575,7 @@ impl DaemonEventStream {
             return Err(Failure::new(
                 6,
                 "daemon_mismatch",
-                "daemon protocol does not match; run daemon restart",
+                "daemon protocol does not match; use the matching mcpcli version to run daemon stop, then use the current version to run daemon start",
             )
             .into());
         }
