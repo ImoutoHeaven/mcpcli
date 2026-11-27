@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod media;
 pub mod oauth_url;
 pub mod runtime;
+pub mod schema;
 pub mod skills;
 
 pub mod platform;

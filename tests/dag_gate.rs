@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Full-repo L0-L8 module layering table (16 library modules + `main` binary entry point).
+/// Full-repo L0-L8 module layering table (17 library modules + `main` binary entry point).
 const MODULE_LAYERS: &[(&str, u8)] = &[
     // L0: zero internal crate:: dependencies
     ("budget", 0),
@@ -11,6 +11,7 @@ const MODULE_LAYERS: &[(&str, u8)] = &[
     ("platform", 0),
     ("oauth_url", 0),
     // L1
+    ("schema", 1),
     ("json", 1),
     ("agents", 1),
     ("skills", 1),
@@ -34,6 +35,17 @@ const MODULE_LAYERS: &[(&str, u8)] = &[
 ];
 
 const L0_MODULES: &[&str] = &["budget", "discovery", "platform", "oauth_url"];
+const RMCP_ALLOWED: &[&str] = &["mcp"];
+const SERDE_SAPHYR_ALLOWED: &[&str] = &["skills"];
+
+/// Lateral dependency allowlist among `src/mcp/*.rs` sibling submodules.
+const MCP_SUBMODULE_DAG: &[(&str, &[&str])] = &[
+    ("ingress", &[]),
+    ("sse", &["ingress"]),
+    ("events", &["ingress", "sse"]),
+    ("skills", &["ingress"]),
+    ("tasks", &["ingress"]),
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
@@ -595,7 +607,7 @@ fn scan_production_graph() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<Strin
         };
         modules.insert(module.clone());
         let entry = graph.entry(module.clone()).or_default();
-        let own_module = if L0_MODULES.contains(&module.as_str()) {
+        let own_module = if L0_MODULES.contains(&module.as_str()) || module == "schema" {
             ""
         } else {
             module.as_str()
@@ -643,8 +655,8 @@ fn all_src_modules_are_registered_in_layer_table() {
         "stale module(s) in L0-L8 table not found in src/: {stale:?}"
     );
 
-    // 16 library modules + main binary entry point
-    assert_eq!(layers.len(), 17);
+    // 17 library modules + main binary entry point
+    assert_eq!(layers.len(), 18);
 }
 
 #[test]
@@ -690,6 +702,288 @@ fn l0_modules_have_zero_internal_crate_dependencies() {
             "L0 module `{module}` must have zero internal crate:: dependencies, found: {deps:?}"
         );
     }
+    let schema_deps = graph.get("schema").cloned().unwrap_or_default();
+    assert!(
+        schema_deps.is_empty(),
+        "L1 module `schema` must have zero internal crate:: dependencies, found: {schema_deps:?}"
+    );
+}
+
+fn references_external_crate(src: &str, crate_ident: &str) -> bool {
+    strip_cfg_test(&tokenize(src))
+        .iter()
+        .any(|tok| matches!(tok, Token::Ident(id) if id == crate_ident))
+}
+
+fn check_external_crate_allowed(
+    module: &str,
+    src: &str,
+    crate_ident: &str,
+    allowed: &[&str],
+) -> bool {
+    allowed.contains(&module) || !references_external_crate(src, crate_ident)
+}
+
+#[test]
+fn external_crate_boundaries_are_enforced() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+
+    let mut violations = Vec::new();
+    for file in files {
+        if file == src_root.join("platform/tests.rs") {
+            continue;
+        }
+        let Some(module) = module_for_src_file(&src_root, &file) else {
+            continue;
+        };
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        if !check_external_crate_allowed(&module, &content, "rmcp", RMCP_ALLOWED) {
+            violations.push(format!(
+                "{} (module `{module}`) references `rmcp` outside RMCP_ALLOWED ({RMCP_ALLOWED:?})",
+                file.display()
+            ));
+        }
+        if !check_external_crate_allowed(&module, &content, "serde_saphyr", SERDE_SAPHYR_ALLOWED) {
+            violations.push(format!(
+                "{} (module `{module}`) references `serde_saphyr` outside SERDE_SAPHYR_ALLOWED ({SERDE_SAPHYR_ALLOWED:?})",
+                file.display()
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "external crate boundary violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+fn mcp_submodule_names() -> BTreeSet<&'static str> {
+    MCP_SUBMODULE_DAG.iter().map(|(name, _)| *name).collect()
+}
+
+fn collect_mcp_relative_targets(
+    tokens: &[Token],
+    mut index: usize,
+    mut depth: usize,
+    self_submod: &str,
+    known: &BTreeSet<&str>,
+    deps: &mut BTreeSet<String>,
+) -> usize {
+    while let Some(Token::Ident(name)) = tokens.get(index) {
+        if tokens.get(index + 1) != Some(&Token::ColonColon) {
+            break;
+        }
+        if name == "super" {
+            let Some(parent) = depth.checked_sub(1) else {
+                return index + 2;
+            };
+            depth = parent;
+        } else if name != "self" {
+            break;
+        }
+        index += 2;
+    }
+    match tokens.get(index) {
+        Some(Token::LBrace) => {
+            let end = skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace);
+            index += 1;
+            while index + 1 < end {
+                index =
+                    collect_mcp_relative_targets(tokens, index, depth, self_submod, known, deps);
+                while index + 1 < end && tokens[index] != Token::Comma {
+                    index = if tokens[index] == Token::LBrace {
+                        skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace)
+                    } else {
+                        index + 1
+                    };
+                }
+                index += 1;
+            }
+            end
+        }
+        Some(Token::Ident(target)) => {
+            // depth == 0 means we resolved to `crate::mcp` (parent of `src/mcp/<submod>.rs`).
+            if depth == 0 && target != self_submod && known.contains(target.as_str()) {
+                deps.insert(target.clone());
+            }
+            index + 1
+        }
+        _ => index + 1,
+    }
+}
+
+fn extract_mcp_submodule_deps(src: &str, self_submod: &str) -> BTreeSet<String> {
+    let tokens = strip_cfg_test(&tokenize(src));
+    let known = mcp_submodule_names();
+    let mut deps = BTreeSet::new();
+    let mut depth = 1usize; // `src/mcp/<submod>.rs` is 1 level below `crate::mcp`.
+    let mut scopes = Vec::new();
+    let mut i = 0;
+
+    while i < tokens.len() {
+        // Match `crate::mcp::<submod>` or `crate::mcp::{...}`.
+        if matches!(&tokens[i], Token::Ident(id) if id == "crate")
+            && tokens.get(i + 1) == Some(&Token::ColonColon)
+            && matches!(tokens.get(i + 2), Some(Token::Ident(id)) if id == "mcp")
+            && tokens.get(i + 3) == Some(&Token::ColonColon)
+        {
+            i = collect_mcp_relative_targets(&tokens, i + 4, 0, self_submod, &known, &mut deps);
+            continue;
+        }
+        // Match `super::<submod>` or `super::{...}` resolving to `crate::mcp`.
+        if matches!(&tokens[i], Token::Ident(id) if id == "super")
+            && tokens.get(i + 1) == Some(&Token::ColonColon)
+        {
+            i = collect_mcp_relative_targets(&tokens, i, depth, self_submod, &known, &mut deps);
+            continue;
+        }
+        match &tokens[i] {
+            Token::LBrace => {
+                let is_mod = i >= 2
+                    && matches!(&tokens[i - 2], Token::Ident(id) if id == "mod")
+                    && matches!(&tokens[i - 1], Token::Ident(_));
+                scopes.push(is_mod);
+                depth += usize::from(is_mod);
+            }
+            Token::RBrace => {
+                depth -= usize::from(scopes.pop().unwrap_or(false));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    deps
+}
+
+/// Tarjan's strongly connected components algorithm; returns all cyclic SCCs (size > 1 or self-loop).
+fn find_scc_cycles(graph: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
+    struct State<'a> {
+        graph: &'a BTreeMap<String, BTreeSet<String>>,
+        next_index: usize,
+        indices: BTreeMap<String, usize>,
+        lowlink: BTreeMap<String, usize>,
+        on_stack: BTreeSet<String>,
+        stack: Vec<String>,
+        cycles: Vec<Vec<String>>,
+    }
+
+    fn strongconnect(v: &str, st: &mut State<'_>) {
+        let idx = st.next_index;
+        st.next_index += 1;
+        st.indices.insert(v.to_owned(), idx);
+        st.lowlink.insert(v.to_owned(), idx);
+        st.stack.push(v.to_owned());
+        st.on_stack.insert(v.to_owned());
+
+        if let Some(neighbors) = st.graph.get(v) {
+            for w in neighbors {
+                if !st.indices.contains_key(w) {
+                    strongconnect(w, st);
+                    let low_w = st.lowlink[w];
+                    let low_v = st.lowlink.get_mut(v).expect("v index");
+                    *low_v = (*low_v).min(low_w);
+                } else if st.on_stack.contains(w) {
+                    let idx_w = st.indices[w];
+                    let low_v = st.lowlink.get_mut(v).expect("v index");
+                    *low_v = (*low_v).min(idx_w);
+                }
+            }
+        }
+
+        if st.lowlink[v] == st.indices[v] {
+            let mut scc = Vec::new();
+            while let Some(w) = st.stack.pop() {
+                st.on_stack.remove(&w);
+                scc.push(w.clone());
+                if w == v {
+                    break;
+                }
+            }
+            let has_self_loop =
+                scc.len() == 1 && st.graph.get(&scc[0]).is_some_and(|n| n.contains(&scc[0]));
+            if scc.len() > 1 || has_self_loop {
+                scc.sort();
+                st.cycles.push(scc);
+            }
+        }
+    }
+
+    let mut st = State {
+        graph,
+        next_index: 0,
+        indices: BTreeMap::new(),
+        lowlink: BTreeMap::new(),
+        on_stack: BTreeSet::new(),
+        stack: Vec::new(),
+        cycles: Vec::new(),
+    };
+    for node in graph.keys() {
+        if !st.indices.contains_key(node) {
+            strongconnect(node, &mut st);
+        }
+    }
+    st.cycles
+}
+
+#[test]
+fn mcp_submodules_follow_dag_and_have_no_cycles() {
+    let mcp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
+    let allowlist: BTreeMap<&str, BTreeSet<&str>> = MCP_SUBMODULE_DAG
+        .iter()
+        .map(|(k, v)| (*k, v.iter().copied().collect()))
+        .collect();
+
+    let mut files = Vec::new();
+    collect_rs_files(&mcp_dir, &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected at least one submodule under {}",
+        mcp_dir.display()
+    );
+
+    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut violations = Vec::new();
+
+    for file in files {
+        let stem = file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("valid UTF-8 submodule filename")
+            .to_owned();
+        if !allowlist.contains_key(stem.as_str()) {
+            violations.push(format!(
+                "unregistered src/mcp/ submodule `{stem}` not in MCP_SUBMODULE_DAG"
+            ));
+            continue;
+        }
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        let deps = extract_mcp_submodule_deps(&content, &stem);
+        let allowed = &allowlist[stem.as_str()];
+        for dst in &deps {
+            if !allowed.contains(dst.as_str()) {
+                violations.push(format!(
+                    "src/mcp/{stem}.rs -> {dst} is not permitted by MCP_SUBMODULE_DAG (allowed: {allowed:?})"
+                ));
+            }
+        }
+        graph.insert(stem, deps);
+    }
+
+    let cycles = find_scc_cycles(&graph);
+    assert!(
+        cycles.is_empty(),
+        "Tarjan SCC detected cycle(s) in src/mcp/ submodules: {cycles:?}"
+    );
+    assert!(
+        violations.is_empty(),
+        "src/mcp/ submodule DAG violations:\n{}",
+        violations.join("\n")
+    );
 }
 
 #[test]
@@ -851,5 +1145,107 @@ fn scanner_keeps_self_qualified_crate_paths_for_l0() {
     assert_eq!(
         extract_dependencies("use crate::platform::digest;", "crate", ""),
         ["platform".to_owned()].into_iter().collect()
+    );
+}
+
+#[test]
+fn external_crate_gate_rejects_disallowed_modules_and_ignores_cfg_test() {
+    let uses_rmcp = "use rmcp::model::Tool;";
+    assert!(!check_external_crate_allowed(
+        "schema",
+        uses_rmcp,
+        "rmcp",
+        RMCP_ALLOWED
+    ));
+    assert!(!check_external_crate_allowed(
+        "main",
+        uses_rmcp,
+        "rmcp",
+        RMCP_ALLOWED
+    ));
+    assert!(check_external_crate_allowed(
+        "mcp",
+        uses_rmcp,
+        "rmcp",
+        RMCP_ALLOWED
+    ));
+
+    let uses_saphyr = "fn f() { let _ = serde_saphyr::from_str::<()>; }";
+    assert!(!check_external_crate_allowed(
+        "schema",
+        uses_saphyr,
+        "serde_saphyr",
+        SERDE_SAPHYR_ALLOWED
+    ));
+    assert!(!check_external_crate_allowed(
+        "mcp",
+        uses_saphyr,
+        "serde_saphyr",
+        SERDE_SAPHYR_ALLOWED
+    ));
+    assert!(check_external_crate_allowed(
+        "skills",
+        uses_saphyr,
+        "serde_saphyr",
+        SERDE_SAPHYR_ALLOWED
+    ));
+
+    let test_only = r#"
+        #[cfg(test)]
+        mod tests {
+            use rmcp::model::Tool;
+            use serde_saphyr::Options;
+        }
+    "#;
+    assert!(check_external_crate_allowed(
+        "json",
+        test_only,
+        "rmcp",
+        RMCP_ALLOWED
+    ));
+    assert!(check_external_crate_allowed(
+        "json",
+        test_only,
+        "serde_saphyr",
+        SERDE_SAPHYR_ALLOWED
+    ));
+}
+
+#[test]
+fn mcp_submodule_scanner_and_tarjan_scc_detect_illegal_edges_and_cycles() {
+    let sample = r#"
+        use super::ingress::Ingress;
+        use crate::mcp::sse::observe_sse;
+        mod nested {
+            use super::super::tasks::poll;
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::skills::walk_skills;
+        }
+    "#;
+    let deps = extract_mcp_submodule_deps(sample, "events");
+    let expected: BTreeSet<String> = ["ingress", "sse", "tasks"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(deps, expected);
+
+    // Acyclic graph has no cyclic SCCs.
+    let mut dag: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    dag.insert("ingress".into(), BTreeSet::new());
+    dag.insert("sse".into(), ["ingress".into()].into_iter().collect());
+    dag.insert(
+        "events".into(),
+        ["ingress".into(), "sse".into()].into_iter().collect(),
+    );
+    assert!(find_scc_cycles(&dag).is_empty());
+
+    // 2-node cycle is detected.
+    let mut cyclic = dag.clone();
+    cyclic.get_mut("ingress").unwrap().insert("sse".into());
+    assert_eq!(
+        find_scc_cycles(&cyclic),
+        vec![vec!["ingress".to_owned(), "sse".to_owned()]]
     );
 }

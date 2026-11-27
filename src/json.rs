@@ -1,5 +1,5 @@
 //! JSON entry points reject duplicate keys, excessive depth, and numeric precision loss.
-use crate::budget::{ByteBudget, ByteLease};
+use crate::budget::{ByteBudget, ByteLease, Leased};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
@@ -397,6 +397,46 @@ impl io::Write for LimitedVecWriter {
     }
 }
 
+pub fn parse_kv_arguments(
+    items: &[String],
+    budget: &Arc<ByteBudget>,
+) -> Result<Leased<Map<String, Value>>> {
+    let mut map = Map::new();
+    let mut value_lease = budget.empty_lease();
+    for item in items {
+        let Some((key, raw_val)) = item.split_once(":=") else {
+            bail!("argument {item:?} must use KEY:=VALUE syntax");
+        };
+        ensure!(
+            !key.is_empty(),
+            "argument key before ':=' must not be empty"
+        );
+        ensure!(!map.contains_key(key), "duplicate argument key {key:?}");
+        if !value_lease.try_grow(key.len().saturating_add(raw_val.len())) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "arguments exceeded active memory limit",
+            )
+            .into());
+        }
+        let scratch = budget
+            .try_acquire(scratch_bytes(raw_val.as_bytes()))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "arguments exceeded active memory limit",
+                )
+            })?;
+        let value = match parse(raw_val.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(_) => Value::String(raw_val.to_owned()),
+        };
+        drop(scratch);
+        map.insert(key.to_owned(), value);
+    }
+    Ok(Leased::new(map, value_lease))
+}
+
 pub fn encode_json_leased<T: Serialize>(
     value: &T,
     max: usize,
@@ -684,5 +724,45 @@ mod tests {
             ipc_mem_err.to_string(),
             "IPC frame exceeded active memory limit"
         );
+    }
+
+    #[test]
+    fn parse_kv_arguments_parses_json_literals_and_falls_back_to_strings() {
+        let budget = ByteBudget::new(1 << 20);
+        let items: Vec<String> = [
+            "-flag:=1",
+            "ok:=true",
+            "empty:=null",
+            "list:=[1, 2]",
+            "obj:={\"k\":\"v\"}",
+            "plain:=hello world",
+            "with_sep:=a:=b",
+            "blank:=",
+            "big:=18446744073709551616",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let parsed = parse_kv_arguments(&items, &budget).unwrap();
+        assert_eq!(parsed["-flag"], serde_json::json!(1));
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["empty"], serde_json::json!(null));
+        assert_eq!(parsed["list"], serde_json::json!([1, 2]));
+        assert_eq!(parsed["obj"], serde_json::json!({"k": "v"}));
+        assert_eq!(parsed["plain"], serde_json::json!("hello world"));
+        assert_eq!(parsed["with_sep"], serde_json::json!("a:=b"));
+        assert_eq!(parsed["blank"], serde_json::json!(""));
+        assert_eq!(parsed["big"], serde_json::json!("18446744073709551616"));
+        drop(parsed);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn parse_kv_arguments_rejects_missing_sep_empty_key_and_duplicates() {
+        let budget = ByteBudget::new(1 << 20);
+        assert!(parse_kv_arguments(&["no_sep".into()], &budget).is_err());
+        assert!(parse_kv_arguments(&[":=1".into()], &budget).is_err());
+        assert!(parse_kv_arguments(&["k:=1".into(), "k:=2".into()], &budget).is_err());
+        assert_eq!(budget.used(), 0);
     }
 }

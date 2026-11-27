@@ -2,6 +2,65 @@ use serde::ser::SerializeMap;
 use serde_json::{Map, Value};
 use std::io::{self, Write};
 
+pub const BUILTIN_SKILL_NAME: &str = "mcpcli";
+pub const BUILTIN_SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub const BUILTIN_SKILL_MD: &str = concat!(
+    "---\n",
+    "name: mcpcli\n",
+    "description: Discover configured MCP servers and skills, inspect tool schemas, call tools with typed KEY:=VALUE arguments, manage async MCP tasks, and read remote server skills.\n",
+    "version: \"",
+    env!("CARGO_PKG_VERSION"),
+    "\"\n",
+    "---\n\n",
+    "# mcpcli\n\n",
+    "Default output is a single JSON value on stdout. Pass `--text` for escaped terminal text.\n\n",
+    "## Discovery\n\n",
+    "1. Run `mcpcli catalog` to read the configured global `AGENTS.md`, local skills, and server list without starting or connecting to any server.\n",
+    "2. Run `mcpcli tools <server> --summary` to list tool names and first-line descriptions. Narrow results with `--filter <substring>`.\n",
+    "3. Run `mcpcli inspect <server> <tool>` to read the full input and output schema before calling a tool.\n\n",
+    "## Schema gate\n\n",
+    "Pin an expected tool snapshot or raw input schema file with `--schema <file>` on `inspect` or `call`:\n\n",
+    "```bash\n",
+    "mcpcli inspect <server> <tool> --schema tool.json\n",
+    "mcpcli call <server> <tool> --schema tool.json --schema-mode exact query:=rust\n",
+    "```\n\n",
+    "`--schema-mode` defaults to `compatible`, which allows backward-compatible changes such as new optional input fields or widening `integer` to `number`. Use `exact` for normalized deep equality. A mismatch exits with code `2` before sending `tools/call`.\n\n",
+    "## Calling tools\n\n",
+    "Pass arguments as `KEY:=VALUE` pairs, `--args <json>`, `--args-file <path>`, or `--stdin`. Each `VALUE` parses as lossless JSON when valid and falls back to a string otherwise. Use `--` before keys that start with `-`:\n\n",
+    "```bash\n",
+    "mcpcli call <server> <tool> query:=mcpcli limit:=10 enabled:=true\n",
+    "mcpcli call <server> <tool> -- -flag:=1\n",
+    "```\n\n",
+    "## Async MCP tasks\n\n",
+    "`mcpcli call` polls `resultType: \"task\"` responses until completion by default. Use `--detach` to return the task handle immediately, then manage it with `tasks` (alias `task`):\n\n",
+    "```bash\n",
+    "mcpcli call <server> <tool> --detach query:=long_job\n",
+    "mcpcli tasks get <server> <task_id> --wait --max-timeout 60\n",
+    "mcpcli tasks update <server> <task_id> --args '{\"confirm\":true}'\n",
+    "mcpcli tasks cancel <server> <task_id>\n",
+    "```\n\n",
+    "## Skills\n\n",
+    "Omit `--server` to inspect local configured skills, or pass `--server <server>` to read remote skills exposed over MCP:\n\n",
+    "```bash\n",
+    "mcpcli skills list --server <server>\n",
+    "mcpcli skills show --server <server> <name_or_uri>\n",
+    "mcpcli skills files --server <server> [--dir <rel_dir>] <name_or_uri>\n",
+    "mcpcli skills read --server <server> [--inline-media] <name_or_uri> <rel_path>\n",
+    "mcpcli skills builtin\n",
+    "```\n\n",
+    "## Exit codes\n\n",
+    "| Code | Meaning |\n",
+    "| --- | --- |\n",
+    "| `0` | Success |\n",
+    "| `1` | Internal, configuration, or memory limit error |\n",
+    "| `2` | CLI usage, argument, path, task ID, or schema mismatch error |\n",
+    "| `3` | Tool completed with `isError: true` |\n",
+    "| `4` | MCP protocol, skill integrity, task failure, or cancellation error |\n",
+    "| `5` | Timeout |\n",
+    "| `6` | Session lost or daemon protocol mismatch |\n",
+);
+
 /// Serialize selected fields by reference without cloning their values.
 pub struct ObjectWithout<'a>(pub &'a Map<String, Value>, pub &'a [&'a str]);
 
@@ -202,6 +261,164 @@ pub fn summarize_tool(mut tool: Value) -> Value {
     Value::Object(summary)
 }
 
+pub fn write_remote_skills_list(stdout: &mut impl Write, skills: &[Value]) -> io::Result<()> {
+    for skill in skills {
+        let frontmatter = skill.get("frontmatter").and_then(Value::as_object);
+        let name = skill
+            .get("name")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                frontmatter
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("");
+        let uri = skill.get("uri").and_then(Value::as_str).unwrap_or("");
+        let desc = skill
+            .get("description")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                frontmatter
+                    .and_then(|f| f.get("description"))
+                    .and_then(Value::as_str)
+            })
+            .and_then(summary_description)
+            .unwrap_or_default();
+        writeln!(
+            stdout,
+            "{}\t{}\t{}",
+            single_line(name, 256),
+            single_line(uri, 2048),
+            desc
+        )?;
+    }
+    Ok(())
+}
+
+pub fn write_remote_skill_show(
+    stdout: &mut impl Write,
+    server: &str,
+    uri: &str,
+    dynamic: bool,
+    content: &str,
+) -> io::Result<()> {
+    write!(
+        stdout,
+        "Origin: {} ({})",
+        single_line(server, 256),
+        single_line(uri, 2048)
+    )?;
+    if dynamic {
+        stdout.write_all(b" [dynamic, unverified]")?;
+    }
+    stdout.write_all(b"\n\n")?;
+    write_safe_text(stdout, content)?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+pub fn write_remote_skill_files(stdout: &mut impl Write, entries: &[Value]) -> io::Result<()> {
+    for entry in entries {
+        let label = entry
+            .get("path")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("uri").and_then(Value::as_str))
+            .unwrap_or("");
+        stdout.write_all(single_line(label, 2048).as_bytes())?;
+        if let Some(size) = entry.get("size").and_then(Value::as_u64) {
+            write!(stdout, "\t{size}")?;
+        }
+        if let Some(extra) = entry
+            .get("digest")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("mimeType").and_then(Value::as_str))
+        {
+            write!(stdout, "\t{}", single_line(extra, 256))?;
+        }
+        stdout.write_all(b"\n")?;
+    }
+    Ok(())
+}
+
+pub fn write_task_status(
+    stdout: &mut impl Write,
+    task_id: &str,
+    status: &str,
+    status_message: Option<&str>,
+) -> io::Result<()> {
+    writeln!(
+        stdout,
+        "task {} [{}]",
+        single_line(task_id, 512),
+        single_line(status, 64)
+    )?;
+    if let Some(message) = status_message.filter(|m| !m.is_empty()) {
+        write_safe_text(stdout, message)?;
+        if !message.ends_with('\n') {
+            stdout.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
+pub fn write_task_get(stdout: &mut impl Write, value: &Value) -> io::Result<()> {
+    let task = value.get("task").filter(|v| v.is_object()).unwrap_or(value);
+    let task_id = task.get("taskId").and_then(Value::as_str).unwrap_or("");
+    let status = task.get("status").and_then(Value::as_str).unwrap_or("");
+    let status_message = task.get("statusMessage").and_then(Value::as_str);
+    write_task_status(stdout, task_id, status, status_message)?;
+
+    match status {
+        "completed" => {
+            if let Some(result) = value.get("result").or_else(|| task.get("result")) {
+                stdout.write_all(b"\n")?;
+                if let Some(content) = result.get("content").and_then(Value::as_array) {
+                    let texts: Vec<&str> = content
+                        .iter()
+                        .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(Value::as_str))
+                        .collect();
+                    if !texts.is_empty() {
+                        write_text_parts(stdout, texts)?;
+                        return Ok(());
+                    }
+                }
+                write_text_json(stdout, result)?;
+                stdout.write_all(b"\n")?;
+            }
+        }
+        "failed" => {
+            if let Some(error) = value.get("error").or_else(|| task.get("error")) {
+                stdout.write_all(b"\n")?;
+                write_text_json(stdout, error)?;
+                stdout.write_all(b"\n")?;
+            }
+        }
+        "input_required" => {
+            if let Some(requests) = value
+                .get("inputRequests")
+                .or_else(|| task.get("inputRequests"))
+            {
+                stdout.write_all(b"\n")?;
+                write_text_json(stdout, requests)?;
+                stdout.write_all(b"\n")?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+pub fn write_task_ack(stdout: &mut impl Write, task_id: &str) -> io::Result<()> {
+    writeln!(stdout, "acknowledged {}", single_line(task_id, 512))
+}
+
+pub fn write_task_cancelled(stdout: &mut impl Write, task_id: &str) -> io::Result<()> {
+    writeln!(stdout, "cancelled {}", single_line(task_id, 512))
+}
+
 fn single_line(text: &str, limit: usize) -> String {
     let mut result = String::new();
     let mut count = 0;
@@ -364,5 +581,96 @@ mod tests {
             "description": "first\u{1b}[31mred\rnext\nsecond"
         }));
         assert_eq!(control_desc["description"], "first\\u{1b}[31mred\\rnext");
+    }
+
+    #[test]
+    fn builtin_skill_guide_has_frontmatter_version_and_core_commands() {
+        assert!(BUILTIN_SKILL_MD.starts_with("---\nname: mcpcli\n"));
+        assert!(BUILTIN_SKILL_MD.contains(BUILTIN_SKILL_VERSION));
+        for needle in [
+            "catalog",
+            "tools <server> --summary",
+            "--filter",
+            "inspect <server> <tool> --schema",
+            "KEY:=VALUE",
+            "--detach",
+            "tasks get",
+            "tasks update",
+            "tasks cancel",
+            "skills list --server",
+            "| `0` |",
+            "| `6` |",
+        ] {
+            assert!(BUILTIN_SKILL_MD.contains(needle), "missing {needle}");
+        }
+        assert!(!BUILTIN_SKILL_MD.contains('—'));
+        assert!(!BUILTIN_SKILL_MD.contains('–'));
+    }
+
+    #[test]
+    fn remote_skill_and_task_text_renderers_escape_control_chars() {
+        let mut out = Vec::new();
+        write_remote_skills_list(
+            &mut out,
+            &[json!({
+                "name": "demo\u{1b}[31m",
+                "uri": "skill://demo/SKILL.md\r",
+                "description": "first\u{1b}[0m line\nsecond"
+            })],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "demo\\u{1b}[31m\tskill://demo/SKILL.md\\r\tfirst\\u{1b}[0m line\n"
+        );
+
+        let mut out = Vec::new();
+        write_remote_skill_show(
+            &mut out,
+            "srv",
+            "skill://demo/SKILL.md",
+            true,
+            "body\u{1b}[31m\r\nnext",
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Origin: srv (skill://demo/SKILL.md) [dynamic, unverified]\n\nbody\\u{1b}[31m\nnext\n"
+        );
+
+        let mut out = Vec::new();
+        write_remote_skill_files(
+            &mut out,
+            &[json!({"path": "refs/a.md", "size": 42, "digest": "sha256:abc"})],
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "refs/a.md\t42\tsha256:abc\n"
+        );
+
+        let mut out = Vec::new();
+        write_task_get(
+            &mut out,
+            &json!({
+                "taskId": "t-1",
+                "status": "failed",
+                "statusMessage": "boom\u{1b}[31m",
+                "error": {"code": -32000, "message": "err\u{1b}[0m\u{85}"}
+            }),
+        )
+        .unwrap();
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.starts_with("task t-1 [failed]\nboom\\u{1b}[31m\n\n"));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("\\u001b[0m\\u{85}"));
+
+        let mut out = Vec::new();
+        write_task_ack(&mut out, "t-1").unwrap();
+        write_task_cancelled(&mut out, "t-2").unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "acknowledged t-1\ncancelled t-2\n"
+        );
     }
 }

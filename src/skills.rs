@@ -11,6 +11,7 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_ENTRIES: usize = 4096;
 const MAX_SKILLS: usize = 1024;
 const MAX_RESOURCE_DEPTH: usize = 16;
+pub const MAX_REMOTE_SKILL_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Skill {
@@ -342,6 +343,195 @@ fn open_beneath(root: &Path, relative: &Path, directory: bool) -> Result<File> {
         .with_context(|| format!("open resource {relative:?} beneath {root:?}"))
 }
 
+pub fn validate_clean_skill_rel_path(rel_path: &str) -> Result<()> {
+    ensure!(!rel_path.is_empty(), "remote skill path must not be empty");
+    ensure!(
+        !rel_path
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || matches!(b, b'\\' | b'?' | b'#' | b'%')),
+        "remote skill path contains forbidden characters"
+    );
+    let mut depth = 0usize;
+    for segment in rel_path.split('/') {
+        ensure!(
+            !segment.is_empty() && segment != "." && segment != "..",
+            "remote skill path contains invalid segment"
+        );
+        depth += 1;
+        ensure!(
+            depth <= MAX_REMOTE_SKILL_DEPTH,
+            "remote skill path exceeds depth {MAX_REMOTE_SKILL_DEPTH}"
+        );
+    }
+    Ok(())
+}
+
+fn skill_root_from_uri(skill_uri: &str) -> Result<&str> {
+    ensure!(
+        !skill_uri
+            .bytes()
+            .any(|b| b < 0x20 || b == 0x7f || matches!(b, b'?' | b'#')),
+        "skill URI contains forbidden characters"
+    );
+    let root = skill_uri
+        .strip_suffix("/SKILL.md")
+        .context("skill URI must end with '/SKILL.md'")?;
+    let (scheme, rest) = root
+        .split_once("://")
+        .context("skill URI must include a scheme")?;
+    ensure!(
+        !scheme.is_empty() && !rest.is_empty() && !rest.ends_with('/'),
+        "skill URI root is invalid"
+    );
+    Ok(root)
+}
+
+pub fn resolve_skill_relative_uri(skill_uri: &str, rel_path: &str) -> Result<String> {
+    let root = skill_root_from_uri(skill_uri)?;
+    validate_clean_skill_rel_path(rel_path)?;
+    Ok(format!("{root}/{rel_path}"))
+}
+
+pub fn validate_manifest_entry_uri(skill_uri: &str, entry_uri: &str) -> Result<String> {
+    let root = skill_root_from_uri(skill_uri)?;
+    let rel_path = entry_uri
+        .strip_prefix(root)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .context("manifest entry URI escapes skill root")?;
+    validate_clean_skill_rel_path(rel_path)?;
+    Ok(rel_path.to_owned())
+}
+
+fn remote_yaml_frontmatter_options() -> serde_saphyr::Options {
+    serde_saphyr::options! {
+        strict_booleans: true,
+        ignore_binary_tag_for_string: true,
+        reject_unsupported_tags: true,
+        merge_keys: serde_saphyr::MergeKeyPolicy::Error,
+        with_snippet: false,
+        budget: serde_saphyr::budget! {
+            max_documents: 1,
+            max_depth: 16,
+            flow_nesting_limit: 16,
+            max_nodes: 1024,
+            max_events: 4096,
+            max_aliases: 0,
+            max_anchors: 0,
+            max_recorded_anchor_events: 0,
+            max_recorded_anchor_bytes: 0,
+            max_total_scalar_bytes: MAX_HEADER_BYTES,
+        },
+        alias_limits: serde_saphyr::alias_limits! {
+            max_total_replayed_events: 0,
+            max_replay_stack_depth: 0,
+            max_alias_expansions_per_anchor: 0,
+        },
+    }
+}
+
+fn number_as_i128(n: &serde_json::Number) -> Option<i128> {
+    if let Some(u) = n.as_u64() {
+        Some(i128::from(u))
+    } else {
+        n.as_i64().map(i128::from)
+    }
+}
+
+fn f64_eq_i128(f: f64, int: i128) -> bool {
+    // Exact powers of two (-2^127, +2^127): every integer-valued f64 in this range converts to i128 losslessly.
+    const MIN_I128_F64: f64 = -170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    const MAX_EXCLUSIVE_I128_F64: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+    f.is_finite()
+        && f.fract() == 0.0
+        && (MIN_I128_F64..MAX_EXCLUSIVE_I128_F64).contains(&f)
+        && (f as i128) == int
+}
+
+fn json_numbers_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    match (number_as_i128(left), number_as_i128(right)) {
+        (Some(a), Some(b)) => a == b,
+        (Some(a), None) => right.as_f64().is_some_and(|b| f64_eq_i128(b, a)),
+        (None, Some(b)) => left.as_f64().is_some_and(|a| f64_eq_i128(a, b)),
+        (None, None) => match (left.as_f64(), right.as_f64()) {
+            (Some(a), Some(b)) => a.is_finite() && b.is_finite() && a == b,
+            _ => false,
+        },
+    }
+}
+
+fn json_values_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::Null, Value::Null) => true,
+        (Value::Bool(a), Value::Bool(b)) => a == b,
+        (Value::Number(a), Value::Number(b)) => json_numbers_equal(a, b),
+        (Value::String(a), Value::String(b)) => a == b,
+        (Value::Array(a), Value::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| json_values_equal(x, y))
+        }
+        (Value::Object(a), Value::Object(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .all(|(k, v)| b.get(k).is_some_and(|rv| json_values_equal(v, rv)))
+        }
+        _ => false,
+    }
+}
+
+pub fn verify_remote_skill_md_frontmatter(
+    text: &str,
+    expected: &serde_json::Map<String, Value>,
+) -> Result<()> {
+    ensure!(
+        !text.starts_with('\u{feff}'),
+        "remote SKILL.md must not start with UTF-8 BOM"
+    );
+    ensure!(
+        !text.as_bytes().contains(&0),
+        "remote SKILL.md must not contain NUL bytes"
+    );
+    let mut lines = text.split_inclusive('\n');
+    let first = lines
+        .next()
+        .context("remote SKILL.md must start with YAML frontmatter")?;
+    let first_line = first.strip_suffix('\n').unwrap_or(first);
+    ensure!(
+        first_line.strip_suffix('\r').unwrap_or(first_line) == "---",
+        "remote SKILL.md must start with '---'"
+    );
+    let header_start = first.len();
+    let mut offset = header_start;
+    let mut header_end = None;
+    for line in lines {
+        let stripped = line.strip_suffix('\n').unwrap_or(line);
+        let stripped = stripped.strip_suffix('\r').unwrap_or(stripped);
+        if stripped == "---" || stripped == "..." {
+            header_end = Some(offset);
+            break;
+        }
+        offset += line.len();
+        ensure!(
+            offset - header_start <= MAX_HEADER_BYTES,
+            "remote YAML frontmatter exceeds {MAX_HEADER_BYTES} bytes"
+        );
+    }
+    let header_end = header_end.context("missing closing YAML frontmatter delimiter")?;
+    let header = &text[header_start..header_end];
+    let value: Value =
+        serde_saphyr::from_str_with_options(header, remote_yaml_frontmatter_options())
+            .context("invalid remote YAML frontmatter")?;
+    let object = value
+        .as_object()
+        .context("remote YAML frontmatter must be a mapping")?;
+    ensure!(
+        object.len() == expected.len()
+            && object
+                .iter()
+                .all(|(k, v)| expected.get(k).is_some_and(|ev| json_values_equal(v, ev))),
+        "remote SKILL.md frontmatter does not match manifest"
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,5 +811,193 @@ mod tests {
         let mut status = 0;
         assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
         assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn validates_clean_remote_skill_paths_and_manifest_uris() {
+        let skill_uri = "skill://demo-skill/SKILL.md";
+        assert!(validate_clean_skill_rel_path("SKILL.md").is_ok());
+        assert!(validate_clean_skill_rel_path("references/guide.md").is_ok());
+        let max_depth = (0..MAX_REMOTE_SKILL_DEPTH)
+            .map(|_| "d")
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(validate_clean_skill_rel_path(&max_depth).is_ok());
+        let too_deep = format!("{max_depth}/extra");
+        assert!(validate_clean_skill_rel_path(&too_deep).is_err());
+
+        for bad in [
+            "",
+            "/",
+            "/a",
+            "a/",
+            "a//b",
+            ".",
+            "..",
+            "a/./b",
+            "a/../b",
+            "../secret",
+            "%2e%2E/secret",
+            "a/b?query=1",
+            "a/b#frag",
+            r"a\b",
+            "a\0b",
+            "a\nb",
+            "a\rb",
+            "a\x1fb",
+            "a\x7fb",
+        ] {
+            assert!(validate_clean_skill_rel_path(bad).is_err(), "{bad:?}");
+            assert!(
+                resolve_skill_relative_uri(skill_uri, bad).is_err(),
+                "{bad:?}"
+            );
+        }
+
+        assert_eq!(
+            resolve_skill_relative_uri(skill_uri, "refs/guide.md").unwrap(),
+            "skill://demo-skill/refs/guide.md"
+        );
+        assert_eq!(
+            validate_manifest_entry_uri(skill_uri, "skill://demo-skill/SKILL.md").unwrap(),
+            "SKILL.md"
+        );
+        assert_eq!(
+            validate_manifest_entry_uri(skill_uri, "skill://demo-skill/refs/guide.md").unwrap(),
+            "refs/guide.md"
+        );
+
+        for bad_entry in [
+            "skill://demo-skill/",
+            "skill://demo-skill2/guide.md",
+            "skill://other/guide.md",
+            "skill://demo-skill/../other/guide.md",
+            "skill://demo-skill/%2e%2E/secret.md",
+            "skill://demo-skill/guide.md?raw=1",
+            "skill://demo-skill/guide.md#top",
+            r"skill://demo-skill/a\b.md",
+            &format!("skill://demo-skill/{too_deep}"),
+        ] {
+            assert!(
+                validate_manifest_entry_uri(skill_uri, bad_entry).is_err(),
+                "{bad_entry:?}"
+            );
+        }
+
+        for bad_skill_uri in [
+            "skill://demo-skill/other.md",
+            "skill:///SKILL.md",
+            "skill://demo-skill//SKILL.md",
+            "demo-skill/SKILL.md",
+            "://demo-skill/SKILL.md",
+            "skill://demo-skill/SKILL.md?x=1",
+            "skill://demo-skill/SKILL.md#h",
+        ] {
+            assert!(
+                resolve_skill_relative_uri(bad_skill_uri, "a.md").is_err(),
+                "{bad_skill_uri:?}"
+            );
+            assert!(
+                validate_manifest_entry_uri(bad_skill_uri, "skill://demo-skill/a.md").is_err(),
+                "{bad_skill_uri:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verifies_remote_frontmatter_delimiters_and_yaml_safety() {
+        let expected = serde_json::json!({
+            "name": "demo",
+            "description": "Remote skill"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        for valid in [
+            "---\nname: demo\ndescription: Remote skill\n---\nBody\n",
+            "---\nname: demo\ndescription: Remote skill\n...\nBody\n",
+            "---\r\nname: demo\r\ndescription: Remote skill\r\n---\r\nBody\r\n",
+            "---\r\nname: demo\r\ndescription: Remote skill\r\n...\r\n",
+            "---\nname: demo\ndescription: Remote skill\n---",
+        ] {
+            assert!(
+                verify_remote_skill_md_frontmatter(valid, &expected).is_ok(),
+                "{valid:?}"
+            );
+        }
+
+        for invalid in [
+            "\u{feff}---\nname: demo\ndescription: Remote skill\n---\n",
+            "---\nname: demo\0\ndescription: Remote skill\n---\n",
+            "---\n---\n",
+            "---\n...\n",
+            "---\n- item\n---\n",
+            "---\nname: demo\ndescription: Remote skill\n",
+            " ---\nname: demo\ndescription: Remote skill\n---\n",
+            "--- \nname: demo\ndescription: Remote skill\n---\n",
+            "---\nbase: &a\n  k: 1\nname: demo\ndescription: Remote skill\n---\n",
+            "---\nbase: &a\n  k: 1\nref: *a\nname: demo\ndescription: Remote skill\n---\n",
+            "---\nbase: &a\n  k: 1\n<<: *a\nname: demo\ndescription: Remote skill\n---\n",
+            "---\nname: demo\nname: demo\ndescription: Remote skill\n---\n",
+        ] {
+            assert!(
+                verify_remote_skill_md_frontmatter(invalid, &expected).is_err(),
+                "{invalid:?}"
+            );
+        }
+
+        let with_null = serde_json::json!({
+            "name": "demo",
+            "x": null
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        for non_finite in [
+            "---\nname: demo\nx: .nan\n---\n",
+            "---\nname: demo\nx: .inf\n---\n",
+            "---\nname: demo\nx: -.inf\n---\n",
+        ] {
+            assert!(
+                verify_remote_skill_md_frontmatter(non_finite, &with_null).is_err(),
+                "{non_finite:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn verifies_remote_frontmatter_numeric_equivalence_and_large_integers() {
+        let md = "---\nname: demo\ndescription: Remote\ncount: 10\nneg: -5\nzero: 0\nnested:\n  ratio: 10\n  items:\n    - 1\n    - 2.0\n    - { v: 42 }\nbig: 9007199254740993\nexact_53: 9007199254740992\n---\nBody\n";
+        let expected = serde_json::json!({
+            "name": "demo",
+            "description": "Remote",
+            "count": 10.0,
+            "neg": -5.0,
+            "zero": -0.0,
+            "nested": {
+                "ratio": 10.0,
+                "items": [1.0, 2, { "v": 42.0 }]
+            },
+            "big": 9007199254740993_u64,
+            "exact_53": 9007199254740992.0_f64
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(verify_remote_skill_md_frontmatter(md, &expected).is_ok());
+
+        // > 2^53 integer precision must not be lost against adjacent integer or rounded f64.
+        let mut wrong_int = expected.clone();
+        wrong_int.insert("big".into(), serde_json::json!(9007199254740992_u64));
+        assert!(verify_remote_skill_md_frontmatter(md, &wrong_int).is_err());
+
+        let mut wrong_f64 = expected.clone();
+        wrong_f64.insert("big".into(), serde_json::json!(9007199254740992.0_f64));
+        assert!(verify_remote_skill_md_frontmatter(md, &wrong_f64).is_err());
+
+        let mut wrong_extra = expected.clone();
+        wrong_extra.insert("extra".into(), serde_json::json!(true));
+        assert!(verify_remote_skill_md_frontmatter(md, &wrong_extra).is_err());
     }
 }
