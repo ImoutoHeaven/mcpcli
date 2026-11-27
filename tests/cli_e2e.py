@@ -856,6 +856,30 @@ def oneshot_unknown_inspect_closes_session(f):
             assert "cleanup" in failure["message"].lower(), failure
 
 
+def oneshot_task_rejection_closes_session(f):
+    commands = [
+        ("call", "state", "get", "--detach"),
+        ("tasks", "get", "state", "task-1"),
+        ("tasks", "get", "state", "task-1", "--wait"),
+    ]
+    for mode in ("normal", "delete_error", "delete_hang"):
+        log = f.use_http(mode)
+        for index, command in enumerate(commands, 1):
+            started = time.monotonic()
+            result = f.invoke("--oneshot", *command, code=4, wall_timeout=6)
+            elapsed = time.monotonic() - started
+            failure = error_value(result)
+            assert not result.stdout and failure["kind"] == "mcp_protocol", (result.stdout, failure)
+            assert not failure.get("outcome_unknown", False), failure
+            assert log.read_text().splitlines().count("DELETE") == index, "task rejection skipped cleanup"
+            assert log.read_text().splitlines().count("tools/call") == 0
+            if mode != "normal":
+                assert "cleanup" in failure["message"].lower(), failure
+            if mode == "delete_hang":
+                assert 1 <= elapsed < 5, f"cleanup did not respect its bounded wait: {elapsed}"
+    assert not f.runtime.exists()
+
+
 def oneshot_unknown_inspect_signal_preserves_error(f):
     log = f.use_http("delete_hang")
     process = f.start("--oneshot", "inspect", "state", "nonexistent", timeout=20,
@@ -1898,7 +1922,7 @@ CASES = [
     unclean_stop_requires_explicit_recovery, lost_server_requires_reset,
     http_delete_error_is_reported, http_delete_timeout_is_reported, http_optional_session_delete,
     interrupt_after_result_preserves_known_outcome, oneshot_unknown_inspect_closes_session,
-    oneshot_unknown_inspect_signal_preserves_error, http_without_ca_store_keeps_tls_validation,
+    oneshot_unknown_inspect_signal_preserves_error, oneshot_task_rejection_closes_session, http_without_ca_store_keeps_tls_validation,
     burst_admission, admission_uses_original_deadline, insecure_unix_endpoint_rejected_before_write, text_mode_crlf_and_empty_outputs,
     events_clean_sep3415_and_transport_header_rules, http_session_404_requires_reset, oauth_cli_login_refresh_diagnostics_and_logout,
     unprivileged_execute_only_ancestors,

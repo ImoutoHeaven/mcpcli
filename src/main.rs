@@ -1016,7 +1016,8 @@ async fn remote_inner(
             let media_store = MediaStore::default();
 
             let exec_result: Result<(Value, mcpcli::budget::ByteLease, Option<InflightBatch>)> =
-                match &*operation {
+                async {
+                    match &*operation {
                     Operation::Server { .. } => connection
                         .server_info()
                         .map(|value| {
@@ -1303,7 +1304,9 @@ async fn remote_inner(
                             })
                     }
                     _ => unreachable!(),
-                };
+                    }
+                }
+                .await;
             match exec_result {
                 Ok((value, lease, inflight)) => {
                     uncertain.store(false, Ordering::Release);
