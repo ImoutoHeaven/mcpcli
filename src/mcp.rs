@@ -1007,6 +1007,11 @@ impl McpConnection {
         attach_stderr_tail(error, self.stderr_capture.as_ref(), self.is_closed()).await
     }
 
+    pub(crate) async fn closed_error(&self) -> anyhow::Error {
+        self.attach_stderr_tail(self.termination.failure(false))
+            .await
+    }
+
     pub async fn list_tools(&self, budget: Duration) -> Result<Leased<Vec<Value>>> {
         let (pages, _) = self.walk_tools(budget, None).await?;
         let (pages, lease) = pages.into_parts();
@@ -1640,6 +1645,11 @@ impl McpEventsClient {
 
     async fn attach_stderr_tail(&self, error: anyhow::Error) -> anyhow::Error {
         attach_stderr_tail(error, self.stderr_capture.as_ref(), self.is_closed()).await
+    }
+
+    pub(crate) async fn closed_error(&self) -> anyhow::Error {
+        self.attach_stderr_tail(self.termination.failure(false))
+            .await
     }
 
     pub fn supports_events(&self) -> bool {

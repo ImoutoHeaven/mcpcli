@@ -67,6 +67,24 @@ impl ServerState {
         self.lost = true;
         self.streams_cancel.cancel();
     }
+
+    async fn session_lost(&mut self, server: &str) -> Failure {
+        self.mark_lost();
+        let mut failure = if let Some(connection) = &self.connection {
+            mcp_error_for_server(connection.closed_error().await, false, Some(server))
+        } else {
+            Failure::new(
+                6,
+                "session_lost",
+                format!(
+                    "server {server:?} disconnected; state may be lost. Run reset {server} before opening a new connection"
+                ),
+            )
+        };
+        failure.code = 6;
+        failure.kind = "session_lost".into();
+        failure
+    }
 }
 
 impl Default for ServerState {
@@ -400,14 +418,7 @@ impl App {
                 .as_ref()
                 .is_some_and(McpConnection::is_closed)
         {
-            state.mark_lost();
-            return Err(Failure::new(
-                6,
-                "session_lost",
-                format!(
-                    "server {server:?} disconnected; state may be lost. Run reset {server} before opening a new connection"
-                ),
-            ));
+            return Err(state.session_lost(server).await);
         }
         if state.connection.is_none() {
             let budget = deadline
@@ -640,14 +651,7 @@ impl App {
                 .as_ref()
                 .is_some_and(McpConnection::is_closed)
         {
-            state.mark_lost();
-            return Err(Failure::new(
-                6,
-                "session_lost",
-                format!(
-                    "server {server:?} disconnected; state may be lost. Run reset {server} before opening a new connection"
-                ),
-            ));
+            return Err(state.session_lost(server).await);
         }
         if state.connection.is_none() {
             let budget = deadline
@@ -902,6 +906,21 @@ async fn write_stream_frame<W: tokio::io::AsyncWrite + Unpin>(
     ipc::write_raw_idle(writer, &frame, app.options.idle_timeout, None, &started).await
 }
 
+async fn event_session_lost(client: &McpEventsClient, server: &str) -> Failure {
+    let mut failure = if client.is_closed() {
+        mcp_error_for_server(client.closed_error().await, false, Some(server))
+    } else {
+        Failure::new(
+            6,
+            "session_lost",
+            format!("server {server:?} was reset or disconnected"),
+        )
+    };
+    failure.code = 6;
+    failure.kind = "session_lost".into();
+    failure
+}
+
 async fn handle_events_stream(
     mut stream: Conn,
     app: Arc<App>,
@@ -1004,11 +1023,7 @@ async fn handle_events_stream(
     let open_result = tokio::select! {
         biased;
         _ = app.shutdown.cancelled() => Err(Failure::new(4, "stopping", "daemon is stopping")),
-        _ = server_cancel.cancelled() => Err(Failure::new(
-            6,
-            "session_lost",
-            format!("server {server:?} was reset or disconnected"),
-        )),
+        _ = server_cancel.cancelled() => Err(event_session_lost(&client, server).await),
         _ = reader.read(&mut extra) => return,
         res = client.open_event_stream(params, open_budget) => {
             if client.is_closed() {
@@ -1052,11 +1067,7 @@ async fn handle_events_stream(
                     &mut writer,
                     &app,
                     StreamFrameKind::Error {
-                        error: Failure::new(
-                            6,
-                            "session_lost",
-                            format!("server {server:?} was reset or disconnected"),
-                        ),
+                        error: event_session_lost(&client, &server).await,
                     },
                 )
                 .await;
@@ -1077,11 +1088,7 @@ async fn handle_events_stream(
                     &mut writer,
                     &app,
                     StreamFrameKind::Error {
-                        error: Failure::new(
-                            6,
-                            "session_lost",
-                            format!("server {server:?} disconnected"),
-                        ),
+                        error: event_session_lost(&client, &server).await,
                     },
                 )
                 .await;
@@ -1700,6 +1707,134 @@ mod tests {
         let _ = daemon_task.await;
         server_task.abort();
     }
+    #[tokio::test]
+    async fn daemon_stream_eof_and_preclosed_requests_preserve_stderr() {
+        #[cfg(unix)]
+        let base = tempfile::tempdir_in("/tmp").unwrap();
+        #[cfg(windows)]
+        let base = tempfile::tempdir().unwrap();
+        let base_path = base.path().canonicalize().unwrap();
+        let stop = base_path.join("stop");
+        let log = base_path.join("requests");
+        let config_path = base_path.join("mcpcli.json");
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        std::fs::write(
+            &config_path,
+            serde_json::to_vec(&json!({
+                "servers": {
+                    "srv": {
+                        "transport": "stdio",
+                        "command": python,
+                        "args": [
+                            "-u", "-c",
+                            include_str!("../tests/fixtures/events_exit_server.py"),
+                            "after-active", stop, log
+                        ]
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = LoadedConfig::load(&config_path).unwrap();
+        let paths =
+            Paths::with_root(loaded.path.clone(), "stderr-eof", &base_path.join("run")).unwrap();
+        let daemon_paths = paths.clone();
+        let daemon_loaded = loaded.clone();
+        let daemon_task = tokio::spawn(async move {
+            run_with_options(daemon_paths, daemon_loaded, DaemonOptions::default()).await
+        });
+        timeout(Duration::from_secs(5), async {
+            while !paths.running().unwrap_or(false) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut stream = runtime::open_event_stream(
+            &paths,
+            &paths
+                .request(
+                    &loaded.digest,
+                    Operation::EventsStream {
+                        server: "srv".into(),
+                        event: "pr.merged".into(),
+                        arguments: None,
+                        cursor: None,
+                        max_age_ms: None,
+                        heartbeat_ms: None,
+                    },
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let (active, lease) = stream.next_frame().await.unwrap().unwrap();
+        assert!(matches!(
+            active,
+            StreamFrameKind::Notification { ref method, .. }
+                if method == "notifications/events/active"
+        ));
+        drop(lease);
+        std::fs::write(stop, b"stop").unwrap();
+        let (frame, lease) = timeout(Duration::from_secs(5), stream.next_frame())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let StreamFrameKind::Error { error } = frame else {
+            panic!("closed stdio stream must report its failure");
+        };
+        let assert_tail = |error: &Failure| {
+            assert_eq!(error.code, 6);
+            assert_eq!(error.kind, "session_lost");
+            assert!(
+                error.data.as_ref().unwrap()["stderr_tail"]
+                    .as_str()
+                    .unwrap()
+                    .contains("events fixture stopped: after-active")
+            );
+        };
+        assert_tail(&error);
+        drop(error);
+        drop(lease);
+        drop(stream);
+
+        for operation in [
+            Operation::EventsList {
+                server: "srv".into(),
+            },
+            Operation::EventsPoll {
+                server: "srv".into(),
+                event: "pr.merged".into(),
+                arguments: None,
+                cursor: None,
+                max_age_ms: None,
+                max_events: None,
+            },
+            Operation::Server {
+                server: "srv".into(),
+            },
+        ] {
+            let request = paths
+                .request(&loaded.digest, operation, Duration::from_secs(5))
+                .unwrap();
+            let error = runtime::exchange(&paths, &request).await.unwrap_err();
+            assert_tail(error.downcast_ref::<Failure>().unwrap());
+        }
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["server/discover", "events/stream"]
+        );
+        runtime::stop(&paths).await.unwrap();
+        daemon_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn queued_events_do_not_block_an_earlier_ordinary_request() {
         let (url, server_task) = start_mock_events_http_server().await;

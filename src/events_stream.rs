@@ -162,29 +162,27 @@ impl DirectTransport {
         self.connection
     }
 
-    fn check_connection(&self) -> Result<()> {
+    async fn check_connection(&self) -> Result<()> {
         if self.connection.is_closed() {
-            return Err(Failure::new(
-                6,
-                "session_lost",
-                "direct MCP connection closed; restart the command to open a new session",
-            )
-            .into());
+            return Err(self.request_error(self.connection.closed_error().await));
         }
         Ok(())
     }
 
     fn request_error(&self, error: anyhow::Error) -> anyhow::Error {
-        self.check_connection().err().unwrap_or_else(|| {
-            daemon::mcp_error_for_server(error, false, self.server.as_deref()).into()
-        })
+        let mut failure = daemon::mcp_error_for_server(error, false, self.server.as_deref());
+        if self.connection.is_closed() {
+            failure.code = 6;
+            failure.kind = "session_lost".into();
+        }
+        failure.into()
     }
 }
 
 impl EventTransport for DirectTransport {
     fn list_events(&mut self, budget: Duration) -> BoxFuture<'_, Result<Leased<Vec<Value>>>> {
         Box::pin(async move {
-            self.check_connection()?;
+            self.check_connection().await?;
             let events = self
                 .connection
                 .list_events(budget)
@@ -200,7 +198,7 @@ impl EventTransport for DirectTransport {
         budget: Duration,
     ) -> BoxFuture<'_, Result<Leased<Value>>> {
         Box::pin(async move {
-            self.check_connection()?;
+            self.check_connection().await?;
             let (params, _params_lease) = params.into_parts();
             let polled = self
                 .connection
@@ -217,7 +215,7 @@ impl EventTransport for DirectTransport {
         budget: Duration,
     ) -> BoxFuture<'_, Result<Box<dyn EventStreamChannel>>> {
         Box::pin(async move {
-            self.check_connection()?;
+            self.check_connection().await?;
             let (params, _params_lease) = params.into_parts();
             let (handle, rx) = self
                 .connection
@@ -420,7 +418,8 @@ fn is_fatal_error(error: &anyhow::Error) -> bool {
 fn is_unsupported_error(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<Failure>()
-        .and_then(|f| f.rpc_error.as_ref())
+        .filter(|failure| failure.kind == "mcp_protocol")
+        .and_then(|failure| failure.rpc_error.as_ref())
         .and_then(|rpc| rpc.get("code"))
         .and_then(Value::as_i64)
         == Some(-32026)
@@ -1304,6 +1303,275 @@ mod tests {
             min_poll_interval: Duration::from_millis(20),
             initial_backoff: Duration::from_millis(10),
             max_backoff: Duration::from_millis(40),
+        }
+    }
+
+    fn exit_server_config(
+        phase: &str,
+        stop: &std::path::Path,
+        log: &std::path::Path,
+    ) -> crate::config::ServerConfig {
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        crate::config::ServerConfig::Stdio {
+            command: python,
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                include_str!("../tests/fixtures/events_exit_server.py").into(),
+                phase.into(),
+                stop.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            description: None,
+            enabled: true,
+            timeout: None,
+        }
+    }
+
+    fn assert_closed_diagnostic(error: &anyhow::Error, phase: &str) {
+        let failure = error.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.code, 6);
+        assert_eq!(failure.kind, "session_lost");
+        assert!(is_fatal_error(error));
+        assert!(
+            failure.data.as_ref().unwrap()["stderr_tail"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("events fixture stopped: {phase}"))
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_stream_requests_preserve_stderr_on_server_exit() {
+        for (phase, mode) in [
+            ("events/list", StreamMode::Auto),
+            ("events/poll", StreamMode::Poll),
+            ("events/stream", StreamMode::Push),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("requests");
+            let config = exit_server_config(phase, &dir.path().join("stop"), &log);
+            let budget = ByteBudget::new(1024 * 1024);
+            let limits = crate::mcp::McpLimits {
+                budget: budget.clone(),
+                ..crate::mcp::McpLimits::default()
+            };
+            let connection =
+                McpConnection::connect_with_limits(&config, Duration::from_secs(5), limits)
+                    .await
+                    .unwrap();
+            let mut transport = DirectTransport::with_server(connection, "srv".into());
+            let mut config = base_config(None);
+            config.mode = mode;
+            let timings = StreamTimings {
+                handshake_timeout: Duration::from_secs(5),
+                ..fast_timings()
+            };
+            let error = run_stream(
+                &mut transport,
+                &config,
+                timings,
+                CancellationToken::new(),
+                Some(&mut Vec::new()),
+            )
+            .await
+            .unwrap_err();
+            assert_closed_diagnostic(&error, phase);
+            assert_eq!(
+                std::fs::read_to_string(log)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["server/discover", phase]
+            );
+            drop(error);
+            let mut connection = transport.into_connection();
+            connection.close().await.unwrap();
+            drop(connection);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_preclosed_requests_keep_diagnostics_and_error_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = dir.path().join("stop");
+        let log = dir.path().join("requests");
+        let config = exit_server_config("after-active", &stop, &log);
+        let budget = ByteBudget::new(1024 * 1024);
+        let limits = crate::mcp::McpLimits {
+            budget: budget.clone(),
+            ..crate::mcp::McpLimits::default()
+        };
+        let connection =
+            McpConnection::connect_with_limits(&config, Duration::from_secs(5), limits)
+                .await
+                .unwrap();
+        let mut transport = DirectTransport::with_server(connection, "srv".into());
+        let params = || StreamEventsParams {
+            name: "pr.merged".into(),
+            arguments: None,
+            cursor: None,
+            max_age_ms: None,
+            heartbeat_ms: None,
+        };
+        let mut channel = transport
+            .open_stream(
+                Leased::new(params(), budget.empty_lease()),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let active = channel.next_item().await.unwrap().unwrap();
+        assert!(matches!(
+            &*active,
+            RawStreamEvent::Notification { method, .. }
+                if method == "notifications/events/active"
+        ));
+        drop(active);
+        std::fs::write(stop, b"stop").unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), channel.next_item())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        channel.close().await;
+        timeout(Duration::from_secs(5), async {
+            while !transport.connection.is_closed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let error = transport
+            .list_events(Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert_closed_diagnostic(&error, "after-active");
+        drop(error);
+        let poll = PollEventsParams {
+            name: "pr.merged".into(),
+            arguments: None,
+            cursor: None,
+            max_age_ms: None,
+            max_events: None,
+        };
+        let error = transport
+            .poll_events(
+                Leased::new(poll, budget.empty_lease()),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_err();
+        assert_closed_diagnostic(&error, "after-active");
+        drop(error);
+        let error = transport
+            .open_stream(
+                Leased::new(params(), budget.empty_lease()),
+                Duration::from_secs(5),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_closed_diagnostic(&error, "after-active");
+        drop(error);
+        assert_eq!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .collect::<Vec<_>>(),
+            ["server/discover", "events/stream"]
+        );
+
+        let payload_budget = ByteBudget::new(64);
+        let rpc_error = std::sync::Arc::new(json!({
+            "code": -32026, "message": "push unavailable", "data": {"retry": "poll"}
+        }));
+        let error = crate::mcp::McpFailure {
+            kind: crate::mcp::FailureKind::Protocol,
+            message: "specific subscription diagnostic".into(),
+            outcome_unknown: true,
+            rpc_error: Some(rpc_error.clone()),
+            auth: None,
+            stderr_tail: Some("ordinary stderr diagnostic".into()),
+            lease: Some(std::sync::Arc::new(payload_budget.try_acquire(64).unwrap())),
+        };
+        let mapped = transport.request_error(error.into());
+        let failure = mapped.downcast_ref::<Failure>().unwrap();
+        assert_eq!(failure.code, 6);
+        assert_eq!(failure.kind, "session_lost");
+        assert_eq!(failure.message, "specific subscription diagnostic");
+        assert!(failure.outcome_unknown);
+        assert!(std::sync::Arc::ptr_eq(
+            failure.rpc_error.as_ref().unwrap(),
+            &rpc_error
+        ));
+        assert_eq!(
+            failure.data.as_ref().unwrap()["stderr_tail"],
+            "ordinary stderr diagnostic"
+        );
+        assert!(!is_unsupported_error(&mapped));
+        let retained = failure.clone();
+        drop(mapped);
+        assert_eq!(payload_budget.used(), 64);
+        drop(retained);
+        assert_eq!(payload_budget.used(), 0);
+        let mut connection = transport.into_connection();
+        connection.close().await.unwrap();
+        drop(connection);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_rpc_fallback_requires_a_live_session() {
+        for closed in [false, true] {
+            let mut failure = if closed {
+                Failure::new(6, "session_lost", "connection ended")
+            } else {
+                Failure::new(4, "mcp_protocol", "push unavailable")
+            };
+            failure.rpc_error = Some(std::sync::Arc::new(json!({
+                "code": -32026, "message": "push unavailable"
+            })));
+            let mut transport = MockTransport {
+                listed: vec![json!({"name": "pr.merged", "delivery": ["push", "poll"]})],
+                polls: VecDeque::from([json!({
+                    "events": [{"eventId": "one", "name": "pr.merged", "data": {}}],
+                    "hasMore": false
+                })]),
+                poll_cursors: Vec::new(),
+                streams: VecDeque::from([VecDeque::from([MockStep::Yield(
+                    RawStreamEvent::Error(failure),
+                )])]),
+                stream_cursors: Vec::new(),
+                budget: ByteBudget::new(1 << 20),
+            };
+            let mut config = base_config(None);
+            config.once = true;
+            let result = run_stream(
+                &mut transport,
+                &config,
+                fast_timings(),
+                CancellationToken::new(),
+                Some(&mut Vec::new()),
+            )
+            .await;
+            if closed {
+                assert_eq!(
+                    result.unwrap_err().downcast_ref::<Failure>().unwrap().kind,
+                    "session_lost"
+                );
+                assert!(transport.poll_cursors.is_empty());
+            } else {
+                result.unwrap();
+                assert_eq!(transport.poll_cursors, [None]);
+            }
         }
     }
 
