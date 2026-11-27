@@ -742,7 +742,7 @@ for line in sys.stdin:
     // 1. Handshake failure surfaces sanitized stderr_tail and releases ByteBudget.
     let budget = ByteBudget::new(256 * 1024);
     let fail_cfg = ServerConfig::Stdio {
-        command: "python3".into(),
+        command: python(),
         args: vec![script.display().to_string(), "fail_handshake".into()],
         env: BTreeMap::new(),
         cwd: None,
@@ -767,7 +767,7 @@ for line in sys.stdin:
     //    silent tool times out, explicit hard cap cuts off continuous progress,
     //    and close() releases all budget leases including StderrCapture.
     let ok_cfg = ServerConfig::Stdio {
-        command: "python3".into(),
+        command: python(),
         args: vec![script.display().to_string(), "run".into()],
         env: BTreeMap::new(),
         cwd: None,

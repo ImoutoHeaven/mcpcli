@@ -2077,36 +2077,61 @@ async fn read_stdin_callback(expected_state: &str, canonical_issuer: &str) -> Re
     parse_pasted_callback(&text, expected_state, canonical_issuer)
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 async fn read_stdin_callback(expected_state: &str, canonical_issuer: &str) -> Result<String> {
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        match reader.read(&mut byte).await {
-            Ok(0) => {
-                if line.is_empty() {
-                    return std::future::pending().await;
-                }
-                break;
-            }
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                if line.len() >= 8 * 1024 {
-                    return Err(Failure::new(
-                        2,
-                        "arguments",
-                        "OAuth callback input on stdin exceeds 8 KiB",
-                    )
-                    .into());
-                }
-                line.push(byte[0]);
-            }
-            Err(_) => return std::future::pending().await,
-        }
+    use std::io::Read as _;
+
+    enum StdinLine {
+        Line(Vec<u8>),
+        TooLong,
+        Pending,
     }
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name("oauth-stdin".into())
+        .spawn(move || {
+            let mut stdin = io::stdin();
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            let outcome = loop {
+                match stdin.read(&mut byte) {
+                    Ok(0) => {
+                        if line.is_empty() {
+                            break StdinLine::Pending;
+                        }
+                        break StdinLine::Line(line);
+                    }
+                    Ok(_) => {
+                        if byte[0] == b'\n' {
+                            break StdinLine::Line(line);
+                        }
+                        if line.len() >= 8 * 1024 {
+                            break StdinLine::TooLong;
+                        }
+                        line.push(byte[0]);
+                    }
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break StdinLine::Pending,
+                }
+            };
+            let _ = tx.send(outcome);
+        });
+    if spawned.is_err() {
+        return std::future::pending().await;
+    }
+    let line = match rx.await {
+        Ok(StdinLine::Line(line)) => line,
+        Ok(StdinLine::TooLong) => {
+            return Err(Failure::new(
+                2,
+                "arguments",
+                "OAuth callback input on stdin exceeds 8 KiB",
+            )
+            .into());
+        }
+        Ok(StdinLine::Pending) | Err(_) => return std::future::pending().await,
+    };
     let text = String::from_utf8(line)
         .map_err(|_| Failure::new(2, "arguments", "OAuth callback input on stdin is not UTF-8"))?;
     if text.trim().is_empty() {
