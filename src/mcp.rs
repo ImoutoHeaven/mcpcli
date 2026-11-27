@@ -492,12 +492,13 @@ struct StderrRing {
 }
 
 impl StderrRing {
-    fn new(cap: usize, lease: ByteLease) -> Self {
-        Self {
-            buf: VecDeque::with_capacity(cap.min(4096)),
-            cap,
-            lease,
+    fn try_new(cap: usize, mut lease: ByteLease) -> Option<Self> {
+        let mut buf = VecDeque::new();
+        buf.try_reserve_exact(cap).ok()?;
+        if !lease.try_grow(buf.capacity().saturating_sub(lease.bytes())) {
+            return None;
         }
+        Some(Self { buf, cap, lease })
     }
 
     fn push(&mut self, bytes: &[u8]) {
@@ -563,8 +564,8 @@ pub(crate) struct StderrCapture {
 }
 
 impl StderrCapture {
-    fn spawn(mut stderr: ChildStderr, cap: usize, lease: ByteLease) -> Arc<Self> {
-        let ring = Arc::new(Mutex::new(StderrRing::new(cap, lease)));
+    fn spawn(mut stderr: ChildStderr, ring: StderrRing) -> Arc<Self> {
+        let ring = Arc::new(Mutex::new(ring));
         let (done_tx, done_rx) = tokio::sync::watch::channel(false);
         let task_ring = ring.clone();
         let handle = tokio::spawn(async move {
@@ -2197,12 +2198,14 @@ impl ChildTransport<ChildStdout, ChildStdin> {
         stderr_tail_bytes: usize,
         budget: Arc<ByteBudget>,
     ) -> std::io::Result<(Self, Option<Arc<StderrCapture>>)> {
-        let stderr_lease = if stderr_tail_bytes > 0 {
-            budget.try_acquire(stderr_tail_bytes)
+        let stderr_ring = if stderr_tail_bytes > 0 {
+            budget
+                .try_acquire(stderr_tail_bytes)
+                .and_then(|lease| StderrRing::try_new(stderr_tail_bytes, lease))
         } else {
             None
         };
-        let capture_stderr = stderr_lease.is_some();
+        let capture_stderr = stderr_ring.is_some();
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2237,10 +2240,8 @@ impl ChildTransport<ChildStdout, ChildStdin> {
         };
         let stdout = child.stdout.take().expect("piped stdout");
         let stdin = child.stdin.take().expect("piped stdin");
-        let stderr_capture = match (child.stderr.take(), stderr_lease) {
-            (Some(stderr), Some(lease)) => {
-                Some(StderrCapture::spawn(stderr, stderr_tail_bytes, lease))
-            }
+        let stderr_capture = match (child.stderr.take(), stderr_ring) {
+            (Some(stderr), Some(ring)) => Some(StderrCapture::spawn(stderr, ring)),
             _ => None,
         };
         let line_lease = budget.empty_lease();
@@ -4731,13 +4732,71 @@ mod stderr_capture_tests {
         // Ring slicing at 4096 bytes across 3-byte characters produces valid UTF-8 with no replacement char.
         let budget = ByteBudget::new(32 * 1024);
         let lease = budget.try_acquire(DEFAULT_STDERR_TAIL_BYTES).unwrap();
-        let mut ring = StderrRing::new(DEFAULT_STDERR_TAIL_BYTES, lease);
+        let mut ring = StderrRing::try_new(DEFAULT_STDERR_TAIL_BYTES, lease).unwrap();
         let payload = "你".repeat(2000); // 6000 bytes (> 4096)
         ring.push(payload.as_bytes());
         let tail = format_stderr_tail(&ring.tail_bytes(MAX_STDERR_SNAPSHOT_BYTES)).unwrap();
         assert!(!tail.contains('\u{FFFD}'));
         assert!(tail.ends_with("你好".chars().next().unwrap()));
         assert!(tail.len() <= MAX_STDERR_SNAPSHOT_BYTES);
+    }
+
+    #[test]
+    fn stderr_ring_preallocates_charged_capacity_and_never_grows() {
+        for cap in [31, 4_097, DEFAULT_STDERR_TAIL_BYTES] {
+            let budget = ByteBudget::new(64 * 1024);
+            let lease = budget.try_acquire(cap).unwrap();
+            let mut ring = StderrRing::try_new(cap, lease).unwrap();
+            let allocated = ring.buf.capacity();
+            assert!(allocated >= cap);
+            assert_eq!(ring.lease.bytes(), allocated);
+            assert_eq!(budget.used(), allocated);
+            for _ in 0..8 {
+                ring.push(&[b'a'; 4_096]);
+                ring.push(b"tail");
+                assert!(ring.buf.len() <= cap);
+                assert_eq!(ring.buf.capacity(), allocated);
+                assert_eq!(budget.used(), allocated);
+                assert_eq!(ring.tail_bytes(4), b"tail");
+            }
+            drop(ring);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stderr_capture_budget_fallback_keeps_child_stdio_working() {
+        let budget = ByteBudget::new(4_096);
+        let python = std::env::var("MCPCLI_TEST_PYTHON")
+            .unwrap_or_else(|_| if cfg!(windows) { "python" } else { "python3" }.into());
+        let mut command = Command::new(python);
+        command.args([
+            "-c",
+            "import sys; sys.stderr.write('fallback diagnostic\\n'); sys.stderr.flush(); print('ready', flush=True)",
+        ]);
+        let (mut transport, capture) = ChildTransport::spawn_observed(
+            command,
+            CleanupState::default(),
+            Ingress::default(),
+            Arc::new(TransportTermination::default()),
+            MAX_RESPONSE_BYTES,
+            4_097,
+            budget.clone(),
+        )
+        .unwrap();
+        assert!(capture.is_none());
+        assert_eq!(budget.used(), 0);
+        let mut output = String::new();
+        timeout(
+            Duration::from_secs(5),
+            transport.read.read_line(&mut output),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(output.trim_end(), "ready");
+        transport.shutdown().await.unwrap();
+        assert_eq!(budget.used(), 0);
     }
 
     #[cfg(unix)]
