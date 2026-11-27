@@ -136,36 +136,68 @@ pub fn safe_text(text: &str) -> String {
 }
 
 pub fn summary_description(text: &str) -> Option<String> {
-    let normalized = safe_text(text);
-    let line = normalized
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())?;
-    let mut chars = line.chars();
-    let mut result: String = chars.by_ref().take(256).collect();
-    if chars.next().is_some() {
-        result.push('…');
+    let mut result = String::with_capacity(256 * 4 + '…'.len_utf8());
+    for line in text.split_inclusive('\n') {
+        let line = match line.strip_suffix('\n') {
+            Some(line) => line.strip_suffix('\r').unwrap_or(line),
+            None => line,
+        };
+        result.clear();
+        let mut count = 0usize;
+        let mut last_nonspace = 0usize;
+        let mut truncated = false;
+        let mut push = |character: char| {
+            if count == 0 && character.is_whitespace() {
+                return true;
+            }
+            count = count.saturating_add(1);
+            if count <= 256 {
+                result.push(character);
+                if !character.is_whitespace() {
+                    last_nonspace = result.len();
+                }
+            }
+            count <= 256 || character.is_whitespace()
+        };
+        for character in line.chars() {
+            let keep = if character.is_control() && character != '\t' {
+                character.escape_default().all(&mut push)
+            } else {
+                push(character)
+            };
+            if !keep {
+                truncated = true;
+                break;
+            }
+        }
+        if truncated {
+            result.push('…');
+        } else {
+            result.truncate(last_nonspace);
+        }
+        if !result.is_empty() {
+            result.shrink_to_fit();
+            return Some(result);
+        }
     }
-    Some(result)
+    None
 }
 
-pub fn summarize_tool(tool: &Value) -> Value {
-    let Some(object) = tool.as_object() else {
-        return tool.clone();
+pub fn summarize_tool(mut tool: Value) -> Value {
+    let Some(object) = tool.as_object_mut() else {
+        return tool;
     };
     let mut summary = Map::new();
-    if let Some(name) = object.get("name").and_then(Value::as_str) {
-        summary.insert("name".into(), Value::String(name.to_owned()));
+    if let Some(name) = object.remove("name").filter(Value::is_string) {
+        summary.insert("name".into(), name);
     }
-    if let Some(description) = object
-        .get("description")
-        .and_then(Value::as_str)
-        .and_then(summary_description)
+    if let Some(Value::String(description)) = object.remove("description")
+        && let Some(description) = summary_description(&description)
     {
         summary.insert("description".into(), Value::String(description));
     }
-    if let Some(annotations) = object.get("annotations").filter(|value| value.is_object()) {
-        summary.insert("annotations".into(), annotations.clone());
+    if let Some(annotations) = object.remove("annotations").filter(Value::is_object) {
+        summary.insert("annotations".into(), annotations);
     }
     Value::Object(summary)
 }
@@ -275,6 +307,30 @@ mod tests {
     }
 
     #[test]
+    fn summary_bounds_work_before_normalizing_long_descriptions() {
+        assert_eq!(
+            summary_description(&format!("word{}\nignored", " ".repeat(64 << 10))),
+            Some("word".into())
+        );
+        assert_eq!(
+            summary_description(&format!("word{}end", " ".repeat(64 << 10))),
+            Some(format!("word{}…", " ".repeat(252)))
+        );
+        assert_eq!(summary_description("\u{85}\nnext"), Some("\\u{85}".into()));
+        assert_eq!(
+            summary_description("\r\n\t \nlast\r"),
+            Some("last\\r".into())
+        );
+        assert_eq!(
+            summary_description(&"😀".repeat(64 << 10))
+                .unwrap()
+                .chars()
+                .count(),
+            257
+        );
+    }
+
+    #[test]
     fn summarize_tool_projects_first_non_empty_line_and_annotations() {
         let long_line = "😀".repeat(260);
         let tool = json!({
@@ -284,7 +340,7 @@ mod tests {
             "annotations": {"readOnlyHint": true, "openWorldHint": false},
             "_meta": {"internal": 1}
         });
-        let summary = summarize_tool(&tool);
+        let summary = summarize_tool(tool);
         assert_eq!(summary["name"], "search_docs");
         let desc = summary["description"].as_str().unwrap();
         assert_eq!(desc.chars().count(), 257);
@@ -296,14 +352,14 @@ mod tests {
         assert!(summary.get("inputSchema").is_none());
         assert!(summary.get("_meta").is_none());
 
-        let blank_desc = summarize_tool(&json!({
+        let blank_desc = summarize_tool(json!({
             "name": "noop",
             "description": "  \r\n\t  ",
             "inputSchema": {}
         }));
         assert_eq!(blank_desc, json!({"name": "noop"}));
 
-        let control_desc = summarize_tool(&json!({
+        let control_desc = summarize_tool(json!({
             "name": "ctrl",
             "description": "first\u{1b}[31mred\rnext\nsecond"
         }));

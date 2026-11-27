@@ -47,7 +47,7 @@ struct Cli {
         long,
         global = true,
         value_parser = clap::value_parser!(u64).range(1..),
-        help = "Request deadline in seconds (1-3600, default 60), or milliseconds for `events stream`"
+        help = "Request timeout in seconds (1-3600; server default or 60); call inactivity timeout; events stream total milliseconds"
     )]
     timeout: Option<u64>,
     #[arg(
@@ -409,7 +409,11 @@ impl Output {
         self
     }
     fn with_lease(mut self, lease: Option<mcpcli::budget::ByteLease>) -> Self {
-        self.lease = lease;
+        match (&mut self.lease, lease) {
+            (Some(current), Some(extra)) => current.merge(extra),
+            (None, lease) => self.lease = lease,
+            _ => {}
+        }
         self
     }
     fn cleanup(mut self, error: Option<Failure>) -> Self {
@@ -951,12 +955,23 @@ fn write_tools_text(stdout: &mut impl Write, value: &Value) -> std::io::Result<(
     fn render_tools<'a>(
         stdout: &mut impl Write,
         tools: impl Iterator<Item = &'a Value>,
+        first_line: bool,
     ) -> std::io::Result<()> {
         let parts = tools.enumerate().flat_map(|(index, tool)| {
             let name = tool["name"].as_str().unwrap_or("<unnamed>");
             let description = tool["description"]
                 .as_str()
-                .filter(|description| !description.is_empty());
+                .filter(|description| !description.is_empty())
+                .and_then(|description| {
+                    if first_line {
+                        description
+                            .lines()
+                            .map(str::trim)
+                            .find(|line| !line.is_empty())
+                    } else {
+                        Some(description)
+                    }
+                });
             [
                 (index > 0).then_some("\n\n"),
                 Some(name),
@@ -970,11 +985,80 @@ fn write_tools_text(stdout: &mut impl Write, value: &Value) -> std::io::Result<(
     }
 
     if let Some(tools) = value.get("tools").and_then(Value::as_array) {
-        render_tools(stdout, tools.iter())
+        render_tools(stdout, tools.iter(), true)
     } else {
         let tools = listed_tools(value).map_err(std::io::Error::other)?;
-        render_tools(stdout, tools)
+        render_tools(stdout, tools, false)
     }
+}
+
+fn project_tools(
+    mut value: Value,
+    filter: Option<&str>,
+    summary: bool,
+    budget: &std::sync::Arc<ByteBudget>,
+) -> Result<Leased<Value>> {
+    let _ = listed_tools(&value)?;
+    let mut projection_lease = budget.empty_lease();
+    let needle = filter.map(str::to_lowercase);
+    let mut selected = Vec::new();
+    let Value::Array(pages) = value["pages"].take() else {
+        unreachable!("validated pages")
+    };
+    for mut page in pages {
+        let Value::Array(tools) = page["tools"].take() else {
+            unreachable!("validated tools")
+        };
+        for tool in tools {
+            let mut matched = needle.is_none();
+            if let Some(needle) = &needle {
+                for field in ["name", "description"] {
+                    if let Some(text) = tool.get(field).and_then(Value::as_str) {
+                        // Cover UTF-8 lowercasing and its allocation growth before copying.
+                        let _scratch = budget
+                            .try_acquire(text.len().saturating_mul(4))
+                            .ok_or_else(|| {
+                                Failure::new(
+                                    1,
+                                    "memory_limit_exceeded",
+                                    "Tool filtering exceeds the active memory limit",
+                                )
+                            })?;
+                        if text.to_lowercase().contains(needle) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if matched {
+                let tool = if summary {
+                    let mut description_lease =
+                        budget.try_acquire(2 * 4 * 257).ok_or_else(|| {
+                            Failure::new(
+                                1,
+                                "memory_limit_exceeded",
+                                "Tool summary exceeds the active memory limit",
+                            )
+                        })?;
+                    let tool = discovery::summarize_tool(tool);
+                    let bytes = match tool.get("description") {
+                        Some(Value::String(description)) => description.capacity(),
+                        _ => 0,
+                    };
+                    description_lease.shrink_to(bytes);
+                    projection_lease.merge(description_lease);
+                    tool
+                } else {
+                    tool
+                };
+                selected.push(tool);
+            }
+        }
+    }
+    let mut output = Map::new();
+    output.insert("tools".into(), Value::Array(selected));
+    Ok(Leased::new(Value::Object(output), projection_lease))
 }
 
 fn take_listed_tool(value: &mut Value, name: &str) -> Result<Value> {
@@ -1333,36 +1417,17 @@ async fn run(cli: &Cli, uncertain: &AtomicBool) -> Result<Output> {
             )
             .await?;
             Ok(remote.into_output(|value| {
-                let value = if filter.is_some() || *summary {
-                    let needle = filter.as_deref().map(str::to_lowercase);
-                    let tools: Vec<Value> = listed_tools(&value)?
-                        .filter(|tool| {
-                            needle.as_ref().is_none_or(|q| {
-                                tool.get("name")
-                                    .and_then(Value::as_str)
-                                    .is_some_and(|name| name.to_lowercase().contains(q))
-                                    || tool
-                                        .get("description")
-                                        .and_then(Value::as_str)
-                                        .is_some_and(|desc| desc.to_lowercase().contains(q))
-                            })
-                        })
-                        .map(|tool| {
-                            if *summary {
-                                discovery::summarize_tool(tool)
-                            } else {
-                                tool.clone()
-                            }
-                        })
-                        .collect();
-                    json!({ "tools": tools })
+                if filter.is_some() || *summary {
+                    let (value, lease) =
+                        project_tools(value, filter.as_deref(), *summary, ByteBudget::global())?
+                            .into_parts();
+                    Ok(Output::json(value).with_lease(Some(lease)))
                 } else {
                     if cli.text {
                         let _ = listed_tools(&value)?;
                     }
-                    value
-                };
-                Ok(Output::json(value))
+                    Ok(Output::json(value))
+                }
             }))
         }
         Command::Inspect { server, tool } => {
@@ -2754,6 +2819,79 @@ mod tests {
             ]
         });
         assert_eq!(tools_text(&flat).unwrap(), "alpha\nFirst line\n\nbeta\n");
+    }
+
+    #[test]
+    fn tools_projection_moves_payloads_and_retains_new_description_lease() {
+        for summary in [false, true] {
+            let value = json!({"pages":[{"tools":[{
+                "name":"sample", "description":"First line\nSecond line",
+                "inputSchema":{"type":"object", "description":"s".repeat(64 << 10)},
+                "annotations":{"note":"a".repeat(64 << 10)}
+            }]}]});
+            let annotation = value["pages"][0]["tools"][0]["annotations"]["note"]
+                .as_str()
+                .unwrap()
+                .as_ptr();
+            let schema = value["pages"][0]["tools"][0]["inputSchema"]["description"]
+                .as_str()
+                .unwrap()
+                .as_ptr();
+            let bytes = input::serialized_len(&value).unwrap();
+            let budget = ByteBudget::new(bytes + 2 * 4 * 257);
+            let source_lease = budget.try_acquire(bytes).unwrap();
+            let remote = RemoteOutput {
+                value,
+                connection: None,
+                inflight: None,
+                lease: Some(source_lease),
+            };
+            let output = remote.into_output(|value| {
+                let (value, lease) =
+                    project_tools(value, Some("SAMPLE"), summary, &budget)?.into_parts();
+                Ok(Output::json(value).with_lease(Some(lease)))
+            });
+            assert_eq!(output.code, 0);
+            let selected = &output.value.as_ref().unwrap()["tools"][0];
+            assert_eq!(
+                selected["annotations"]["note"].as_str().unwrap().as_ptr(),
+                annotation
+            );
+            if summary {
+                assert_eq!(selected["description"], "First line");
+                assert!(selected.get("inputSchema").is_none());
+                assert!(budget.used() > bytes);
+            } else {
+                assert_eq!(
+                    selected["inputSchema"]["description"]
+                        .as_str()
+                        .unwrap()
+                        .as_ptr(),
+                    schema
+                );
+                assert_eq!(selected["description"], "First line\nSecond line");
+                assert_eq!(budget.used(), bytes);
+            }
+            assert_eq!(output.lease.as_ref().unwrap().bytes(), budget.used());
+            drop(output);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn filtered_text_uses_first_nonempty_line_without_changing_json() {
+        let flat =
+            json!({"tools":[{"name":"sample", "description":"\n First line \nSecond line"}]});
+        assert_eq!(tools_text(&flat).unwrap(), "sample\nFirst line\n");
+        assert_eq!(
+            flat["tools"][0]["description"],
+            "\n First line \nSecond line"
+        );
+        let pages = json!({"pages":[{"tools":flat["tools"].clone()}]});
+        assert_eq!(
+            tools_text(&pages).unwrap(),
+            "sample\n\n First line \nSecond line\n"
+        );
     }
 
     #[test]
