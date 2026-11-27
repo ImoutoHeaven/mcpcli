@@ -1,6 +1,16 @@
 //! OAuth 2.1 PKCE client flow, RFC 9728/8414 discovery, `WWW-Authenticate` diagnostics,
 //! private credential persistence, and singleflight refresh rotation.
-use crate::{config::ServerConfig, discovery::safe_text, ipc::Failure, platform, runtime::Lock};
+use crate::{
+    config::ServerConfig,
+    discovery::safe_text,
+    ipc::Failure,
+    oauth_url::{
+        is_disallowed_remote_oauth_ip, is_loopback_literal_host, parse_url_host_ip,
+        validate_oauth_endpoint_url,
+    },
+    platform,
+    runtime::Lock,
+};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -9,7 +19,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     io::{self, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
@@ -224,83 +234,6 @@ pub fn canonical_resource_url(raw: &str) -> Result<String> {
     Ok(canonical)
 }
 
-fn parse_url_host_ip(host: &str) -> Option<IpAddr> {
-    if let Some(v6_str) = host.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
-        v6_str.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
-    } else {
-        host.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
-    }
-}
-
-fn is_loopback_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-    }
-}
-
-fn is_non_public_ipv4(v4: Ipv4Addr) -> bool {
-    let octets = v4.octets();
-    v4.is_loopback()
-        || v4.is_private()
-        || v4.is_link_local()
-        || v4.is_unspecified()
-        || v4.is_broadcast()
-        || v4.is_multicast()
-        || octets[0] == 0
-        || (octets[0] == 100 && (octets[1] & 0b1100_0000) == 64)
-        || (octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
-        || (octets[0] == 198 && (octets[1] & 0xfe) == 18)
-        || octets[0] >= 240
-}
-
-fn is_disallowed_remote_oauth_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_non_public_ipv4(v4),
-        IpAddr::V6(v6) => {
-            if let Some(v4) = v6.to_ipv4_mapped() {
-                return is_non_public_ipv4(v4);
-            }
-            let seg0 = v6.segments()[0];
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (seg0 & 0xfe00) == 0xfc00
-                || (seg0 & 0xffc0) == 0xfe80
-        }
-    }
-}
-
-pub(crate) fn is_loopback_literal_host(host: Option<&str>) -> bool {
-    let Some(h) = host else {
-        return false;
-    };
-    if let Some(ip) = parse_url_host_ip(h) {
-        return is_loopback_ip(ip);
-    }
-    let trimmed = h.trim_end_matches('.');
-    trimmed.eq_ignore_ascii_case("localhost")
-        || trimmed.to_ascii_lowercase().ends_with(".localhost")
-}
-
-fn is_disallowed_remote_oauth_host(host: &str) -> bool {
-    if let Some(ip) = parse_url_host_ip(host) {
-        return is_disallowed_remote_oauth_ip(ip);
-    }
-    let lower = host.trim_end_matches('.').to_ascii_lowercase();
-    lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "localhost.localdomain"
-        || lower == "ip6-localhost"
-        || lower == "ip6-loopback"
-        || lower.ends_with(".local")
-        || lower == "metadata"
-        || lower == "metadata.google.internal"
-        || lower == "instance-data"
-}
-
 fn validate_mcp_server_url(raw: &str) -> Result<(reqwest::Url, bool)> {
     let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid MCP server URL"))?;
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
@@ -316,40 +249,6 @@ fn validate_mcp_server_url(raw: &str) -> Result<(reqwest::Url, bool)> {
         _ => bail!(
             "MCP server must use https:// or loopback http:// (127.0.0.0/8, [::1], or localhost)"
         ),
-    }
-}
-
-/// Validate OAuth discovery, registration, authorization, token, or revocation URLs.
-pub fn validate_oauth_endpoint_url(
-    raw: &str,
-    label: &str,
-    allow_loopback: bool,
-) -> Result<reqwest::Url> {
-    let url = reqwest::Url::parse(raw).map_err(|_| anyhow::anyhow!("invalid {label} URL"))?;
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        bail!("{label} URL must not include credentials or a fragment");
-    }
-    let Some(host) = url.host_str() else {
-        bail!("invalid {label} URL");
-    };
-    if allow_loopback {
-        match url.scheme() {
-            "https" => Ok(url),
-            "http" if is_loopback_literal_host(Some(host)) => Ok(url),
-            _ => bail!(
-                "{label} must use https:// or loopback http:// (127.0.0.0/8, [::1], or localhost)"
-            ),
-        }
-    } else {
-        if url.scheme() != "https" {
-            bail!("{label} must use https:// for non-loopback MCP servers");
-        }
-        if is_disallowed_remote_oauth_host(host) {
-            bail!(
-                "{label} must not target loopback, private, or metadata addresses for non-loopback MCP servers"
-            );
-        }
-        Ok(url)
     }
 }
 
@@ -1071,7 +970,7 @@ async fn credential_lock(resource: &str) -> Result<Lock> {
     // Keep one lock across filename aliases and the first store creation.
     let path = parent.join(format!(
         ".oauth-{}.lock",
-        crate::config::digest(resource.as_bytes())
+        crate::platform::digest(resource.as_bytes())
     ));
     // A refresh may take 15 seconds before committing its rotated token.
     Lock::acquire(&path, Duration::from_secs(30)).await

@@ -54,14 +54,14 @@ use crate::{
 mod events;
 mod ingress;
 mod sse;
+#[cfg(windows)]
+use crate::platform::windows_job;
 pub use events::{
     EVENTS_EXTENSION_ID, EventNotification, EventStreamHandle, EventStreamReceiver,
     MAX_EVENT_NOTIFICATION_BYTES, MAX_EVENT_PAGES, PollEventsParams, StreamEventsParams,
 };
 use events::{EventNotificationTransport, EventRouter, EventSchemaCache};
 use ingress::{Ingress, IngressError, ObserveOutcome};
-#[cfg(windows)]
-pub(crate) mod windows_job;
 
 pub const MAX_CONNECT: Duration = Duration::from_secs(30);
 pub const MAX_RESPONSE_BYTES: usize = 512 * 1024 * 1024;
@@ -632,7 +632,7 @@ impl McpConnection {
         );
         server.insert("result".into(), result);
         let (server_bytes, server_lease) =
-            crate::ipc::encode_json_leased(&server, limits.max_response_bytes, &limits.budget)?;
+            crate::json::encode_json_leased(&server, limits.max_response_bytes, &limits.budget)?;
         drop(server);
         drop(result_lease);
         Ok(Self {
@@ -1590,7 +1590,7 @@ fn encode_mcp_message(
     budget: &Arc<ByteBudget>,
     termination: &TransportTermination,
 ) -> std::io::Result<Leased<Vec<u8>>> {
-    crate::ipc::encode_json_leased(message, limit, budget).map(|(bytes, lease)| Leased::new(bytes, lease)).map_err(|error| {
+    crate::json::encode_json_leased(message, limit, budget).map(|(bytes, lease)| Leased::new(bytes, lease)).map_err(|error| {
         let reason = if error.kind() == std::io::ErrorKind::OutOfMemory {
             format!("MCP outgoing message exceeded the {} active memory limit", format_bytes(budget.limit()))
         } else { format!("MCP outgoing message could not be encoded within the {} message limit: {error}", format_bytes(limit)) };

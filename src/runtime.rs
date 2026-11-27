@@ -1,6 +1,6 @@
 //! Private runtime files and short-lived clients of the persistent daemon.
 use crate::budget::{ByteBudget, ByteLease, format_bytes};
-use crate::config::{LoadedConfig, digest, valid_name};
+use crate::config::{LoadedConfig, valid_name};
 use crate::ipc::{self, Failure, Operation, Request, Response, StreamFrame, StreamFrameKind};
 use crate::platform;
 pub use crate::platform::{private_dir, secure_file};
@@ -113,7 +113,7 @@ impl Paths {
         let mut key = config.as_os_str().as_encoded_bytes().to_vec();
         key.push(0);
         key.extend_from_slice(session.as_bytes());
-        let namespace = digest(&key)[..24].to_owned();
+        let namespace = platform::digest(&key)[..24].to_owned();
         let directory = root.join(&namespace);
         private_dir(&directory)?;
         let socket = platform::endpoint(&directory, false)?;

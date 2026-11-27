@@ -4,13 +4,23 @@ pub mod local;
 mod unix;
 #[cfg(windows)]
 mod windows;
+#[cfg(windows)]
+pub(crate) mod windows_job;
 #[cfg(unix)]
 pub use unix::*;
 #[cfg(windows)]
 pub use windows::*;
 
+use sha2::{Digest, Sha256};
 use std::io;
 use std::path::{Path, PathBuf};
+
+pub fn digest(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 /// Use the mapped executable on Linux even if its pathname was replaced.
 pub fn image_path() -> io::Result<PathBuf> {
@@ -95,7 +105,7 @@ pub fn endpoint(directory: &Path, control: bool) -> io::Result<PathBuf> {
         let mut identity = local::user_sid()?.into_bytes();
         identity.push(0);
         identity.extend_from_slice(directory.as_os_str().as_encoded_bytes());
-        let hash = crate::config::digest(&identity);
+        let hash = digest(&identity);
         Ok(PathBuf::from(format!(
             r"\\.\pipe\mcpcli-{}-{}",
             &hash[..32],

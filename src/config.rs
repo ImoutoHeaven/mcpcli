@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -345,13 +344,6 @@ fn diagnose_config_shape(value: &serde_json::Value) -> String {
         .into()
 }
 
-pub fn digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
-
 /// Management commands can still locate a daemon after its config is removed.
 pub fn locate(path: &Path) -> Result<PathBuf> {
     if path.exists() {
@@ -593,7 +585,7 @@ impl LoadedConfig {
             }
             *root = from_config_directory(parent, root)?;
         }
-        let digest = digest(&serde_json::to_vec(&config)?);
+        let digest = crate::platform::digest(&serde_json::to_vec(&config)?);
         Ok(Self {
             path,
             config,

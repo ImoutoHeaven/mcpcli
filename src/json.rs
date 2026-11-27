@@ -1,10 +1,13 @@
 //! JSON entry points reject duplicate keys, excessive depth, and numeric precision loss.
+use crate::budget::{ByteBudget, ByteLease};
 use anyhow::{Context, Result, bail, ensure};
+use serde::Serialize;
 use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 use std::fmt;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 const MAX_DEPTH: usize = 64;
 
@@ -293,6 +296,128 @@ pub fn read_file(path: &Path, max: usize) -> Result<Vec<u8>> {
         bail!("input must be a regular file");
     }
     read_limited(file, max)
+}
+
+struct LimitedVecWriter {
+    buf: Vec<u8>,
+    max: usize,
+    prefix: usize,
+    lease: ByteLease,
+    abort: Option<io::Error>,
+}
+
+impl LimitedVecWriter {
+    fn new(max: usize, budget: &Arc<ByteBudget>, prefix: usize) -> io::Result<Self> {
+        let mut lease = budget.empty_lease();
+        if !lease.try_grow(prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "IPC frame exceeded active memory limit",
+            ));
+        }
+        Ok(Self {
+            buf: vec![0u8; prefix],
+            max,
+            prefix,
+            lease,
+            abort: None,
+        })
+    }
+
+    fn finish(mut self) -> io::Result<(Vec<u8>, ByteLease)> {
+        if let Some(error) = self.abort {
+            return Err(error);
+        }
+        let payload_len = self.buf.len().saturating_sub(self.prefix);
+        if payload_len == 0 || payload_len > self.max || payload_len > u32::MAX as usize {
+            self.buf = Vec::new();
+            self.lease.release();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response exceeds frame limit",
+            ));
+        }
+        self.lease.shrink_to(self.buf.capacity());
+        if self.prefix == 4 {
+            self.buf[..4].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        }
+        Ok((self.buf, self.lease))
+    }
+}
+
+impl io::Write for LimitedVecWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(payload_len) = (self.buf.len() - self.prefix).checked_add(bytes.len()) else {
+            self.buf = Vec::new();
+            self.lease.release();
+            self.abort = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response exceeds frame limit",
+            ));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response exceeds frame limit",
+            ));
+        };
+        if payload_len > self.max || payload_len > u32::MAX as usize {
+            self.buf = Vec::new();
+            self.lease.release();
+            self.abort = Some(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response exceeds frame limit",
+            ));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "IPC response exceeds frame limit",
+            ));
+        }
+        let needed = self.prefix + payload_len;
+        if !self
+            .lease
+            .reserve_vec(&mut self.buf, needed, self.max.saturating_add(self.prefix))
+        {
+            self.buf = Vec::new();
+            self.lease.release();
+            self.abort = Some(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "IPC frame exceeded active memory limit",
+            ));
+            return Err(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "IPC frame exceeded active memory limit",
+            ));
+        }
+        self.buf.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub fn encode_json_leased<T: Serialize>(
+    value: &T,
+    max: usize,
+    budget: &Arc<ByteBudget>,
+) -> io::Result<(Vec<u8>, ByteLease)> {
+    encode_leased(value, max, budget, 0)
+}
+
+pub(crate) fn encode_leased<T: Serialize>(
+    value: &T,
+    max: usize,
+    budget: &Arc<ByteBudget>,
+    prefix: usize,
+) -> io::Result<(Vec<u8>, ByteLease)> {
+    let mut writer = LimitedVecWriter::new(max, budget, prefix)?;
+    if let Err(error) = serde_json::to_writer(&mut writer, value) {
+        if let Some(abort) = writer.abort.take() {
+            return Err(abort);
+        }
+        return Err(io::Error::other(error));
+    }
+    writer.finish()
 }
 
 #[cfg(test)]

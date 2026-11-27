@@ -22,7 +22,7 @@ use tokio::{
 };
 
 #[cfg(windows)]
-use crate::mcp::windows_job;
+use crate::platform::windows_job;
 
 pub const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(30);
 pub const GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);

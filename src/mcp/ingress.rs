@@ -369,7 +369,7 @@ impl Ingress {
             // Matched call/error responses are small stubs; lossless data stays
             // in the capture. The SDK's subsequent parse/queue is outside this
             // local owner's lifetime.
-            let (bytes, lease) = crate::ipc::encode_json_leased(&**message, limit, budget)
+            let (bytes, lease) = crate::json::encode_json_leased(&**message, limit, budget)
                 .map_err(|_| IngressError::MemoryExhausted)?;
             sse.data = Some(String::from_utf8(bytes).expect("JSON is UTF-8"));
             event_lease.merge(lease);

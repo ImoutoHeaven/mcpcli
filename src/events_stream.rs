@@ -620,7 +620,7 @@ impl<'a> Sink<'a> {
         check_running(deadline, cancel)?;
         let budget = ByteBudget::global();
         let (mut bytes, mut lease) =
-            crate::ipc::encode_json_leased(payload, crate::ipc::RESPONSE_LIMIT, budget)?;
+            crate::json::encode_json_leased(payload, crate::ipc::RESPONSE_LIMIT, budget)?;
         let needed = bytes.len().saturating_add(1);
         if !lease.reserve_vec(&mut bytes, needed, crate::ipc::RESPONSE_LIMIT + 1) {
             return Err(Failure::new(

@@ -18,6 +18,7 @@ pub mod ipc;
 pub mod json;
 pub mod mcp;
 pub mod media;
+pub mod oauth_url;
 pub mod runtime;
 pub mod skills;
 
