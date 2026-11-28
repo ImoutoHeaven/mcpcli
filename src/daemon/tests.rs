@@ -1136,6 +1136,87 @@ async fn start_mock_progress_http_server() -> (String, tokio::task::JoinHandle<(
 }
 
 #[tokio::test]
+async fn daemon_uses_one_budget_for_mcp_results_and_media_wrappers() {
+    let (url, server_task) = start_mock_progress_http_server().await;
+    #[cfg(unix)]
+    let base = tempfile::tempdir_in("/tmp").unwrap();
+    #[cfg(windows)]
+    let base = tempfile::tempdir().unwrap();
+    let base_path = base.path().canonicalize().unwrap();
+    let config_path = base_path.join("mcpcli.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "servers": { "mock": { "transport": "http", "url": url } }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let loaded = LoadedConfig::load(&config_path).unwrap();
+    let paths =
+        Paths::with_root(loaded.path.clone(), "shared-budget", &base_path.join("run")).unwrap();
+    let budget = crate::budget::ByteBudget::new(1024 * 1024);
+    let separate_mcp_budget = crate::budget::ByteBudget::new(1024 * 1024);
+    let options = DaemonOptions {
+        budget: budget.clone(),
+        mcp_limits: crate::mcp::McpLimits {
+            budget: separate_mcp_budget.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let daemon_task = tokio::spawn(run_with_options(paths.clone(), loaded.clone(), options));
+    timeout(runtime::START_WAIT, async {
+        loop {
+            if runtime::exchange(
+                &paths,
+                &paths
+                    .request("", Operation::Status, Duration::from_millis(200))
+                    .unwrap(),
+            )
+            .await
+            .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let request = paths
+        .request(
+            &loaded.digest,
+            Operation::Call {
+                server: "mock".into(),
+                tool: "progress_ok".into(),
+                arguments: serde_json::from_value(json!({ "steps": 0 })).unwrap(),
+                inline_media: false,
+                detach: false,
+                expected_schema: None,
+            },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    let (response, _lease) = runtime::exchange(&paths, &request).await.unwrap();
+    let value = response.result.unwrap();
+    assert_eq!(value["result"]["content"][0]["text"], "completed");
+    assert_eq!(value["savedMedia"], json!([]));
+    assert!(
+        budget.used() > 0,
+        "the MCP connection retains its server info"
+    );
+    assert_eq!(separate_mcp_budget.used(), 0);
+
+    runtime::stop(&paths).await.unwrap();
+    daemon_task.await.unwrap().unwrap();
+    assert_eq!(budget.used(), 0);
+    assert_eq!(separate_mcp_budget.used(), 0);
+    server_task.abort();
+}
+
+#[tokio::test]
 async fn dual_clock_call_progress_timeout_queue_timeout_and_force_reset() {
     let (url, server_task) = start_mock_progress_http_server().await;
     #[cfg(unix)]

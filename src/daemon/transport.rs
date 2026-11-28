@@ -624,8 +624,9 @@ pub async fn run(paths: Paths, config: LoadedConfig) -> Result<()> {
 pub async fn run_with_options(
     paths: Paths,
     config: LoadedConfig,
-    options: DaemonOptions,
+    mut options: DaemonOptions,
 ) -> Result<()> {
+    options.mcp_limits.budget = options.budget.clone();
     let _lifetime = Lock::acquire(&paths.daemon_lock(), START_WAIT)
         .await
         .context("cannot acquire daemon lifetime lock")?;
