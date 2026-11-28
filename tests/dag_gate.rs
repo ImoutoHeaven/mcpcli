@@ -42,11 +42,27 @@ const MAX_PROD_LINES: usize = 1500;
 
 /// Lateral dependency allowlist among `src/mcp/*.rs` sibling submodules.
 const MCP_SUBMODULE_DAG: &[(&str, &[&str])] = &[
-    ("ingress", &[]),
-    ("sse", &["ingress"]),
-    ("events", &["ingress", "sse"]),
-    ("skills", &["ingress"]),
-    ("tasks", &["ingress"]),
+    ("types", &[]),
+    ("ingress", &["types"]),
+    ("sse", &["types", "ingress"]),
+    ("events", &["types", "ingress", "sse"]),
+    ("stdio", &["types", "ingress"]),
+    ("http", &["types", "ingress", "sse", "events"]),
+    ("events_client", &["types", "ingress", "events", "stdio"]),
+    (
+        "connection",
+        &[
+            "types",
+            "ingress",
+            "sse",
+            "events",
+            "stdio",
+            "http",
+            "events_client",
+        ],
+    ),
+    ("skills", &["types", "ingress", "connection"]),
+    ("tasks", &["types", "ingress", "connection"]),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1448,6 +1464,11 @@ fn mcp_submodules_follow_dag_and_have_no_cycles() {
     assert!(
         cycles.is_empty(),
         "Tarjan SCC detected cycle(s) in src/mcp/ submodules: {cycles:?}"
+    );
+    let root_cycles = module_tree_scc_cycles(&src_root, "mcp", true);
+    assert!(
+        root_cycles.is_empty(),
+        "Tarjan SCC detected root-inclusive cycle(s) in src/mcp/: {root_cycles:?}"
     );
     assert!(
         violations.is_empty(),

@@ -9,78 +9,22 @@ use std::{
     time::Duration,
 };
 
-use rmcp::model::{
-    CancelTaskParams, CreateTaskResult, GetTaskParams, InputResponses, ProtocolVersion,
-    ServerPeerInfo, TaskStatus, UpdateTaskParams,
-};
+use rmcp::model::{CancelTaskParams, GetTaskParams, InputResponses, UpdateTaskParams};
 use serde_json::{Map, Value};
 use tokio::time::{Instant, timeout};
 use tokio_util::sync::CancellationToken;
 
+pub use super::types::{TaskSeed, TaskStatusKind};
 use super::{
-    McpConnection, McpOpError as Failure, busy_capture, observed_result,
-    routing_header_payload_bound, service_failure,
+    connection::McpConnection,
+    ingress::{busy_capture, observed_result, service_failure},
+    types::{McpOpError as Failure, check_tasks_capability, routing_header_payload_bound},
 };
 use crate::budget::ByteLease;
 
 pub const MIN_POLL_INTERVAL_MS: u64 = 50;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 1_000;
 pub const CANCEL_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskStatusKind {
-    Working,
-    InputRequired,
-    Completed,
-    Failed,
-    Cancelled,
-}
-
-impl TaskStatusKind {
-    fn from_rmcp(status: TaskStatus) -> Self {
-        match status {
-            TaskStatus::Working => Self::Working,
-            TaskStatus::InputRequired => Self::InputRequired,
-            TaskStatus::Completed => Self::Completed,
-            TaskStatus::Failed => Self::Failed,
-            TaskStatus::Cancelled => Self::Cancelled,
-            _ => Self::Working,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Working => "working",
-            Self::InputRequired => "input_required",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-        }
-    }
-
-    pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TaskSeed {
-    pub task_id: String,
-    pub status: TaskStatusKind,
-    pub poll_interval_ms: Option<u64>,
-    pub ttl_ms: Option<u64>,
-}
-
-impl TaskSeed {
-    pub(super) fn from_create_task_result(res: &CreateTaskResult) -> Self {
-        Self {
-            task_id: res.task.task_id.clone(),
-            status: TaskStatusKind::from_rmcp(res.task.status),
-            poll_interval_ms: res.task.poll_interval_ms,
-            ttl_ms: res.task.ttl_ms,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct TaskSnapshot {
@@ -95,36 +39,6 @@ pub struct TaskSnapshot {
 pub struct TaskPollBudgets {
     pub step_idle: Duration,
     pub hard_deadline: Option<Instant>,
-}
-
-pub(super) fn check_tasks_capability(
-    info: Option<&ServerPeerInfo>,
-) -> std::result::Result<(), Failure> {
-    let Some(info) = info else {
-        return Err(Failure::new(
-            4,
-            "mcp_protocol",
-            "MCP server info is missing",
-        ));
-    };
-    if info.protocol_version < ProtocolVersion::V_2026_07_28 {
-        return Err(Failure::new(
-            4,
-            "mcp_protocol",
-            format!(
-                "MCP server protocol version {} does not support tasks (requires >= 2026-07-28)",
-                info.protocol_version
-            ),
-        ));
-    }
-    if !info.capabilities.supports_tasks() {
-        return Err(Failure::new(
-            4,
-            "mcp_protocol",
-            "MCP server does not advertise the io.modelcontextprotocol/tasks extension",
-        ));
-    }
-    Ok(())
 }
 
 pub async fn get_task(
@@ -612,11 +526,45 @@ where
     }
 }
 
+impl McpConnection {
+    pub fn check_tasks_support(&self) -> std::result::Result<(), Failure> {
+        check_tasks_capability(self.peer.peer_info().as_deref())
+    }
+
+    pub async fn get_task(
+        &self,
+        task_id: &str,
+        budget: Duration,
+    ) -> std::result::Result<TaskSnapshot, Failure> {
+        get_task(self, task_id, budget).await
+    }
+
+    pub async fn update_task(
+        &self,
+        task_id: &str,
+        input_responses: Map<String, Value>,
+        budget: Duration,
+        dispatched: &AtomicBool,
+    ) -> std::result::Result<Value, Failure> {
+        update_task(self, task_id, input_responses, budget, dispatched).await
+    }
+
+    pub async fn cancel_task(
+        &self,
+        task_id: &str,
+        budget: Duration,
+        dispatched: &AtomicBool,
+    ) -> std::result::Result<Value, Failure> {
+        cancel_task(self, task_id, budget, dispatched).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::budget::ByteBudget;
     use rmcp::model::{Implementation, InitializeResult, ServerCapabilities};
+    use rmcp::model::{ProtocolVersion, ServerPeerInfo};
     use std::sync::atomic::AtomicUsize;
 
     fn snapshot(task_id: &str, status: TaskStatusKind, value: Value) -> TaskSnapshot {

@@ -10,7 +10,10 @@ use futures_util::{Stream, StreamExt, stream::BoxStream};
 use rmcp::transport::streamable_http_client::SseError;
 use sse_stream::Sse;
 
-use super::{FailureKind, TransportTermination, ingress::Ingress};
+use super::{
+    ingress::Ingress,
+    types::{FailureKind, IngressError, TransportTermination},
+};
 use crate::budget::{ByteBudget, ByteLease, Leased, format_bytes};
 
 const MAX_SSE_ID_BYTES: usize = 8 * 1024;
@@ -202,12 +205,12 @@ impl<S> BoundedSseStream<S> {
                 .observe_sse(&mut sse, &mut lease, self.limit, &self.budget)
             {
                 Ok(()) => {}
-                Err(super::IngressError::MemoryExhausted) => {
+                Err(IngressError::MemoryExhausted) => {
                     drop(sse);
                     drop(lease);
                     return Err(self.fail_memory_limit());
                 }
-                Err(super::IngressError::InvalidMetadata) => {
+                Err(IngressError::InvalidMetadata) => {
                     drop(sse);
                     drop(lease);
                     self.done = true;
@@ -217,7 +220,7 @@ impl<S> BoundedSseStream<S> {
                         .terminate(FailureKind::Protocol, message.into());
                     return Err(SseError::Body(Box::new(std::io::Error::other(message))));
                 }
-                Err(super::IngressError::FrameTooLarge { limit }) => {
+                Err(IngressError::FrameTooLarge { limit }) => {
                     drop(sse);
                     drop(lease);
                     return Err(self.fail_too_large(limit));

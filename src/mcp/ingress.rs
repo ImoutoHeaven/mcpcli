@@ -1,8 +1,12 @@
 //! Capture verified raw JSON-RPC responses alongside dedicated byte leases.
 use crate::budget::{ByteBudget, ByteLease, Leased};
-use rmcp::model::{
-    ClientJsonRpcMessage, ClientNotification, ErrorCode, ErrorData, RequestId,
-    ServerJsonRpcMessage, ServerNotification, ServerResult, TaskPayload,
+use anyhow::Result;
+use rmcp::{
+    model::{
+        ClientJsonRpcMessage, ClientNotification, ErrorCode, ErrorData, RequestId,
+        ServerJsonRpcMessage, ServerNotification, ServerResult, TaskPayload,
+    },
+    service::ServiceError,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -12,14 +16,12 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub const SKILL_RESOURCE_MAX_FRAME_BYTES: usize = 32 << 20;
+use super::types::{
+    FailureKind, IngressError, McpFailure, PREFERRED_PROTOCOL_VERSIONS, TransportTermination,
+    failure, failure_with_outcome, should_ignore_notification,
+};
 
-#[derive(Debug)]
-pub(super) enum IngressError {
-    MemoryExhausted,
-    InvalidMetadata,
-    FrameTooLarge { limit: usize },
-}
+pub const SKILL_RESOURCE_MAX_FRAME_BYTES: usize = 32 << 20;
 
 pub(super) enum ObserveOutcome {
     NotMatched,
@@ -529,7 +531,7 @@ fn ignore_notification(value: &Value) -> bool {
     value
         .get("method")
         .and_then(Value::as_str)
-        .is_some_and(|method| super::should_ignore_notification(value, method))
+        .is_some_and(|method| should_ignore_notification(value, method))
 }
 
 fn negotiation_data(data: Option<Value>) -> Option<Value> {
@@ -537,7 +539,7 @@ fn negotiation_data(data: Option<Value>) -> Option<Value> {
     if supported.iter().any(|version| !version.is_string()) {
         return None;
     }
-    let versions = super::PREFERRED_PROTOCOL_VERSIONS
+    let versions = PREFERRED_PROTOCOL_VERSIONS
         .iter()
         .filter(|version| {
             supported
@@ -549,6 +551,139 @@ fn negotiation_data(data: Option<Value>) -> Option<Value> {
     let mut projected = serde_json::Map::new();
     projected.insert("supported".into(), Value::Array(versions));
     Some(Value::Object(projected))
+}
+
+pub(super) fn observed_result(
+    response: Option<(&'static str, Result<Value>, ByteLease)>,
+    expected: Option<&str>,
+    calling: bool,
+) -> Result<(&'static str, Value, ByteLease)> {
+    if let Some((method, response, lease)) = response {
+        let mut owned = Leased::new(response, lease);
+        if expected.map_or(
+            matches!(method, "initialize" | "server/discover"),
+            |expected| expected == method,
+        ) && let Ok(response) = owned.value_mut()
+            && let Some(result) = response.get_mut("result")
+        {
+            let result = result.take();
+            let (envelope, lease) = owned.into_parts();
+            drop(envelope);
+            return Ok((method, result, lease));
+        }
+    }
+    Err(failure_with_outcome(
+        FailureKind::Protocol,
+        "MCP response metadata could not be captured",
+        calling,
+    ))
+}
+
+pub(super) fn busy_capture() -> anyhow::Error {
+    failure(
+        FailureKind::Protocol,
+        "MCP connection already has an operation in progress; request was not dispatched",
+    )
+}
+
+pub(super) fn rpc_failure(
+    code: i32,
+    diagnostic: String,
+    calling: bool,
+    ingress: &Ingress,
+) -> anyhow::Error {
+    let (message, rpc_error, lease) = match ingress.take() {
+        Some((_, Ok(mut response), lease)) if response.get("error").is_some() => (
+            diagnostic,
+            response.get_mut("error").map(Value::take).map(Arc::new),
+            Some(Arc::new(lease)),
+        ),
+        Some((_, Err(_), _lease)) => (
+            format!(
+                "MCP error {code}: response rejected because its JSON cannot be represented losslessly"
+            ),
+            None,
+            None,
+        ),
+        _ => (diagnostic, None, None),
+    };
+    let suffix = if calling {
+        "; outcome unknown, the call was not retried"
+    } else {
+        ""
+    };
+    McpFailure {
+        kind: FailureKind::Protocol,
+        message: format!("{message}{suffix}"),
+        outcome_unknown: calling,
+        rpc_error,
+        auth: None,
+        stderr_tail: None,
+        lease,
+    }
+    .into()
+}
+
+pub(super) fn service_failure(
+    error: ServiceError,
+    calling: bool,
+    ingress: &Ingress,
+    termination: &TransportTermination,
+) -> anyhow::Error {
+    let suffix = if calling {
+        "; outcome unknown, the call was not retried"
+    } else {
+        ""
+    };
+    let fail = |kind, message| failure_with_outcome(kind, message, calling);
+    match error {
+        ServiceError::McpError(e) => rpc_failure(
+            e.code.0,
+            format!("MCP error {}: {}", e.code.0, e.message),
+            calling,
+            ingress,
+        ),
+        ServiceError::Timeout { .. } => fail(
+            FailureKind::Timeout,
+            format!("MCP request timed out{suffix}"),
+        ),
+        ServiceError::UnexpectedResponse => fail(
+            FailureKind::Protocol,
+            format!("MCP server returned an unexpected response{suffix}"),
+        ),
+        _ => termination.take_error(calling).unwrap_or_else(|| {
+            fail(
+                FailureKind::Transport,
+                format!("MCP connection failed{suffix}"),
+            )
+        }),
+    }
+}
+
+pub(super) struct UntrackOnDrop {
+    ingress: Ingress,
+    id: Option<rmcp::model::RequestId>,
+}
+
+impl UntrackOnDrop {
+    pub(super) fn new(ingress: Ingress, id: rmcp::model::RequestId) -> Self {
+        Self {
+            ingress,
+            id: Some(id),
+        }
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for UntrackOnDrop {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.ingress.untrack(&id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -715,7 +850,7 @@ mod tests {
 
     #[test]
     fn error_stub_preserves_sdk_version_negotiation() {
-        let preferred = super::super::PREFERRED_PROTOCOL_VERSIONS[0].as_str();
+        let preferred = super::PREFERRED_PROTOCOL_VERSIONS[0].as_str();
         for supported in [
             serde_json::json!([preferred, "unknown", preferred]),
             serde_json::json!(["unknown"]),
@@ -745,7 +880,7 @@ mod tests {
             let projected = &sdk_error.error.data;
             let original: Option<Vec<rmcp::model::ProtocolVersion>> =
                 serde_json::from_value(supported.clone()).ok();
-            let expected: Vec<_> = super::super::PREFERRED_PROTOCOL_VERSIONS
+            let expected: Vec<_> = super::PREFERRED_PROTOCOL_VERSIONS
                 .iter()
                 .filter(|version| original.as_ref().is_some_and(|all| all.contains(version)))
                 .map(|version| version.as_str())

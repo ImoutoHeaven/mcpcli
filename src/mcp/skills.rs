@@ -11,8 +11,9 @@ use serde_json::{Map, Value};
 use tokio::time::{Instant, timeout};
 
 use super::{
-    McpConnection, McpOpError as Failure, busy_capture, observed_result,
-    routing_header_payload_bound, service_failure,
+    connection::McpConnection,
+    ingress::{busy_capture, observed_result, service_failure},
+    types::{McpOpError as Failure, routing_header_payload_bound},
 };
 use crate::{
     budget::{ByteLease, Leased, format_bytes},
@@ -1185,6 +1186,64 @@ pub async fn skills_read(
     }
 }
 
+impl McpConnection {
+    pub fn supports_skills(&self) -> bool {
+        check_skills_capability(self.peer.peer_info().as_deref(), false).is_ok()
+    }
+
+    pub fn check_skills_support(&self, require_dir: bool) -> std::result::Result<(), Failure> {
+        check_skills_capability(self.peer.peer_info().as_deref(), require_dir)
+    }
+
+    pub async fn skills_list(
+        &self,
+        server: &str,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), Failure> {
+        skills_list(self, server, budget).await
+    }
+
+    pub async fn skills_show(
+        &self,
+        server: &str,
+        selector: &str,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), Failure> {
+        skills_show(self, server, selector, budget).await
+    }
+
+    pub async fn skills_files(
+        &self,
+        server: &str,
+        selector: &str,
+        dir: Option<&str>,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease), Failure> {
+        skills_files(self, server, selector, dir, budget).await
+    }
+
+    pub async fn skills_read(
+        &self,
+        server: &str,
+        selector: &str,
+        rel_path: &str,
+        inline_media: bool,
+        media: &MediaStore,
+        budget: Duration,
+    ) -> std::result::Result<(Value, ByteLease, Option<InflightBatch>), Failure> {
+        skills_read(
+            self,
+            server,
+            selector,
+            rel_path,
+            inline_media,
+            media,
+            budget,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1241,8 +1300,11 @@ mod tests {
         budget: std::sync::Arc<crate::budget::ByteBudget>,
     ) -> (McpConnection, tokio::io::BufReader<tokio::io::DuplexStream>) {
         use super::super::{
-            ChildTransport, CleanupState, EventNotificationTransport, EventRouter,
-            EventSchemaCache, Handler, Ingress, McpLimits, TransportTermination,
+            connection::Handler,
+            events::{EventNotificationTransport, EventRouter, EventSchemaCache},
+            ingress::Ingress,
+            stdio::ChildTransport,
+            types::{CleanupState, McpLimits, TransportTermination},
         };
         use std::sync::{Arc, atomic::AtomicBool};
         let ingress = Ingress::default();

@@ -19,10 +19,13 @@ use rmcp::{
 use serde_json::{Map, Value};
 use tokio::sync::mpsc;
 
-use super::{FailureKind, TransportTermination, failure, ingress::Ingress};
+pub use super::types::EVENTS_EXTENSION_ID;
+use super::{
+    ingress::Ingress,
+    types::{FailureKind, TransportTermination, failure},
+};
 use crate::budget::{ByteBudget, Leased, format_bytes};
 
-pub const EVENTS_EXTENSION_ID: &str = "io.modelcontextprotocol/events";
 pub const MAX_EVENT_NOTIFICATION_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENT_PAGES: usize = 100;
 const EVENT_CHANNEL_CAPACITY: usize = 128;
