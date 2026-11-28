@@ -1412,6 +1412,83 @@ fn platform_module_tree_has_no_cycles() {
 }
 
 #[test]
+fn all_multi_file_module_trees_have_no_cycles() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut trees = Vec::new();
+    for entry in fs::read_dir(&src_root)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", src_root.display()))
+    {
+        let entry = entry.expect("dir entry");
+        if !entry.file_type().expect("file type").is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == "tests" {
+            continue;
+        }
+        trees.push(name);
+    }
+    trees.sort();
+
+    for expected in ["auth", "cli", "daemon", "mcp", "platform"] {
+        assert!(
+            trees.iter().any(|t| t == expected),
+            "expected multi-file module tree `src/{expected}/` to be checked, found: {trees:?}"
+        );
+    }
+
+    let mut violations = Vec::new();
+    for tree in &trees {
+        let cycles = module_tree_scc_cycles(&src_root, tree, true);
+        if !cycles.is_empty() {
+            violations.push(format!("src/{tree}/: {cycles:?}"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "Tarjan SCC detected root-inclusive submodule cycle(s):\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn production_files_stay_within_line_budget() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(
+        !files.is_empty(),
+        "expected production .rs files under {}",
+        src_root.display()
+    );
+
+    let mut violations = Vec::new();
+    for file in files {
+        if is_test_source_file(&src_root, &file) {
+            continue;
+        }
+        let content = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        let prod_lines = count_prod_lines(&content);
+        if prod_lines > MAX_PROD_LINES {
+            let rel = file.strip_prefix(&src_root).unwrap_or(&file);
+            violations.push(format!(
+                "src/{}: {} > {}",
+                rel.display(),
+                prod_lines,
+                MAX_PROD_LINES
+            ));
+        }
+    }
+    violations.sort();
+    assert!(
+        violations.is_empty(),
+        "production files exceed MAX_PROD_LINES ({MAX_PROD_LINES}):\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
 fn mcp_submodules_follow_dag_and_have_no_cycles() {
     let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mcp_dir = src_root.join("mcp");

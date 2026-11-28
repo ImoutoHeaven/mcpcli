@@ -56,29 +56,42 @@ layers `L0` to `L8` (`layer(src) > layer(dst)`), enforced by `tests/dag_gate.rs`
 
 | Layer | Modules | Constraints |
 | --- | --- | --- |
-| `L0` | `budget`, `discovery`, `platform`, `oauth_url` | Zero internal `crate::` dependencies |
+| `L0` | `budget`, `discovery`, `platform` (`src/platform/mod.rs` + `local.rs`, `unix.rs`, `windows.rs`, `windows_job.rs`), `oauth_url` | Zero internal `crate::` dependencies; `unix.rs` and `windows.rs` depend on leaf `src/platform/local.rs` rather than `mod.rs` |
 | `L1` | `schema`, `json`, `agents`, `skills` | `schema` has zero internal `crate::` dependencies (`L1 schema -> ∅`); `skills` depends only on `platform` |
 | `L2` | `config`, `ipc`, `events_exec` | `ipc` depends on `budget`, `json`, `schema` |
 | `L3` | `runtime` | Local IPC client exchange and dual-clock cancellation |
-| `L4` | `media`, `auth` | Private media cache and OAuth 2.1 client |
-| `L5` | `mcp` (`src/mcp.rs` + `src/mcp/*.rs`) | Sole module allowed to reference `rmcp` |
-| `L6` | `daemon` | Long-lived connection host and IPC server |
+| `L4` | `media`, `auth` (`src/auth.rs` + `src/auth/{challenge,store,discovery,callback,manager}.rs`) | Private media cache and OAuth 2.1 client |
+| `L5` | `mcp` (`src/mcp.rs` + 10 submodules under `src/mcp/`) | Sole module allowed to reference `rmcp` |
+| `L6` | `daemon` (`src/daemon.rs` + `src/daemon/{error,state,dispatch,transport}.rs`) | Long-lived connection host and IPC server |
 | `L7` | `events_stream` | Foreground SEP-3415 event stream runner |
-| `L8` | `main` | CLI parsing, input budgeting, and output rendering |
+| `L8` | `main` (`src/main.rs`, `src/cli.rs`, `src/cli/{args,output,input,offline,remote,events}.rs`) | Binary-local CLI parsing, input budgeting, and output rendering (not exported in `src/lib.rs`) |
 
-`tests/dag_gate.rs` enforces four static gates over non-`#[cfg(test)]` tokens:
+`tests/dag_gate.rs` enforces six static gates over non-`#[cfg(test)]` tokens
+(skipping `*/tests.rs` and `tests/`):
 
-- All 18 modules (17 library modules plus `main`) are registered in
-  `MODULE_LAYERS`, satisfy `layer(src) > layer(dst)`, and keep `L0` plus
-  `L1 schema` free of internal `crate::` edges.
+- All 18 modules (17 library modules plus `main`, including binary-local
+  `src/cli.rs` and `src/cli/*.rs`) are registered in `MODULE_LAYERS`, satisfy
+  `layer(src) > layer(dst)`, and keep `L0` plus `L1 schema` free of internal
+  `crate::` edges.
 - `RMCP_ALLOWED = &["mcp"]` blocks `rmcp` from leaking into `schema`, `skills`,
   `ipc`, `daemon`, or `main`.
 - `SERDE_SAPHYR_ALLOWED = &["skills"]` restricts `serde_saphyr` to
   `L1 src/skills.rs`.
-- `MCP_SUBMODULE_DAG` checks lateral edges among the five `src/mcp/*.rs`
-  submodules (`ingress -> ∅`, `sse -> {ingress}`, `events -> {ingress, sse}`,
-  `skills -> {ingress}`, `tasks -> {ingress}`) and runs Tarjan's SCC algorithm
-  to assert zero cycles.
+- `MCP_SUBMODULE_DAG` checks lateral edges across all 10 `src/mcp/*.rs`
+  submodules (`types -> ∅`, `ingress -> {types}`, `sse -> {types, ingress}`,
+  `events -> {types, ingress, sse}`, `stdio -> {types, ingress}`,
+  `http -> {types, ingress, sse, events}`,
+  `events_client -> {types, ingress, events, stdio}`,
+  `connection -> {types, ingress, sse, events, stdio, http, events_client}`,
+  `skills -> {types, ingress, connection}`,
+  `tasks -> {types, ingress, connection}`).
+- Root-inclusive (`include_root = true`) Tarjan SCC checks cover every
+  multi-file module tree under `src/` (`platform`, `auth`, `mcp`, `daemon`, and
+  binary-local `cli`), keeping each root facade strictly above its child
+  submodules with zero cycles.
+- `MAX_PROD_LINES = 1500` bounds non-test production lines per file across all
+  non-test `.rs` files under `src/`, computed by subtracting `#[cfg(test)]`
+  item line spans from total file lines.
 
 ## 2. Connection ownership
 
