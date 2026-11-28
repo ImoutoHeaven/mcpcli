@@ -82,7 +82,8 @@ enum TokenKind {
     Gt,
     Semi,
     Comma,
-    Other,
+    Lifetime,
+    Punct(char),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,7 +188,10 @@ fn tokenize(src: &str) -> Vec<Token> {
                 });
                 i = after_char;
             } else {
-                // Lifetime token: skip '\'' and following identifier chars
+                tokens.push(Token {
+                    kind: TokenKind::Lifetime,
+                    line,
+                });
                 i += 1;
                 while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
@@ -219,7 +223,7 @@ fn tokenize(src: &str) -> Vec<Token> {
         }
         if matches!(b, b'-' | b'=') && i + 1 < len && bytes[i + 1] == b'>' {
             tokens.push(Token {
-                kind: TokenKind::Other,
+                kind: TokenKind::Punct(b as char),
                 line,
             });
             i += 2;
@@ -238,7 +242,7 @@ fn tokenize(src: &str) -> Vec<Token> {
             b'>' => TokenKind::Gt,
             b';' => TokenKind::Semi,
             b',' => TokenKind::Comma,
-            _ => TokenKind::Other,
+            _ => TokenKind::Punct(b as char),
         };
         tokens.push(Token { kind, line });
         i += 1;
@@ -427,6 +431,138 @@ fn skip_balanced(tokens: &[Token], start: usize, open: &TokenKind, close: &Token
     tokens.len()
 }
 
+fn skip_control_pattern(tokens: &[Token], mut i: usize, separator: &TokenKind) -> usize {
+    while i < tokens.len() {
+        // A range pattern's ..= is not the assignment separating a let pattern and value.
+        if &tokens[i].kind == separator
+            && !matches!(
+                tokens.get(i.wrapping_sub(1)).map(|t| &t.kind),
+                Some(TokenKind::Punct('.'))
+            )
+        {
+            return i + 1;
+        }
+        i = match tokens[i].kind {
+            TokenKind::LBrace => skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace),
+            TokenKind::LParen => skip_balanced(tokens, i, &TokenKind::LParen, &TokenKind::RParen),
+            TokenKind::LBracket => {
+                skip_balanced(tokens, i, &TokenKind::LBracket, &TokenKind::RBracket)
+            }
+            _ => i + 1,
+        };
+    }
+    i
+}
+
+fn skip_header_generic_arguments(tokens: &[Token], mut i: usize) -> usize {
+    let mut depth = 0usize;
+    while i < tokens.len() {
+        match tokens[i].kind {
+            TokenKind::Lt => depth += 1,
+            TokenKind::Gt => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            TokenKind::LBrace => {
+                i = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+                continue;
+            }
+            TokenKind::LParen => {
+                i = skip_balanced(tokens, i, &TokenKind::LParen, &TokenKind::RParen);
+                continue;
+            }
+            TokenKind::LBracket => {
+                i = skip_balanced(tokens, i, &TokenKind::LBracket, &TokenKind::RBracket);
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn skip_control_body(tokens: &[Token], start: usize, kind: &str) -> usize {
+    let has_header = kind != "loop";
+    let mut generic_end = None;
+    let mut i = if kind == "for" {
+        skip_control_pattern(tokens, start, &TokenKind::Ident("in".to_owned()))
+    } else {
+        start
+    };
+    while i < tokens.len() {
+        match &tokens[i].kind {
+            TokenKind::ColonColon
+                if has_header && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::Lt) =>
+            {
+                i = skip_header_generic_arguments(tokens, i + 1);
+                generic_end = Some(i);
+            }
+            TokenKind::Ident(name) if has_header && name == "let" => {
+                i = skip_control_pattern(tokens, i + 1, &TokenKind::Punct('='));
+            }
+            TokenKind::Ident(name)
+                if has_header
+                    && matches!(name.as_str(), "if" | "while" | "for" | "match" | "loop") =>
+            {
+                i = skip_control_expression(tokens, i);
+            }
+            TokenKind::LParen => {
+                i = skip_balanced(tokens, i, &TokenKind::LParen, &TokenKind::RParen);
+            }
+            TokenKind::LBracket => {
+                i = skip_balanced(tokens, i, &TokenKind::LBracket, &TokenKind::RBracket);
+            }
+            TokenKind::LBrace => {
+                // A block can itself be a header operand, before the control-flow body.
+                let operand = has_header
+                    && (i == start
+                        // A generic path's closing > ends an operand; comparisons require one.
+                        || (matches!(tokens[i - 1].kind, TokenKind::Lt | TokenKind::Gt)
+                            && generic_end != Some(i))
+                        || matches!(
+                            &tokens[i - 1].kind,
+                            TokenKind::Punct(
+                                '=' | '|' | '&' | '+' | '-' | '*' | '/' | '%' | '^' | ':'
+                            ) | TokenKind::Bang
+                                | TokenKind::Comma
+                        )
+                        || matches!(&tokens[i - 1].kind, TokenKind::Ident(name)
+                    if matches!(name.as_str(), "in" | "unsafe" | "const" | "async" | "move")));
+                i = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+                if !operand {
+                    return i;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn skip_control_expression(tokens: &[Token], start: usize) -> usize {
+    let TokenKind::Ident(name) = &tokens[start].kind else {
+        return start + 1;
+    };
+    let mut i = skip_control_body(tokens, start + 1, name);
+    if name == "if" {
+        while matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "else") {
+            i += 1;
+            if matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "if") {
+                i = skip_control_body(tokens, i + 1, "if");
+            } else if tokens.get(i).map(|t| &t.kind) == Some(&TokenKind::LBrace) {
+                i = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+                break;
+            } else {
+                break;
+            }
+        }
+    }
+    i
+}
+
 fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
     // Skip any additional outer attributes attached to the same item.
     while let Some((after_attr, false, _)) = parse_attr(tokens, i) {
@@ -448,13 +584,19 @@ fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
             Some(TokenKind::Ident(s)) if matches!(s.as_str(), "default" | "async" | "unsafe")
         ) {
             probe += 1;
+            if matches!(tokens.get(probe).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "move")
+                && tokens.get(probe + 1).map(|t| &t.kind) == Some(&TokenKind::LBrace)
+            {
+                probe += 1;
+            }
             continue;
         }
         if matches!(tokens.get(probe).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "const")
-            && matches!(
-                tokens.get(probe + 1).map(|t| &t.kind),
-                Some(TokenKind::Ident(next)) if matches!(next.as_str(), "fn" | "unsafe" | "extern")
-            )
+            && (tokens.get(probe + 1).map(|t| &t.kind) == Some(&TokenKind::LBrace)
+                || matches!(
+                    tokens.get(probe + 1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(next)) if matches!(next.as_str(), "fn" | "unsafe" | "extern")
+                ))
         {
             probe += 1;
             continue;
@@ -469,6 +611,12 @@ fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
             continue;
         }
         break;
+    }
+
+    if tokens.get(probe).map(|t| &t.kind) == Some(&TokenKind::Lifetime)
+        && tokens.get(probe + 1).map(|t| &t.kind) == Some(&TokenKind::Punct(':'))
+    {
+        probe += 2;
     }
 
     let Some(lead) = tokens.get(probe) else {
@@ -538,6 +686,20 @@ fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
     // Direct block `{ ... }`.
     if lead.kind == TokenKind::LBrace {
         i = skip_balanced(tokens, probe, &TokenKind::LBrace, &TokenKind::RBrace);
+        if matches!(
+            tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Semi | TokenKind::Comma)
+        ) {
+            i += 1;
+        }
+        return i;
+    }
+
+    // Control-flow statements end at their body, not at the next production semicolon.
+    if let TokenKind::Ident(name) = &lead.kind
+        && matches!(name.as_str(), "if" | "while" | "for" | "match" | "loop")
+    {
+        i = skip_control_expression(tokens, probe);
         if matches!(
             tokens.get(i).map(|t| &t.kind),
             Some(TokenKind::Semi | TokenKind::Comma)
@@ -818,7 +980,7 @@ fn has_module_path_override(src: &str) -> bool {
             );
             if tokens[index + 2..end - 1].windows(2).any(|pair| {
                 matches!(&pair[0].kind, TokenKind::Ident(name) if name == "path")
-                    && pair[1].kind == TokenKind::Other
+                    && pair[1].kind == TokenKind::Punct('=')
             }) {
                 return true;
             }
@@ -1115,160 +1277,305 @@ fn mcp_submodule_names() -> BTreeSet<&'static str> {
     MCP_SUBMODULE_DAG.iter().map(|(name, _)| *name).collect()
 }
 
-fn collect_submodule_relative_targets(
-    tokens: &[Token],
-    mut index: usize,
-    mut depth: usize,
-    self_submod: &str,
-    known: &BTreeSet<String>,
-    root_node: Option<&str>,
-    deps: &mut BTreeSet<String>,
-) -> usize {
-    while let Some(TokenKind::Ident(name)) = tokens.get(index).map(|t| &t.kind) {
-        if tokens.get(index + 1).map(|t| &t.kind) != Some(&TokenKind::ColonColon) {
-            break;
-        }
-        if name == "super" {
-            let Some(parent) = depth.checked_sub(1) else {
-                return index + 2;
-            };
-            depth = parent;
-        } else if name != "self" {
-            break;
-        }
-        index += 2;
-    }
-    match tokens.get(index).map(|t| &t.kind) {
-        Some(TokenKind::LBrace) => {
-            let end = skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace);
-            index += 1;
-            while index + 1 < end {
-                index = collect_submodule_relative_targets(
-                    tokens,
-                    index,
-                    depth,
-                    self_submod,
-                    known,
-                    root_node,
-                    deps,
-                );
-                while index + 1 < end && tokens[index].kind != TokenKind::Comma {
-                    index = if tokens[index].kind == TokenKind::LBrace {
-                        skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace)
-                    } else {
-                        index + 1
-                    };
-                }
-                index += 1;
-            }
-            end
-        }
-        Some(TokenKind::Ident(target)) => {
-            if depth == 0 && target != self_submod && target != "self" {
-                if known.contains(target.as_str()) {
-                    deps.insert(target.clone());
-                } else if let Some(root) = root_node {
-                    deps.insert(root.to_owned());
-                }
-            }
-            index + 1
-        }
-        _ => index + 1,
-    }
+struct TreeModule {
+    path: Vec<String>,
+    tokens: Vec<Token>,
+    children: BTreeSet<String>,
 }
 
-fn extract_tree_submodule_deps(
-    src: &str,
-    top_module: &str,
-    self_submod: &str,
-    initial_depth: usize,
-    known: &BTreeSet<String>,
-    root_node: Option<&str>,
-) -> BTreeSet<String> {
-    let tokens = strip_cfg_test(&tokenize(src));
-    let mut deps = BTreeSet::new();
-    let mut depth = initial_depth;
-    let mut scopes = Vec::new();
+fn collect_tree_modules(tokens: &[Token], path: Vec<String>, modules: &mut Vec<TreeModule>) {
+    let mut module = TreeModule {
+        path,
+        tokens: Vec::new(),
+        children: BTreeSet::new(),
+    };
     let mut i = 0;
-
     while i < tokens.len() {
-        // Match `crate::<top_module>::<submod>` or `crate::<top_module>::{...}`.
-        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "crate")
-            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
-            && matches!(tokens.get(i + 2).map(|t| &t.kind), Some(TokenKind::Ident(id)) if id == top_module)
-            && tokens.get(i + 3).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
+        if matches!(&tokens[i].kind, TokenKind::Ident(name) if name == "mod")
+            && let Some(TokenKind::Ident(child)) = tokens.get(i + 1).map(|t| &t.kind)
+            && matches!(
+                tokens.get(i + 2).map(|t| &t.kind),
+                Some(TokenKind::Semi | TokenKind::LBrace)
+            )
         {
-            i = collect_submodule_relative_targets(
-                &tokens,
-                i + 4,
-                0,
-                self_submod,
-                known,
-                root_node,
-                &mut deps,
-            );
+            module.children.insert(child.clone());
+            if tokens[i + 2].kind == TokenKind::LBrace {
+                let end = skip_balanced(tokens, i + 2, &TokenKind::LBrace, &TokenKind::RBrace);
+                let mut child_path = module.path.clone();
+                child_path.push(child.clone());
+                collect_tree_modules(&tokens[i + 3..end - 1], child_path, modules);
+                i = end;
+            } else {
+                i += 3;
+            }
             continue;
         }
-        // Match `super::<submod>` or `super::{...}` resolving to `crate::<top_module>`.
-        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "super")
-            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
-        {
-            i = collect_submodule_relative_targets(
-                &tokens,
-                i,
-                depth,
-                self_submod,
-                known,
-                root_node,
-                &mut deps,
-            );
-            continue;
+        module.tokens.push(tokens[i].clone());
+        i += 1;
+    }
+    modules.push(module);
+}
+
+#[derive(Clone)]
+struct TreeImport {
+    path: Vec<String>,
+    alias: Option<String>,
+}
+
+fn collect_tree_imports(tokens: &[Token], prefix: &[String], out: &mut Vec<TreeImport>) {
+    let mut path = prefix.to_vec();
+    let mut i = 0;
+    if tokens
+        .first()
+        .is_some_and(|t| t.kind == TokenKind::ColonColon)
+    {
+        // Leading :: resolves through the extern prelude, not this module tree.
+        path.push("::".to_owned());
+        i += 1;
+    }
+    while let Some(TokenKind::Ident(name)) = tokens.get(i).map(|t| &t.kind) {
+        if name == "as" {
+            break;
         }
-        match &tokens[i].kind {
-            TokenKind::LBrace => {
-                let is_mod = i >= 2
-                    && matches!(&tokens[i - 2].kind, TokenKind::Ident(id) if id == "mod")
-                    && matches!(&tokens[i - 1].kind, TokenKind::Ident(_));
-                scopes.push(is_mod);
-                depth += usize::from(is_mod);
-            }
-            TokenKind::RBrace => {
-                depth -= usize::from(scopes.pop().unwrap_or(false));
-            }
-            _ => {}
+        path.push(name.clone());
+        i += 1;
+        if tokens.get(i).map(|t| &t.kind) != Some(&TokenKind::ColonColon) {
+            break;
         }
         i += 1;
     }
-
-    deps
+    if tokens.get(i).map(|t| &t.kind) == Some(&TokenKind::LBrace) {
+        let end = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+        i += 1;
+        while i + 1 < end {
+            let start = i;
+            while i + 1 < end && tokens[i].kind != TokenKind::Comma {
+                i = if tokens[i].kind == TokenKind::LBrace {
+                    skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace)
+                } else {
+                    i + 1
+                };
+            }
+            collect_tree_imports(&tokens[start..i], &path, out);
+            i += 1;
+        }
+        return;
+    }
+    if path.last().is_some_and(|s| s == "self") && path.len() > 1 {
+        path.pop();
+    }
+    let alias = if tokens.get(i).map(|t| &t.kind) == Some(&TokenKind::Punct('*')) {
+        None
+    } else if matches!(tokens.get(i).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "as") {
+        match tokens.get(i + 1).map(|t| &t.kind) {
+            Some(TokenKind::Ident(name)) => Some(name.clone()),
+            _ => None,
+        }
+    } else {
+        path.last().cloned()
+    };
+    if !path.is_empty() {
+        out.push(TreeImport { path, alias });
+    }
 }
 
-fn extract_root_child_deps(src: &str, known: &BTreeSet<String>) -> BTreeSet<String> {
-    let tokens = strip_cfg_test(&tokenize(src));
-    let mut deps = BTreeSet::new();
-    for i in 0..tokens.len() {
-        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "mod")
-            && let Some(TokenKind::Ident(child)) = tokens.get(i + 1).map(|t| &t.kind)
-            && known.contains(child.as_str())
-        {
-            deps.insert(child.clone());
+fn resolve_tree_path(
+    path: &[String],
+    current: &[String],
+    known: &BTreeSet<Vec<String>>,
+    imports: &BTreeMap<String, Vec<String>>,
+) -> Option<Vec<String>> {
+    let first = path.first()?;
+    match first.as_str() {
+        "crate" => Some(path[1..].to_vec()),
+        "self" | "super" => {
+            let mut resolved = current.to_vec();
+            let mut i = 0;
+            while let Some(segment) = path.get(i) {
+                match segment.as_str() {
+                    "self" => {}
+                    "super" => {
+                        resolved.pop()?;
+                    }
+                    _ => break,
+                }
+                i += 1;
+            }
+            resolved.extend_from_slice(&path[i..]);
+            Some(resolved)
         }
-        if let TokenKind::Ident(child) = &tokens[i].kind
-            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
-            && known.contains(child.as_str())
-        {
-            deps.insert(child.clone());
+        _ => {
+            let mut local = current.to_vec();
+            local.push(first.clone());
+            let mut resolved = if let Some(alias) = imports.get(first) {
+                alias.clone()
+            } else if known.contains(&local) {
+                local
+            } else {
+                return None;
+            };
+            resolved.extend_from_slice(&path[1..]);
+            Some(resolved)
         }
     }
-    deps
+}
+
+fn record_tree_dependency(
+    path: &[String],
+    current: &[String],
+    known: &BTreeSet<Vec<String>>,
+    deps: &mut BTreeSet<String>,
+) {
+    if let Some(module) = (1..=path.len())
+        .rev()
+        .find_map(|len| known.get(&path[..len]))
+        && module != current
+    {
+        deps.insert(module.join("::"));
+    }
+}
+
+fn scan_tree_tokens(
+    tokens: &[Token],
+    current: &[String],
+    known: &BTreeSet<Vec<String>>,
+    inherited_imports: &BTreeMap<String, Vec<String>>,
+    deps: &mut BTreeSet<String>,
+) {
+    let mut uses = BTreeMap::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        if matches!(&tokens[i].kind, TokenKind::Ident(name) if name == "use")
+            && tokens.get(i + 1).map(|t| &t.kind) != Some(&TokenKind::Lt)
+        {
+            let start = i;
+            while i < tokens.len() && tokens[i].kind != TokenKind::Semi {
+                i += 1;
+            }
+            let mut imports = Vec::new();
+            collect_tree_imports(&tokens[start + 1..i], &[], &mut imports);
+            uses.insert(start, (i, imports));
+        } else if tokens[i].kind == TokenKind::LBrace {
+            i = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+            continue;
+        }
+        i += 1;
+    }
+    let mut imports = inherited_imports.clone();
+    for (_, statements) in uses.values() {
+        for import in statements {
+            if let Some(alias) = &import.alias {
+                imports.remove(alias);
+            }
+        }
+    }
+    // Imports are in scope before their declaration; resolve alias chains to a fixed point.
+    let import_count: usize = uses.values().map(|(_, imports)| imports.len()).sum();
+    for _ in 0..=import_count {
+        let before = imports.clone();
+        for (_, statements) in uses.values() {
+            for import in statements {
+                if let Some(alias) = &import.alias
+                    && let Some(path) = resolve_tree_path(&import.path, current, known, &imports)
+                {
+                    imports.insert(alias.clone(), path);
+                }
+            }
+        }
+        if imports == before {
+            break;
+        }
+    }
+    i = 0;
+    while i < tokens.len() {
+        if let Some((end, statements)) = uses.get(&i) {
+            for import in statements {
+                if let Some(path) = resolve_tree_path(&import.path, current, known, &imports) {
+                    record_tree_dependency(&path, current, known, deps);
+                }
+            }
+            i = end + 1;
+            continue;
+        }
+        if tokens[i].kind == TokenKind::LBrace {
+            let end = skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+            scan_tree_tokens(&tokens[i + 1..end - 1], current, known, &imports, deps);
+            i = end;
+            continue;
+        }
+        if matches!(&tokens[i].kind, TokenKind::Ident(name) if name == "pub")
+            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::LParen)
+        {
+            i = skip_balanced(tokens, i + 1, &TokenKind::LParen, &TokenKind::RParen);
+            continue;
+        }
+        if let TokenKind::Ident(first) = &tokens[i].kind {
+            let mut path = vec![first.clone()];
+            let start = i;
+            i += 1;
+            while tokens.get(i).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
+                && let Some(TokenKind::Ident(next)) = tokens.get(i + 1).map(|t| &t.kind)
+            {
+                path.push(next.clone());
+                i += 2;
+            }
+            if path.len() > 1
+                && !matches!(
+                    tokens.get(start.wrapping_sub(1)).map(|t| &t.kind),
+                    Some(TokenKind::ColonColon | TokenKind::Punct('.'))
+                )
+                && let Some(path) = resolve_tree_path(&path, current, known, &imports)
+            {
+                record_tree_dependency(&path, current, known, deps);
+            }
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn tree_module_graph(
+    modules: &[TreeModule],
+    mut known: BTreeSet<Vec<String>>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    for module in modules {
+        for len in 1..=module.path.len() {
+            known.insert(module.path[..len].to_vec());
+        }
+        for child in &module.children {
+            let mut path = module.path.clone();
+            path.push(child.clone());
+            known.insert(path);
+        }
+    }
+    let mut graph = BTreeMap::new();
+    for module in modules {
+        let deps = graph
+            .entry(module.path.join("::"))
+            .or_insert_with(BTreeSet::new);
+        for child in &module.children {
+            deps.insert(format!("{}::{child}", module.path.join("::")));
+        }
+        scan_tree_tokens(&module.tokens, &module.path, &known, &BTreeMap::new(), deps);
+    }
+    graph
 }
 
 fn extract_mcp_submodule_deps(src: &str, self_submod: &str) -> BTreeSet<String> {
-    let known: BTreeSet<String> = mcp_submodule_names()
+    let path = vec!["mcp".to_owned(), self_submod.to_owned()];
+    let mut modules = Vec::new();
+    collect_tree_modules(&strip_cfg_test(&tokenize(src)), path, &mut modules);
+    let known = mcp_submodule_names()
         .into_iter()
-        .map(str::to_owned)
+        .map(|name| vec!["mcp".to_owned(), name.to_owned()])
         .collect();
-    extract_tree_submodule_deps(src, "mcp", self_submod, 1, &known, None)
+    tree_module_graph(&modules, known)
+        .values()
+        .flatten()
+        .filter_map(|target| target.split("::").nth(1))
+        .filter(|target| *target != self_submod)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Tarjan's strongly connected components algorithm; returns all cyclic SCCs (size > 1 or self-loop).
@@ -1349,55 +1656,43 @@ fn module_tree_scc_cycles(
     let dir = src_root.join(top_module);
     let mut files = Vec::new();
     collect_rs_files(&dir, &mut files);
-
-    let root_file = if dir.join("mod.rs").exists() {
-        dir.join("mod.rs")
-    } else {
-        src_root.join(format!("{top_module}.rs"))
-    };
-
-    let mut child_files: Vec<(String, PathBuf, usize)> = Vec::new();
-    let mut known_children = BTreeSet::new();
+    if !dir.join("mod.rs").exists() {
+        let root_file = src_root.join(format!("{top_module}.rs"));
+        if root_file.exists() {
+            files.push(root_file);
+        }
+    }
+    let mut modules = Vec::new();
     for file in files {
-        if is_test_source_file(src_root, &file) || file == root_file {
+        if is_test_source_file(src_root, &file) {
             continue;
         }
-        let rel = file.strip_prefix(&dir).expect("file under module dir");
-        let first = rel.components().next().expect("non-empty relative path");
-        let first_str = first.as_os_str().to_string_lossy();
-        let child = first_str
-            .strip_suffix(".rs")
-            .unwrap_or(&first_str)
-            .to_owned();
-        let depth = rel.components().count() - usize::from(file.file_name().unwrap() == "mod.rs");
-        known_children.insert(child.clone());
-        child_files.push((child, file, depth));
-    }
-
-    let root_key = format!("{top_module} (root)");
-    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if include_root && root_file.exists() {
-        let root_src = fs::read_to_string(&root_file)
-            .unwrap_or_else(|e| panic!("failed to read {}: {e}", root_file.display()));
-        graph.insert(
-            root_key.clone(),
-            extract_root_child_deps(&root_src, &known_children),
-        );
-    }
-    for (child, file, depth) in child_files {
         let src = fs::read_to_string(&file)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
-        let deps = extract_tree_submodule_deps(
-            &src,
-            top_module,
-            &child,
-            depth,
-            &known_children,
-            include_root.then_some(root_key.as_str()),
-        );
-        graph.entry(child).or_default().extend(deps);
+        let (tokens, whole_file_test, _) = strip_cfg_test_with_spans(&tokenize(&src));
+        if whole_file_test {
+            continue;
+        }
+        let relative = file
+            .strip_prefix(src_root)
+            .expect("file under src")
+            .with_extension("");
+        let mut path: Vec<String> = relative
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        if path.last().is_some_and(|part| part == "mod") {
+            path.pop();
+        }
+        collect_tree_modules(&tokens, path, &mut modules);
     }
-
+    let mut graph = tree_module_graph(&modules, BTreeSet::new());
+    if !include_root {
+        graph.remove(top_module);
+        for deps in graph.values_mut() {
+            deps.remove(top_module);
+        }
+    }
     find_scc_cycles(&graph)
 }
 
@@ -1943,4 +2238,235 @@ fn prod_line_counter_enforces_budget_and_handles_cfg_test_spans() {
     // Top-level `#![cfg(test)]` marks the entire file as 0 production lines.
     let inner_cfg_test = "#![cfg(test)]\nfn a() {}\nfn b() {}\n";
     assert_eq!(count_prod_lines(inner_cfg_test), 0);
+}
+
+fn module_tree_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("temporary module tree");
+    for (path, source) in files {
+        let file = root.path().join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, source).unwrap();
+    }
+    root
+}
+
+#[test]
+fn module_tree_scanner_detects_root_imports() {
+    for import in [
+        "use super::*;",
+        "use super as parent;",
+        "use crate::auth as parent;",
+        "use crate::{auth as parent};",
+        "use super::{self as parent};",
+        "use crate::auth::*;",
+        "use crate as root; use root::auth as parent;",
+        "use {parent::auth as top, second as parent, third as second, fourth as third, crate as fourth};",
+    ] {
+        let child = format!("{import}\npub const VALUE: u8 = 1;");
+        let root = module_tree_fixture(&[
+            ("auth.rs", "mod child; pub use child::VALUE;"),
+            ("auth/child.rs", &child),
+        ]);
+        assert!(
+            !module_tree_scc_cycles(root.path(), "auth", true).is_empty(),
+            "root import escaped the SCC gate: {import}"
+        );
+        assert!(module_tree_scc_cycles(root.path(), "auth", false).is_empty());
+    }
+}
+
+#[test]
+fn module_tree_scanner_keeps_nested_file_and_inline_nodes() {
+    for files in [
+        vec![
+            ("auth.rs", "mod a; pub use a::VALUE;"),
+            (
+                "auth/a.rs",
+                "mod b; pub use self::b::VALUE; pub const PARENT: u8 = 1;",
+            ),
+            (
+                "auth/a/b.rs",
+                "use super::PARENT; pub const VALUE: u8 = PARENT;",
+            ),
+        ],
+        vec![
+            ("auth.rs", "mod a; pub use a::VALUE;"),
+            (
+                "auth/a.rs",
+                "mod b { use super::PARENT; pub const VALUE: u8 = PARENT; } pub use self::b::VALUE; pub const PARENT: u8 = 1;",
+            ),
+        ],
+        vec![
+            ("auth.rs", "mod a; pub use a::VALUE;"),
+            (
+                "auth/a/mod.rs",
+                "mod b; pub use crate::auth::a::b::VALUE; pub const PARENT: u8 = 1;",
+            ),
+            (
+                "auth/a/b.rs",
+                "use super as parent; pub const VALUE: u8 = parent::PARENT;",
+            ),
+        ],
+    ] {
+        let root = module_tree_fixture(&files);
+        assert_eq!(
+            module_tree_scc_cycles(root.path(), "auth", true),
+            vec![vec!["auth::a".to_owned(), "auth::a::b".to_owned()]],
+            "nested modules must remain distinct: {files:?}"
+        );
+    }
+
+    let root = module_tree_fixture(&[
+        ("auth.rs", "mod a;"),
+        (
+            "auth/a.rs",
+            "mod inline { mod leaf; pub use leaf::VALUE; pub const PARENT: u8 = 1; }",
+        ),
+        (
+            "auth/a/inline/leaf.rs",
+            "use super::{self as parent}; pub const VALUE: u8 = parent::PARENT;",
+        ),
+    ]);
+    assert_eq!(
+        module_tree_scc_cycles(root.path(), "auth", true),
+        vec![vec![
+            "auth::a::inline".to_owned(),
+            "auth::a::inline::leaf".to_owned()
+        ]]
+    );
+}
+
+#[test]
+fn cfg_test_control_flow_keeps_following_production_statements() {
+    for control in [
+        "if true {}",
+        "if true {} else if false {} else {}",
+        "while false {}",
+        "for _ in [1, 2] {}",
+        "loop { break; }",
+        "'outer: loop { break 'outer; }",
+        "const { 1 };",
+        "async move {};",
+        "match Some(1) { Some(_) => {}, None => {} }",
+        "if { true } {}",
+        "if (|| { true })() {}",
+        "if if true { true } else { false } {}",
+        "if match Some(true) { Some(x) => x, None => false } {}",
+        "if true && { false } {}",
+        "while const { false } {}",
+        "for _ in { [1, 2] } {}",
+        "match { Some(1) } { Some(_) => {}, None => {} }",
+    ] {
+        let source = format!("fn f() {{\n#[cfg(test)]\n{control}\ncrate::daemon::run();\n}}\n");
+        assert_eq!(
+            extract_dependencies(&source, "crate", "mcp"),
+            BTreeSet::from(["daemon".to_owned()]),
+            "production dependency after {control}"
+        );
+        assert_eq!(
+            count_prod_lines(&source),
+            3,
+            "production lines after {control}"
+        );
+        let over_budget = format!("{source}{}", "fn prod() {}\n".repeat(1498));
+        assert_eq!(count_prod_lines(&over_budget), 1501);
+        assert!(!prod_line_budget_ok(
+            Path::new("src"),
+            Path::new("src/sample.rs"),
+            &over_budget
+        ));
+    }
+}
+
+#[test]
+fn module_tree_scanner_preserves_acyclic_sibling_dependencies() {
+    let root = module_tree_fixture(&[
+        ("auth.rs", "mod a; mod b; pub use a::VALUE;"),
+        (
+            "auth/a.rs",
+            r#"
+            mod nested;
+            pub use self::nested::VALUE;
+            use crate as root;
+            use root::auth::b::{self as sibling, Helper};
+            #[cfg(test)]
+            use super as parent;
+            pub(in crate::auth) fn run() {
+                // use super::*;
+                let _ = "super::ROOT";
+                sibling::value();
+            }
+        "#,
+        ),
+        (
+            "auth/a/nested.rs",
+            "use super::super::b::Helper; pub const VALUE: u8 = 1;",
+        ),
+        ("auth/b.rs", "pub struct Helper; pub fn value() {}"),
+    ]);
+    assert!(module_tree_scc_cycles(root.path(), "auth", true).is_empty());
+}
+
+#[test]
+fn cfg_test_pattern_headers_keep_only_the_production_statement() {
+    for control in [
+        "if let Event::Ready { value } = event {\ncrate::mcp::test_only(value);\n}",
+        "while let Event::Ready { value } = event {\ncrate::mcp::test_only(value);\nbreak;\n}",
+        "for Point { x, y } in points {\ncrate::mcp::test_only(x + y);\n}",
+        "if ready && let Event::Ready { value } = event { crate::mcp::test_only(value); }",
+        "while ready && let Event::Ready { value } = event { crate::mcp::test_only(value); break; }",
+        "if let Event::Ready { value: Point { x, y } } = event { crate::mcp::test_only(x + y); }",
+        "for (Point { x, y }, [value]) in points { crate::mcp::test_only(x + y + value); }",
+        "if let 0..=9 = value { crate::mcp::test_only(value); }",
+    ] {
+        let source = format!("fn f() {{\n#[cfg(test)]\n{control}\ncrate::daemon::run();\n}}\n");
+        assert_eq!(
+            extract_dependencies(&source, "crate", "auth"),
+            BTreeSet::from(["daemon".to_owned()]),
+            "test-only dependency escaped from {control}"
+        );
+        assert_eq!(
+            count_prod_lines(&source),
+            3,
+            "production lines after {control}"
+        );
+        let over_budget = format!("{source}{}", "fn prod() {}\n".repeat(1498));
+        assert_eq!(count_prod_lines(&over_budget), 1501);
+        assert!(!prod_line_budget_ok(
+            Path::new("src"),
+            Path::new("src/sample.rs"),
+            &over_budget
+        ));
+    }
+}
+
+#[test]
+fn cfg_test_comparison_blocks_and_generic_paths_keep_the_body_boundary() {
+    for control in [
+        "if 0 < { 1 } {\ncrate::mcp::test_only();\n}",
+        "if 2 > { 1 } {\ncrate::mcp::test_only();\n}",
+        "match f::<u8> { _ => { crate::mcp::test_only(); } }",
+        "match f::<Option<Vec<u8>>> { _ => { crate::mcp::test_only(); } }",
+        "match f::<fn() -> u8> { _ => { crate::mcp::test_only(); } }",
+        "match f::<{ 1 > 0 }> { _ => { crate::mcp::test_only(); } }",
+    ] {
+        let source = format!("fn outer() {{\n#[cfg(test)]\n{control}\ncrate::daemon::run();\n}}\n");
+        assert_eq!(
+            extract_dependencies(&source, "crate", "auth"),
+            BTreeSet::from(["daemon".to_owned()]),
+            "control header ended at the wrong block in {control}"
+        );
+        assert_eq!(
+            count_prod_lines(&source),
+            3,
+            "production lines after {control}"
+        );
+        let over_budget = format!("{source}{}", "fn prod() {}\n".repeat(1498));
+        assert_eq!(count_prod_lines(&over_budget), 1501);
+        assert!(!prod_line_budget_ok(
+            Path::new("src"),
+            Path::new("src/sample.rs"),
+            &over_budget
+        ));
+    }
 }
