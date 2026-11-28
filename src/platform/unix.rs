@@ -1,3 +1,4 @@
+use super::local::{DirectoryEntry, FileKind};
 use anyhow::{Context, Result, bail};
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{File, OpenOptions};
@@ -278,7 +279,7 @@ pub fn open_beneath(root: &Path, relative: &Path, directory: bool) -> io::Result
     Ok(current)
 }
 
-pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::DirectoryEntry>> {
+pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<DirectoryEntry>> {
     // fdopendir takes ownership only on success; a duplicated descriptor keeps the caller's file live.
     let duplicate = file.try_clone()?;
     let directory = unsafe { libc::fdopendir(duplicate.as_raw_fd()) };
@@ -331,12 +332,12 @@ pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::Dir
             return Err(io::Error::last_os_error());
         }
         let kind = match stat.st_mode & libc::S_IFMT {
-            libc::S_IFDIR => super::FileKind::Directory,
-            libc::S_IFREG => super::FileKind::File,
-            libc::S_IFLNK => super::FileKind::Link,
-            _ => super::FileKind::Other,
+            libc::S_IFDIR => FileKind::Directory,
+            libc::S_IFREG => FileKind::File,
+            libc::S_IFLNK => FileKind::Link,
+            _ => FileKind::Other,
         };
-        entries.push(super::DirectoryEntry {
+        entries.push(DirectoryEntry {
             name: OsString::from_vec(name.to_bytes().to_vec()),
             kind,
         });

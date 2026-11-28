@@ -1,4 +1,4 @@
-use super::local::{self, SecurityAttributes};
+use super::local::{self, DirectoryEntry, FileKind, SecurityAttributes};
 use anyhow::{Context, Result, bail};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
@@ -557,7 +557,7 @@ fn open_relative(
     Ok(file)
 }
 
-pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::DirectoryEntry>> {
+pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<DirectoryEntry>> {
     let mut entries = Vec::new();
     let mut buffer = vec![0u64; 8192];
     let length = (buffer.len() * std::mem::size_of::<u64>()) as u32;
@@ -605,15 +605,15 @@ pub fn directory_entries(file: &File, limit: usize) -> io::Result<Vec<super::Dir
                     return Err(io::Error::other("directory exceeds its entry limit"));
                 }
                 let kind = if entry.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    super::FileKind::Link
+                    FileKind::Link
                 } else if entry.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                    super::FileKind::Directory
+                    FileKind::Directory
                 } else if entry.FileAttributes & FILE_ATTRIBUTE_DEVICE != 0 {
-                    super::FileKind::Other
+                    FileKind::Other
                 } else {
-                    super::FileKind::File
+                    FileKind::File
                 };
-                entries.push(super::DirectoryEntry { name, kind });
+                entries.push(DirectoryEntry { name, kind });
             }
             if entry.NextEntryOffset == 0 {
                 break;

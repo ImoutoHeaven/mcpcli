@@ -114,28 +114,7 @@ pub fn endpoint(directory: &Path, control: bool) -> io::Result<PathBuf> {
     }
 }
 
-#[derive(Clone, Copy)]
-pub enum FileKind {
-    File,
-    Directory,
-    Link,
-    Other,
-}
-impl FileKind {
-    pub fn is_file(self) -> bool {
-        matches!(self, Self::File)
-    }
-    pub fn is_dir(self) -> bool {
-        matches!(self, Self::Directory)
-    }
-    pub fn is_symlink(self) -> bool {
-        matches!(self, Self::Link)
-    }
-}
-pub struct DirectoryEntry {
-    pub name: std::ffi::OsString,
-    pub kind: FileKind,
-}
+pub use local::{DirectoryEntry, FileKind};
 
 #[cfg(test)]
 mod tests;

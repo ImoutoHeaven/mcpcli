@@ -38,6 +38,7 @@ const L0_MODULES: &[&str] = &["budget", "discovery", "platform", "oauth_url"];
 const RMCP_ALLOWED: &[&str] = &["mcp"];
 const SERDE_SAPHYR_ALLOWED: &[&str] = &["skills"];
 const SKILLS_ALLOWED: &[&str] = &["platform"];
+const MAX_PROD_LINES: usize = 1500;
 
 /// Lateral dependency allowlist among `src/mcp/*.rs` sibling submodules.
 const MCP_SUBMODULE_DAG: &[(&str, &[&str])] = &[
@@ -49,29 +50,45 @@ const MCP_SUBMODULE_DAG: &[(&str, &[&str])] = &[
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token {
+enum TokenKind {
     Ident(String),
+    Literal,
     ColonColon,
     Hash,
+    Bang,
     LBracket,
     RBracket,
     LBrace,
     RBrace,
     LParen,
     RParen,
+    Lt,
+    Gt,
     Semi,
     Comma,
     Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Token {
+    kind: TokenKind,
+    line: usize,
 }
 
 fn tokenize(src: &str) -> Vec<Token> {
     let bytes = src.as_bytes();
     let len = bytes.len();
     let mut i = 0;
+    let mut line = 1usize;
     let mut tokens = Vec::new();
 
     while i < len {
         let b = bytes[i];
+        if b == b'\n' {
+            line += 1;
+            i += 1;
+            continue;
+        }
         // Whitespace
         if b.is_ascii_whitespace() {
             i += 1;
@@ -89,49 +106,69 @@ fn tokenize(src: &str) -> Vec<Token> {
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
             i += 2;
             let mut depth = 1usize;
-            while i + 1 < len && depth > 0 {
-                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            while i < len && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
-                } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
                     depth -= 1;
                     i += 2;
                 } else {
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                    }
                     i += 1;
                 }
             }
-            if depth > 0 {
-                i = len;
-            }
             continue;
         }
-        // Raw string literal: r"...", r#"..."#, br"...", br#"..."#, cr"...", cr#"..."#
-        if let Some(after_raw) = try_skip_raw_string(bytes, i) {
+        // Raw string literal: r"...", r#"..."#, br/rb/cr/rc variants
+        if let Some(after_raw) = try_skip_raw_string(bytes, i, &mut line) {
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                line,
+            });
             i = after_raw;
             continue;
         }
         // Byte/C string literal prefix: b"...", c"..."
         if matches!(b, b'b' | b'c') && i + 1 < len && bytes[i + 1] == b'"' {
-            i = skip_quoted_string(bytes, i + 1);
+            i = skip_quoted_string(bytes, i + 1, &mut line);
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                line,
+            });
             continue;
         }
         // Byte char literal: b'...'
         if b == b'b'
             && i + 1 < len
             && bytes[i + 1] == b'\''
-            && let Some(after_char) = try_skip_char_literal(bytes, i + 1)
+            && let Some(after_char) = try_skip_char_literal(bytes, i + 1, &mut line)
         {
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                line,
+            });
             i = after_char;
             continue;
         }
         // Normal string literal
         if b == b'"' {
-            i = skip_quoted_string(bytes, i);
+            i = skip_quoted_string(bytes, i, &mut line);
+            tokens.push(Token {
+                kind: TokenKind::Literal,
+                line,
+            });
             continue;
         }
         // Char literal vs lifetime
         if b == b'\'' {
-            if let Some(after_char) = try_skip_char_literal(bytes, i) {
+            if let Some(after_char) = try_skip_char_literal(bytes, i, &mut line) {
+                tokens.push(Token {
+                    kind: TokenKind::Literal,
+                    line,
+                });
                 i = after_char;
             } else {
                 // Lifetime token: skip '\'' and following identifier chars
@@ -149,46 +186,59 @@ fn tokenize(src: &str) -> Vec<Token> {
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            tokens.push(Token::Ident(src[start..i].to_owned()));
+            tokens.push(Token {
+                kind: TokenKind::Ident(src[start..i].to_owned()),
+                line,
+            });
             continue;
         }
         // Two-char punctuation
         if b == b':' && i + 1 < len && bytes[i + 1] == b':' {
-            tokens.push(Token::ColonColon);
+            tokens.push(Token {
+                kind: TokenKind::ColonColon,
+                line,
+            });
             i += 2;
             continue;
         }
-        let tok = match b {
-            b'#' => Token::Hash,
-            b'[' => Token::LBracket,
-            b']' => Token::RBracket,
-            b'{' => Token::LBrace,
-            b'}' => Token::RBrace,
-            b'(' => Token::LParen,
-            b')' => Token::RParen,
-            b';' => Token::Semi,
-            b',' => Token::Comma,
-            _ => Token::Other,
+        if matches!(b, b'-' | b'=') && i + 1 < len && bytes[i + 1] == b'>' {
+            tokens.push(Token {
+                kind: TokenKind::Other,
+                line,
+            });
+            i += 2;
+            continue;
+        }
+        let kind = match b {
+            b'#' => TokenKind::Hash,
+            b'!' => TokenKind::Bang,
+            b'[' => TokenKind::LBracket,
+            b']' => TokenKind::RBracket,
+            b'{' => TokenKind::LBrace,
+            b'}' => TokenKind::RBrace,
+            b'(' => TokenKind::LParen,
+            b')' => TokenKind::RParen,
+            b'<' => TokenKind::Lt,
+            b'>' => TokenKind::Gt,
+            b';' => TokenKind::Semi,
+            b',' => TokenKind::Comma,
+            _ => TokenKind::Other,
         };
-        tokens.push(tok);
+        tokens.push(Token { kind, line });
         i += 1;
     }
 
     tokens
 }
 
-fn try_skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
+fn try_skip_raw_string(bytes: &[u8], start: usize, line: &mut usize) -> Option<usize> {
     let len = bytes.len();
-    let mut i = start;
-    if matches!(bytes[i], b'b' | b'c') {
-        i += 1;
-        if i >= len || bytes[i] != b'r' {
-            return None;
-        }
-    } else if bytes[i] != b'r' {
-        return None;
-    }
-    i += 1;
+    let r_offset = match (bytes.get(start).copied(), bytes.get(start + 1).copied()) {
+        (Some(b'b' | b'c'), Some(b'r')) | (Some(b'r'), Some(b'b' | b'c')) => 2,
+        (Some(b'r'), _) => 1,
+        _ => return None,
+    };
+    let mut i = start + r_offset;
     let mut hashes = 0usize;
     while i < len && bytes[i] == b'#' {
         hashes += 1;
@@ -199,6 +249,11 @@ fn try_skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
     }
     i += 1;
     while i < len {
+        if bytes[i] == b'\n' {
+            *line += 1;
+            i += 1;
+            continue;
+        }
         if bytes[i] == b'"' {
             let mut matched = 0usize;
             while matched < hashes && i + 1 + matched < len && bytes[i + 1 + matched] == b'#' {
@@ -213,20 +268,29 @@ fn try_skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
     Some(len)
 }
 
-fn skip_quoted_string(bytes: &[u8], quote_pos: usize) -> usize {
+fn skip_quoted_string(bytes: &[u8], quote_pos: usize, line: &mut usize) -> usize {
     let len = bytes.len();
     let mut i = quote_pos + 1;
     while i < len {
         match bytes[i] {
-            b'\\' => i += 2,
+            b'\\' => {
+                if i + 1 < len && bytes[i + 1] == b'\n' {
+                    *line += 1;
+                }
+                i += 2;
+            }
             b'"' => return i + 1,
+            b'\n' => {
+                *line += 1;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
     len
 }
 
-fn try_skip_char_literal(bytes: &[u8], quote_pos: usize) -> Option<usize> {
+fn try_skip_char_literal(bytes: &[u8], quote_pos: usize, line: &mut usize) -> Option<usize> {
     let len = bytes.len();
     let i = quote_pos + 1;
     if i >= len {
@@ -234,7 +298,13 @@ fn try_skip_char_literal(bytes: &[u8], quote_pos: usize) -> Option<usize> {
     }
     if bytes[i] == b'\\' {
         let mut j = (i + 2).min(len);
+        if i + 1 < len && bytes[i + 1] == b'\n' {
+            *line += 1;
+        }
         while j < len {
+            if bytes[j] == b'\n' {
+                *line += 1;
+            }
             if bytes[j] == b'\'' {
                 return Some(j + 1);
             }
@@ -247,6 +317,9 @@ fn try_skip_char_literal(bytes: &[u8], quote_pos: usize) -> Option<usize> {
     let ch = rest.chars().next()?;
     let next = i + ch.len_utf8();
     if next < len && bytes[next] == b'\'' {
+        if ch == '\n' {
+            *line += 1;
+        }
         Some(next + 1)
     } else {
         None
@@ -255,28 +328,32 @@ fn try_skip_char_literal(bytes: &[u8], quote_pos: usize) -> Option<usize> {
 
 fn is_cfg_test_predicate(inner: &[Token]) -> bool {
     // Matches bare `test`
-    if matches!(inner, [Token::Ident(s)] if s == "test") {
+    if matches!(inner.first().map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "test")
+        && inner.len() == 1
+    {
         return true;
     }
     // Matches `all(..., test, ...)` where `test` is a top-level predicate inside `all(...)`.
-    if matches!(inner.first(), Some(Token::Ident(s)) if s == "all")
-        && inner.get(1) == Some(&Token::LParen)
-        && skip_balanced(inner, 1, &Token::LParen, &Token::RParen) == inner.len()
+    if matches!(inner.first().map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "all")
+        && inner.get(1).map(|t| &t.kind) == Some(&TokenKind::LParen)
+        && skip_balanced(inner, 1, &TokenKind::LParen, &TokenKind::RParen) == inner.len()
     {
         let args = &inner[2..inner.len() - 1];
         let mut depth = 0usize;
         let mut start = 0usize;
         for idx in 0..=args.len() {
-            let at_sep = idx == args.len() || (depth == 0 && args[idx] == Token::Comma);
+            let at_sep = idx == args.len() || (depth == 0 && args[idx].kind == TokenKind::Comma);
             if at_sep {
-                if matches!(&args[start..idx], [Token::Ident(s)] if s == "test") {
+                if args[start..idx].len() == 1
+                    && matches!(&args[start].kind, TokenKind::Ident(s) if s == "test")
+                {
                     return true;
                 }
                 start = idx + 1;
             } else {
-                match args[idx] {
-                    Token::LParen => depth += 1,
-                    Token::RParen => depth = depth.saturating_sub(1),
+                match args[idx].kind {
+                    TokenKind::LParen => depth += 1,
+                    TokenKind::RParen => depth = depth.saturating_sub(1),
                     _ => {}
                 }
             }
@@ -285,37 +362,45 @@ fn is_cfg_test_predicate(inner: &[Token]) -> bool {
     false
 }
 
-fn is_cfg_test_attr(tokens: &[Token], i: usize) -> Option<usize> {
-    // Matches: # [ cfg ( test ) ] and # [ cfg ( all ( ..., test, ... ) ) ]
-    if tokens.get(i) != Some(&Token::Hash) || tokens.get(i + 1) != Some(&Token::LBracket) {
+/// Parses `#![...]` (`is_inner = true`) or `#[...]` (`is_inner = false`), returning
+/// `(after_bracket, is_inner, is_cfg_test)`.
+fn parse_attr(tokens: &[Token], i: usize) -> Option<(usize, bool, bool)> {
+    if tokens.get(i)?.kind != TokenKind::Hash {
         return None;
     }
-    let attr_end = skip_balanced(tokens, i + 1, &Token::LBracket, &Token::RBracket);
-    if attr_end < i + 6 {
-        return None;
+    let (is_inner, bracket_idx) = match (
+        tokens.get(i + 1).map(|t| &t.kind),
+        tokens.get(i + 2).map(|t| &t.kind),
+    ) {
+        (Some(TokenKind::Bang), Some(TokenKind::LBracket)) => (true, i + 2),
+        (Some(TokenKind::LBracket), _) => (false, i + 1),
+        _ => return None,
+    };
+    let attr_end = skip_balanced(
+        tokens,
+        bracket_idx,
+        &TokenKind::LBracket,
+        &TokenKind::RBracket,
+    );
+    if attr_end <= bracket_idx + 1 {
+        return Some((attr_end, is_inner, false));
     }
-    let inside_bracket = &tokens[i + 2..attr_end - 1];
-    if !matches!(inside_bracket.first(), Some(Token::Ident(s)) if s == "cfg")
-        || inside_bracket.get(1) != Some(&Token::LParen)
-        || skip_balanced(inside_bracket, 1, &Token::LParen, &Token::RParen) != inside_bracket.len()
-    {
-        return None;
-    }
-    let inner = &inside_bracket[2..inside_bracket.len() - 1];
-    if is_cfg_test_predicate(inner) {
-        Some(attr_end)
-    } else {
-        None
-    }
+    let inside_bracket = &tokens[bracket_idx + 1..attr_end - 1];
+    let is_cfg_test = matches!(inside_bracket.first().map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "cfg")
+        && inside_bracket.get(1).map(|t| &t.kind) == Some(&TokenKind::LParen)
+        && skip_balanced(inside_bracket, 1, &TokenKind::LParen, &TokenKind::RParen)
+            == inside_bracket.len()
+        && is_cfg_test_predicate(&inside_bracket[2..inside_bracket.len() - 1]);
+    Some((attr_end, is_inner, is_cfg_test))
 }
 
-fn skip_balanced(tokens: &[Token], start: usize, open: &Token, close: &Token) -> usize {
+fn skip_balanced(tokens: &[Token], start: usize, open: &TokenKind, close: &TokenKind) -> usize {
     let mut i = start;
     let mut depth = 0usize;
     while i < tokens.len() {
-        if &tokens[i] == open {
+        if &tokens[i].kind == open {
             depth += 1;
-        } else if &tokens[i] == close {
+        } else if &tokens[i].kind == close {
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return i + 1;
@@ -328,33 +413,72 @@ fn skip_balanced(tokens: &[Token], start: usize, open: &Token, close: &Token) ->
 
 fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
     // Skip any additional outer attributes attached to the same item.
-    while tokens.get(i) == Some(&Token::Hash) && tokens.get(i + 1) == Some(&Token::LBracket) {
-        i = skip_balanced(tokens, i + 1, &Token::LBracket, &Token::RBracket);
+    while let Some((after_attr, false, _)) = parse_attr(tokens, i) {
+        i = after_attr;
     }
-    // Check if the item is a semicolon-terminated statement (use / const / static / type).
+
+    // Advance past visibility and item modifiers to classify the gated target.
     let mut probe = i;
-    if matches!(tokens.get(probe), Some(Token::Ident(s)) if s == "pub") {
-        probe += 1;
-        if tokens.get(probe) == Some(&Token::LParen) {
-            probe = skip_balanced(tokens, probe, &Token::LParen, &Token::RParen);
+    loop {
+        if matches!(tokens.get(probe).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "pub") {
+            probe += 1;
+            if tokens.get(probe).map(|t| &t.kind) == Some(&TokenKind::LParen) {
+                probe = skip_balanced(tokens, probe, &TokenKind::LParen, &TokenKind::RParen);
+            }
+            continue;
         }
+        if matches!(
+            tokens.get(probe).map(|t| &t.kind),
+            Some(TokenKind::Ident(s)) if matches!(s.as_str(), "default" | "async" | "unsafe")
+        ) {
+            probe += 1;
+            continue;
+        }
+        if matches!(tokens.get(probe).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "const")
+            && matches!(
+                tokens.get(probe + 1).map(|t| &t.kind),
+                Some(TokenKind::Ident(next)) if matches!(next.as_str(), "fn" | "unsafe" | "extern")
+            )
+        {
+            probe += 1;
+            continue;
+        }
+        if matches!(tokens.get(probe).map(|t| &t.kind), Some(TokenKind::Ident(s)) if s == "extern")
+            && !matches!(tokens.get(probe + 1).map(|t| &t.kind), Some(TokenKind::Ident(next)) if next == "crate")
+        {
+            probe += 1;
+            if tokens.get(probe).map(|t| &t.kind) == Some(&TokenKind::Literal) {
+                probe += 1;
+            }
+            continue;
+        }
+        break;
     }
-    let semicolon_terminated = match tokens.get(probe) {
-        Some(Token::Ident(s)) if matches!(s.as_str(), "use" | "static" | "type") => true,
-        Some(Token::Ident(s)) if s == "const" => !matches!(
-            tokens.get(probe + 1),
-            Some(Token::Ident(next)) if matches!(next.as_str(), "fn" | "unsafe" | "extern")
-        ),
-        _ => false,
+
+    let Some(lead) = tokens.get(probe) else {
+        return tokens.len();
     };
 
+    // Semicolon-terminated declarations (`use`, `static`, `type`, `const`, `let`, `extern crate`).
+    let is_extern_crate = matches!(&lead.kind, TokenKind::Ident(s) if s == "extern")
+        && matches!(tokens.get(probe + 1).map(|t| &t.kind), Some(TokenKind::Ident(next)) if next == "crate");
+    let semicolon_terminated = is_extern_crate
+        || matches!(
+            &lead.kind,
+            TokenKind::Ident(s) if matches!(s.as_str(), "use" | "static" | "type" | "const" | "let")
+        );
+
     if semicolon_terminated {
-        let mut depth = 0usize;
+        let (mut paren, mut bracket, mut brace) = (0usize, 0usize, 0usize);
         while i < tokens.len() {
-            match tokens[i] {
-                Token::LBrace => depth += 1,
-                Token::RBrace => depth = depth.saturating_sub(1),
-                Token::Semi if depth == 0 => return i + 1,
+            match tokens[i].kind {
+                TokenKind::LParen => paren += 1,
+                TokenKind::RParen => paren = paren.saturating_sub(1),
+                TokenKind::LBracket => bracket += 1,
+                TokenKind::RBracket => bracket = bracket.saturating_sub(1),
+                TokenKind::LBrace => brace += 1,
+                TokenKind::RBrace => brace = brace.saturating_sub(1),
+                TokenKind::Semi if paren == 0 && bracket == 0 && brace == 0 => return i + 1,
                 _ => {}
             }
             i += 1;
@@ -362,29 +486,214 @@ fn skip_cfg_test_item(tokens: &[Token], mut i: usize) -> usize {
         return tokens.len();
     }
 
-    // Block item (mod/fn/struct/enum/impl/trait) or `mod tests;`
-    while i < tokens.len() {
-        match tokens[i] {
-            Token::Semi => return i + 1,
-            Token::LBrace => return skip_balanced(tokens, i, &Token::LBrace, &Token::RBrace),
-            _ => i += 1,
+    // Block items (`mod`, `fn`, `struct`, `enum`, `union`, `trait`, `impl`, `macro_rules`) or `mod tests;`
+    let is_brace_macro = matches!(&lead.kind, TokenKind::Ident(_))
+        && tokens.get(probe + 1).map(|t| &t.kind) == Some(&TokenKind::Bang)
+        && tokens.get(probe + 2).map(|t| &t.kind) == Some(&TokenKind::LBrace);
+    let is_block_item = is_brace_macro
+        || matches!(
+            &lead.kind,
+            TokenKind::Ident(s)
+                if matches!(
+                    s.as_str(),
+                    "fn" | "struct" | "enum" | "union" | "trait" | "impl" | "mod" | "macro_rules"
+                )
+        );
+
+    if is_block_item {
+        let (mut paren, mut bracket) = (0usize, 0usize);
+        while i < tokens.len() {
+            match tokens[i].kind {
+                TokenKind::LParen => paren += 1,
+                TokenKind::RParen => paren = paren.saturating_sub(1),
+                TokenKind::LBracket => bracket += 1,
+                TokenKind::RBracket => bracket = bracket.saturating_sub(1),
+                TokenKind::Semi if paren == 0 && bracket == 0 => return i + 1,
+                TokenKind::LBrace if paren == 0 && bracket == 0 => {
+                    return skip_balanced(tokens, i, &TokenKind::LBrace, &TokenKind::RBrace);
+                }
+                _ => {}
+            }
+            i += 1;
         }
+        return tokens.len();
+    }
+
+    // Direct block `{ ... }`.
+    if lead.kind == TokenKind::LBrace {
+        i = skip_balanced(tokens, probe, &TokenKind::LBrace, &TokenKind::RBrace);
+        if matches!(
+            tokens.get(i).map(|t| &t.kind),
+            Some(TokenKind::Semi | TokenKind::Comma)
+        ) {
+            i += 1;
+        }
+        return i;
+    }
+
+    // Struct/enum fields, parameters, match arms, or call arguments: stop at `,`/`;` or before a closing delimiter.
+    let (mut paren, mut bracket, mut brace, mut angle) = (0usize, 0usize, 0usize, 0usize);
+    while i < tokens.len() {
+        if paren == 0 && bracket == 0 && brace == 0 {
+            if matches!(
+                tokens[i].kind,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket
+            ) {
+                return i;
+            }
+            if angle == 0 && matches!(tokens[i].kind, TokenKind::Comma | TokenKind::Semi) {
+                return i + 1;
+            }
+            match tokens[i].kind {
+                TokenKind::Lt => angle += 1,
+                TokenKind::Gt => angle = angle.saturating_sub(1),
+                _ => {}
+            }
+        }
+        match tokens[i].kind {
+            TokenKind::LParen => paren += 1,
+            TokenKind::RParen => paren = paren.saturating_sub(1),
+            TokenKind::LBracket => bracket += 1,
+            TokenKind::RBracket => bracket = bracket.saturating_sub(1),
+            TokenKind::LBrace => brace += 1,
+            TokenKind::RBrace => brace = brace.saturating_sub(1),
+            _ => {}
+        }
+        i += 1;
     }
     tokens.len()
 }
 
-fn strip_cfg_test(tokens: &[Token]) -> Vec<Token> {
+fn strip_cfg_test_with_spans(tokens: &[Token]) -> (Vec<Token>, bool, Vec<(usize, usize)>) {
     let mut out = Vec::with_capacity(tokens.len());
+    let mut spans = Vec::new();
+    let mut scope_starts: Vec<(usize, usize)> = Vec::new();
+    let mut brace_depth = 0usize;
     let mut i = 0;
+
     while i < tokens.len() {
-        if let Some(after_attr) = is_cfg_test_attr(tokens, i) {
-            i = skip_cfg_test_item(tokens, after_attr);
+        if let Some((after_attr, true, true)) = parse_attr(tokens, i) {
+            if brace_depth == 0 {
+                return (Vec::new(), true, Vec::new());
+            }
+            let start_line = if let Some(&(out_start, open_line)) = scope_starts.last() {
+                out.truncate(out_start);
+                open_line
+            } else {
+                tokens[i].line
+            };
+            let target_depth = brace_depth - 1;
+            i = after_attr;
+            while i < tokens.len() {
+                if tokens[i].kind == TokenKind::LBrace {
+                    brace_depth += 1;
+                } else if tokens[i].kind == TokenKind::RBrace {
+                    if brace_depth - 1 == target_depth {
+                        if i > 0 {
+                            spans.push((start_line, tokens[i - 1].line));
+                        }
+                        break;
+                    }
+                    brace_depth -= 1;
+                }
+                i += 1;
+            }
             continue;
+        }
+
+        if matches!(parse_attr(tokens, i), Some((_, false, _))) {
+            let mut cursor = i;
+            let mut has_cfg_test = false;
+            while let Some((after_attr, false, is_cfg_test)) = parse_attr(tokens, cursor) {
+                if is_cfg_test {
+                    has_cfg_test = true;
+                }
+                cursor = after_attr;
+            }
+            if has_cfg_test {
+                let start_line = tokens[i].line;
+                let end_idx = skip_cfg_test_item(tokens, cursor);
+                if end_idx > i {
+                    let end_line = tokens[end_idx - 1].line;
+                    spans.push((start_line, end_line));
+                }
+                i = end_idx;
+                continue;
+            }
+            out.extend_from_slice(&tokens[i..cursor]);
+            i = cursor;
+            continue;
+        }
+
+        if tokens[i].kind == TokenKind::LBrace {
+            brace_depth += 1;
+            let open_line = tokens[i].line;
+            out.push(tokens[i].clone());
+            scope_starts.push((out.len(), open_line));
+            i += 1;
+            continue;
+        }
+        if tokens[i].kind == TokenKind::RBrace {
+            brace_depth = brace_depth.saturating_sub(1);
+            scope_starts.pop();
         }
         out.push(tokens[i].clone());
         i += 1;
     }
-    out
+
+    (out, false, spans)
+}
+
+fn strip_cfg_test(tokens: &[Token]) -> Vec<Token> {
+    strip_cfg_test_with_spans(tokens).0
+}
+
+fn count_prod_lines(source: &str) -> usize {
+    let total_lines = source.lines().count();
+    if total_lines == 0 {
+        return 0;
+    }
+    let tokens = tokenize(source);
+    let (_, whole_file_test, mut spans) = strip_cfg_test_with_spans(&tokens);
+    if whole_file_test {
+        return 0;
+    }
+    if spans.is_empty() {
+        return total_lines;
+    }
+    spans.sort_unstable();
+    let mut excluded = 0usize;
+    let mut cur_start = spans[0].0.max(1);
+    let mut cur_end = spans[0].1.min(total_lines);
+    for &(s, e) in &spans[1..] {
+        let s = s.max(1);
+        let e = e.min(total_lines);
+        if s <= cur_end.saturating_add(1) {
+            cur_end = cur_end.max(e);
+        } else {
+            if cur_end >= cur_start {
+                excluded += cur_end - cur_start + 1;
+            }
+            cur_start = s;
+            cur_end = e;
+        }
+    }
+    if cur_end >= cur_start {
+        excluded += cur_end - cur_start + 1;
+    }
+    total_lines.saturating_sub(excluded)
+}
+
+fn is_test_source_file(src_root: &Path, file: &Path) -> bool {
+    if file.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+        return true;
+    }
+    let rel = file.strip_prefix(src_root).unwrap_or(file);
+    rel.components().any(|comp| comp.as_os_str() == "tests")
+}
+
+fn prod_line_budget_ok(src_root: &Path, file: &Path, source: &str) -> bool {
+    is_test_source_file(src_root, file) || count_prod_lines(source) <= MAX_PROD_LINES
 }
 
 fn extract_dependencies(src: &str, root_ident: &str, self_module: &str) -> BTreeSet<String> {
@@ -393,38 +702,38 @@ fn extract_dependencies(src: &str, root_ident: &str, self_module: &str) -> BTree
     let mut i = 0;
 
     while i + 2 < tokens.len() {
-        let is_root = matches!(&tokens[i], Token::Ident(id) if id == root_ident);
-        if is_root && tokens[i + 1] == Token::ColonColon {
-            match &tokens[i + 2] {
-                Token::Ident(target) => {
+        let is_root = matches!(&tokens[i].kind, TokenKind::Ident(id) if id == root_ident);
+        if is_root && tokens[i + 1].kind == TokenKind::ColonColon {
+            match &tokens[i + 2].kind {
+                TokenKind::Ident(target) => {
                     if target != self_module && target != "self" {
                         deps.insert(target.clone());
                     }
                     i += 3;
                     continue;
                 }
-                Token::LBrace => {
+                TokenKind::LBrace => {
                     // Parse top-level comma-separated module names inside `root::{ ... }`.
                     let mut j = i + 3;
                     let mut depth = 0usize;
                     let mut expect_module = true;
                     while j < tokens.len() {
-                        match &tokens[j] {
-                            Token::LBrace => {
+                        match &tokens[j].kind {
+                            TokenKind::LBrace => {
                                 depth += 1;
                                 expect_module = false;
                             }
-                            Token::RBrace => {
+                            TokenKind::RBrace => {
                                 if depth == 0 {
                                     j += 1;
                                     break;
                                 }
                                 depth -= 1;
                             }
-                            Token::Comma if depth == 0 => {
+                            TokenKind::Comma if depth == 0 => {
                                 expect_module = true;
                             }
-                            Token::Ident(target) if depth == 0 && expect_module => {
+                            TokenKind::Ident(target) if depth == 0 && expect_module => {
                                 if target != self_module && target != "self" {
                                     deps.insert(target.clone());
                                 }
@@ -474,6 +783,9 @@ fn module_for_src_file(src_root: &Path, file: &Path) -> Option<String> {
     let first = rel.components().next().expect("non-empty relative path");
     let first_str = first.as_os_str().to_string_lossy();
     let module = first_str.strip_suffix(".rs").unwrap_or(&first_str);
+    if module == "cli" {
+        return Some("main".to_owned());
+    }
     Some(module.to_owned())
 }
 
@@ -481,10 +793,16 @@ fn has_module_path_override(src: &str) -> bool {
     let tokens = strip_cfg_test(&tokenize(src));
     let mut index = 0;
     while index + 1 < tokens.len() {
-        if tokens[index] == Token::Hash && tokens[index + 1] == Token::LBracket {
-            let end = skip_balanced(&tokens, index + 1, &Token::LBracket, &Token::RBracket);
+        if tokens[index].kind == TokenKind::Hash && tokens[index + 1].kind == TokenKind::LBracket {
+            let end = skip_balanced(
+                &tokens,
+                index + 1,
+                &TokenKind::LBracket,
+                &TokenKind::RBracket,
+            );
             if tokens[index + 2..end - 1].windows(2).any(|pair| {
-                matches!(&pair[0], Token::Ident(name) if name == "path") && pair[1] == Token::Other
+                matches!(&pair[0].kind, TokenKind::Ident(name) if name == "path")
+                    && pair[1].kind == TokenKind::Other
             }) {
                 return true;
             }
@@ -512,8 +830,8 @@ fn collect_relative_path(
     self_module: &str,
     deps: &mut BTreeSet<String>,
 ) -> usize {
-    while let Some(Token::Ident(name)) = tokens.get(index) {
-        if tokens.get(index + 1) != Some(&Token::ColonColon) {
+    while let Some(TokenKind::Ident(name)) = tokens.get(index).map(|t| &t.kind) {
+        if tokens.get(index + 1).map(|t| &t.kind) != Some(&TokenKind::ColonColon) {
             break;
         }
         if name == "super" {
@@ -526,15 +844,15 @@ fn collect_relative_path(
         }
         index += 2;
     }
-    match tokens.get(index) {
-        Some(Token::LBrace) => {
-            let end = skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace);
+    match tokens.get(index).map(|t| &t.kind) {
+        Some(TokenKind::LBrace) => {
+            let end = skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace);
             index += 1;
             while index + 1 < end {
                 index = collect_relative_path(tokens, index, depth, self_module, deps);
-                while index + 1 < end && tokens[index] != Token::Comma {
-                    index = if tokens[index] == Token::LBrace {
-                        skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace)
+                while index + 1 < end && tokens[index].kind != TokenKind::Comma {
+                    index = if tokens[index].kind == TokenKind::LBrace {
+                        skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace)
                     } else {
                         index + 1
                     };
@@ -543,7 +861,7 @@ fn collect_relative_path(
             }
             end
         }
-        Some(Token::Ident(target)) => {
+        Some(TokenKind::Ident(target)) => {
             if depth == 0 && target != self_module && layer_map().contains_key(target.as_str()) {
                 deps.insert(target.clone());
             }
@@ -560,26 +878,40 @@ fn extract_super_dependencies(src: &str, self_module: &str, file_depth: usize) -
     let mut scopes = Vec::new();
     let mut index = 0;
     while index < tokens.len() {
-        if matches!(&tokens[index], Token::Ident(name) if name == "super")
-            && tokens.get(index + 1) == Some(&Token::ColonColon)
+        if matches!(&tokens[index].kind, TokenKind::Ident(name) if name == "super")
+            && tokens.get(index + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
         {
             index = collect_relative_path(&tokens, index, depth, self_module, &mut deps);
             continue;
         }
-        match &tokens[index] {
-            Token::LBrace => {
+        match &tokens[index].kind {
+            TokenKind::LBrace => {
                 let module = index >= 2
-                    && matches!(&tokens[index - 2], Token::Ident(name) if name == "mod")
-                    && matches!(&tokens[index - 1], Token::Ident(_));
+                    && matches!(&tokens[index - 2].kind, TokenKind::Ident(name) if name == "mod")
+                    && matches!(&tokens[index - 1].kind, TokenKind::Ident(_));
                 scopes.push(module);
                 depth += usize::from(module);
             }
-            Token::RBrace => {
+            TokenKind::RBrace => {
                 depth -= usize::from(scopes.pop().unwrap_or(false));
             }
             _ => {}
         }
         index += 1;
+    }
+    deps
+}
+
+fn extract_module_crate_dependencies(src: &str, module: &str) -> BTreeSet<String> {
+    let own_module = if L0_MODULES.contains(&module) || module == "schema" {
+        ""
+    } else {
+        module
+    };
+    let mut deps = extract_dependencies(src, "crate", own_module);
+    if module == "main" {
+        deps.remove("cli");
+        deps.extend(extract_dependencies(src, "mcpcli", module));
     }
     deps
 }
@@ -593,7 +925,7 @@ fn scan_production_graph() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<Strin
     let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for file in files {
-        if file == src_root.join("platform/tests.rs") {
+        if is_test_source_file(&src_root, &file) {
             continue;
         }
         let content = fs::read_to_string(&file)
@@ -608,20 +940,12 @@ fn scan_production_graph() -> (BTreeSet<String>, BTreeMap<String, BTreeSet<Strin
         };
         modules.insert(module.clone());
         let entry = graph.entry(module.clone()).or_default();
-        let own_module = if L0_MODULES.contains(&module.as_str()) || module == "schema" {
-            ""
-        } else {
-            module.as_str()
-        };
-        entry.extend(extract_dependencies(&content, "crate", own_module));
+        entry.extend(extract_module_crate_dependencies(&content, &module));
         entry.extend(extract_super_dependencies(
             &content,
             &module,
             module_depth(&src_root, &file),
         ));
-        if module == "main" {
-            entry.extend(extract_dependencies(&content, "mcpcli", &module));
-        }
     }
 
     (modules, graph)
@@ -723,7 +1047,7 @@ fn foundational_modules_keep_their_dependency_contracts() {
 fn references_external_crate(src: &str, crate_ident: &str) -> bool {
     strip_cfg_test(&tokenize(src))
         .iter()
-        .any(|tok| matches!(tok, Token::Ident(id) if id == crate_ident))
+        .any(|tok| matches!(&tok.kind, TokenKind::Ident(id) if id == crate_ident))
 }
 
 fn check_external_crate_allowed(
@@ -743,7 +1067,7 @@ fn external_crate_boundaries_are_enforced() {
 
     let mut violations = Vec::new();
     for file in files {
-        if file == src_root.join("platform/tests.rs") {
+        if is_test_source_file(&src_root, &file) {
             continue;
         }
         let Some(module) = module_for_src_file(&src_root, &file) else {
@@ -775,16 +1099,17 @@ fn mcp_submodule_names() -> BTreeSet<&'static str> {
     MCP_SUBMODULE_DAG.iter().map(|(name, _)| *name).collect()
 }
 
-fn collect_mcp_relative_targets(
+fn collect_submodule_relative_targets(
     tokens: &[Token],
     mut index: usize,
     mut depth: usize,
     self_submod: &str,
-    known: &BTreeSet<&str>,
+    known: &BTreeSet<String>,
+    root_node: Option<&str>,
     deps: &mut BTreeSet<String>,
 ) -> usize {
-    while let Some(Token::Ident(name)) = tokens.get(index) {
-        if tokens.get(index + 1) != Some(&Token::ColonColon) {
+    while let Some(TokenKind::Ident(name)) = tokens.get(index).map(|t| &t.kind) {
+        if tokens.get(index + 1).map(|t| &t.kind) != Some(&TokenKind::ColonColon) {
             break;
         }
         if name == "super" {
@@ -797,16 +1122,23 @@ fn collect_mcp_relative_targets(
         }
         index += 2;
     }
-    match tokens.get(index) {
-        Some(Token::LBrace) => {
-            let end = skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace);
+    match tokens.get(index).map(|t| &t.kind) {
+        Some(TokenKind::LBrace) => {
+            let end = skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace);
             index += 1;
             while index + 1 < end {
-                index =
-                    collect_mcp_relative_targets(tokens, index, depth, self_submod, known, deps);
-                while index + 1 < end && tokens[index] != Token::Comma {
-                    index = if tokens[index] == Token::LBrace {
-                        skip_balanced(tokens, index, &Token::LBrace, &Token::RBrace)
+                index = collect_submodule_relative_targets(
+                    tokens,
+                    index,
+                    depth,
+                    self_submod,
+                    known,
+                    root_node,
+                    deps,
+                );
+                while index + 1 < end && tokens[index].kind != TokenKind::Comma {
+                    index = if tokens[index].kind == TokenKind::LBrace {
+                        skip_balanced(tokens, index, &TokenKind::LBrace, &TokenKind::RBrace)
                     } else {
                         index + 1
                     };
@@ -815,10 +1147,13 @@ fn collect_mcp_relative_targets(
             }
             end
         }
-        Some(Token::Ident(target)) => {
-            // depth == 0 means we resolved to `crate::mcp` (parent of `src/mcp/<submod>.rs`).
-            if depth == 0 && target != self_submod && known.contains(target.as_str()) {
-                deps.insert(target.clone());
+        Some(TokenKind::Ident(target)) => {
+            if depth == 0 && target != self_submod && target != "self" {
+                if known.contains(target.as_str()) {
+                    deps.insert(target.clone());
+                } else if let Some(root) = root_node {
+                    deps.insert(root.to_owned());
+                }
             }
             index + 1
         }
@@ -826,40 +1161,62 @@ fn collect_mcp_relative_targets(
     }
 }
 
-fn extract_mcp_submodule_deps(src: &str, self_submod: &str) -> BTreeSet<String> {
+fn extract_tree_submodule_deps(
+    src: &str,
+    top_module: &str,
+    self_submod: &str,
+    initial_depth: usize,
+    known: &BTreeSet<String>,
+    root_node: Option<&str>,
+) -> BTreeSet<String> {
     let tokens = strip_cfg_test(&tokenize(src));
-    let known = mcp_submodule_names();
     let mut deps = BTreeSet::new();
-    let mut depth = 1usize; // `src/mcp/<submod>.rs` is 1 level below `crate::mcp`.
+    let mut depth = initial_depth;
     let mut scopes = Vec::new();
     let mut i = 0;
 
     while i < tokens.len() {
-        // Match `crate::mcp::<submod>` or `crate::mcp::{...}`.
-        if matches!(&tokens[i], Token::Ident(id) if id == "crate")
-            && tokens.get(i + 1) == Some(&Token::ColonColon)
-            && matches!(tokens.get(i + 2), Some(Token::Ident(id)) if id == "mcp")
-            && tokens.get(i + 3) == Some(&Token::ColonColon)
+        // Match `crate::<top_module>::<submod>` or `crate::<top_module>::{...}`.
+        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "crate")
+            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
+            && matches!(tokens.get(i + 2).map(|t| &t.kind), Some(TokenKind::Ident(id)) if id == top_module)
+            && tokens.get(i + 3).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
         {
-            i = collect_mcp_relative_targets(&tokens, i + 4, 0, self_submod, &known, &mut deps);
+            i = collect_submodule_relative_targets(
+                &tokens,
+                i + 4,
+                0,
+                self_submod,
+                known,
+                root_node,
+                &mut deps,
+            );
             continue;
         }
-        // Match `super::<submod>` or `super::{...}` resolving to `crate::mcp`.
-        if matches!(&tokens[i], Token::Ident(id) if id == "super")
-            && tokens.get(i + 1) == Some(&Token::ColonColon)
+        // Match `super::<submod>` or `super::{...}` resolving to `crate::<top_module>`.
+        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "super")
+            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
         {
-            i = collect_mcp_relative_targets(&tokens, i, depth, self_submod, &known, &mut deps);
+            i = collect_submodule_relative_targets(
+                &tokens,
+                i,
+                depth,
+                self_submod,
+                known,
+                root_node,
+                &mut deps,
+            );
             continue;
         }
-        match &tokens[i] {
-            Token::LBrace => {
+        match &tokens[i].kind {
+            TokenKind::LBrace => {
                 let is_mod = i >= 2
-                    && matches!(&tokens[i - 2], Token::Ident(id) if id == "mod")
-                    && matches!(&tokens[i - 1], Token::Ident(_));
+                    && matches!(&tokens[i - 2].kind, TokenKind::Ident(id) if id == "mod")
+                    && matches!(&tokens[i - 1].kind, TokenKind::Ident(_));
                 scopes.push(is_mod);
                 depth += usize::from(is_mod);
             }
-            Token::RBrace => {
+            TokenKind::RBrace => {
                 depth -= usize::from(scopes.pop().unwrap_or(false));
             }
             _ => {}
@@ -868,6 +1225,34 @@ fn extract_mcp_submodule_deps(src: &str, self_submod: &str) -> BTreeSet<String> 
     }
 
     deps
+}
+
+fn extract_root_child_deps(src: &str, known: &BTreeSet<String>) -> BTreeSet<String> {
+    let tokens = strip_cfg_test(&tokenize(src));
+    let mut deps = BTreeSet::new();
+    for i in 0..tokens.len() {
+        if matches!(&tokens[i].kind, TokenKind::Ident(id) if id == "mod")
+            && let Some(TokenKind::Ident(child)) = tokens.get(i + 1).map(|t| &t.kind)
+            && known.contains(child.as_str())
+        {
+            deps.insert(child.clone());
+        }
+        if let TokenKind::Ident(child) = &tokens[i].kind
+            && tokens.get(i + 1).map(|t| &t.kind) == Some(&TokenKind::ColonColon)
+            && known.contains(child.as_str())
+        {
+            deps.insert(child.clone());
+        }
+    }
+    deps
+}
+
+fn extract_mcp_submodule_deps(src: &str, self_submod: &str) -> BTreeSet<String> {
+    let known: BTreeSet<String> = mcp_submodule_names()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    extract_tree_submodule_deps(src, "mcp", self_submod, 1, &known, None)
 }
 
 /// Tarjan's strongly connected components algorithm; returns all cyclic SCCs (size > 1 or self-loop).
@@ -940,9 +1325,80 @@ fn find_scc_cycles(graph: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String
     st.cycles
 }
 
+fn module_tree_scc_cycles(
+    src_root: &Path,
+    top_module: &str,
+    include_root: bool,
+) -> Vec<Vec<String>> {
+    let dir = src_root.join(top_module);
+    let mut files = Vec::new();
+    collect_rs_files(&dir, &mut files);
+
+    let root_file = if dir.join("mod.rs").exists() {
+        dir.join("mod.rs")
+    } else {
+        src_root.join(format!("{top_module}.rs"))
+    };
+
+    let mut child_files: Vec<(String, PathBuf, usize)> = Vec::new();
+    let mut known_children = BTreeSet::new();
+    for file in files {
+        if is_test_source_file(src_root, &file) || file == root_file {
+            continue;
+        }
+        let rel = file.strip_prefix(&dir).expect("file under module dir");
+        let first = rel.components().next().expect("non-empty relative path");
+        let first_str = first.as_os_str().to_string_lossy();
+        let child = first_str
+            .strip_suffix(".rs")
+            .unwrap_or(&first_str)
+            .to_owned();
+        let depth = rel.components().count() - usize::from(file.file_name().unwrap() == "mod.rs");
+        known_children.insert(child.clone());
+        child_files.push((child, file, depth));
+    }
+
+    let root_key = format!("{top_module} (root)");
+    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    if include_root && root_file.exists() {
+        let root_src = fs::read_to_string(&root_file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", root_file.display()));
+        graph.insert(
+            root_key.clone(),
+            extract_root_child_deps(&root_src, &known_children),
+        );
+    }
+    for (child, file, depth) in child_files {
+        let src = fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", file.display()));
+        let deps = extract_tree_submodule_deps(
+            &src,
+            top_module,
+            &child,
+            depth,
+            &known_children,
+            include_root.then_some(root_key.as_str()),
+        );
+        graph.entry(child).or_default().extend(deps);
+    }
+
+    find_scc_cycles(&graph)
+}
+
+#[test]
+fn platform_module_tree_has_no_cycles() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let cycles = module_tree_scc_cycles(&src_root, "platform", true);
+    assert!(
+        cycles.is_empty(),
+        "Tarjan SCC detected root-inclusive cycle(s) in src/platform/: {cycles:?}"
+    );
+}
+
 #[test]
 fn mcp_submodules_follow_dag_and_have_no_cycles() {
-    let mcp_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp");
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mcp_dir = src_root.join("mcp");
     let allowlist: BTreeMap<&str, BTreeSet<&str>> = MCP_SUBMODULE_DAG
         .iter()
         .map(|(k, v)| (*k, v.iter().copied().collect()))
@@ -960,6 +1416,9 @@ fn mcp_submodules_follow_dag_and_have_no_cycles() {
     let mut violations = Vec::new();
 
     for file in files {
+        if is_test_source_file(&src_root, &file) {
+            continue;
+        }
         let stem = file
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1027,6 +1486,8 @@ fn scanner_handles_multiline_uses_comments_strings_and_cfg_test() {
         use crate::delta::item;
         const S: &str = "crate::fake_str::x";
         const R: &str = r#"crate::fake_raw::y"#;
+        const RB: &[u8] = rb#"crate::fake_rb::z"#;
+        const RC: &std::ffi::CStr = rc#"crate::fake_rc::w"#;
         fn call(c: char) {
             let _ = crate::epsilon::run('a', '\'');
             let _ = matches!(c, '\''|'"');
@@ -1123,6 +1584,40 @@ fn scanner_resolves_super_chains_in_files_and_inline_modules() {
         module_depth(root, Path::new("src/platform/nested/mod.rs")),
         2
     );
+    assert_eq!(module_depth(root, Path::new("src/cli.rs")), 1);
+    assert_eq!(module_depth(root, Path::new("src/cli/args.rs")), 2);
+}
+
+#[test]
+fn scanner_maps_cli_submodules_to_main_and_skips_test_files() {
+    let root = Path::new("src");
+    assert_eq!(
+        module_for_src_file(root, Path::new("src/cli.rs")).as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        module_for_src_file(root, Path::new("src/cli/remote.rs")).as_deref(),
+        Some("main")
+    );
+    assert!(is_test_source_file(root, Path::new("src/auth/tests.rs")));
+    assert!(is_test_source_file(root, Path::new("src/cli/tests.rs")));
+    assert!(is_test_source_file(
+        root,
+        Path::new("src/daemon/tests/smoke.rs")
+    ));
+    assert!(!is_test_source_file(root, Path::new("src/cli/remote.rs")));
+
+    let cli_src = r#"
+        use crate::cli::args::Cli;
+        use mcpcli::daemon::DaemonOptions;
+        use mcpcli::config::LoadedConfig;
+    "#;
+    let deps = extract_module_crate_dependencies(cli_src, "main");
+    let expected: BTreeSet<String> = ["config", "daemon"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(deps, expected);
 }
 
 #[test]
@@ -1273,4 +1768,81 @@ fn mcp_submodule_scanner_and_tarjan_scc_detect_illegal_edges_and_cycles() {
         find_scc_cycles(&cyclic),
         vec![vec!["ingress".to_owned(), "sse".to_owned()]]
     );
+}
+
+#[test]
+fn prod_line_counter_enforces_budget_and_handles_cfg_test_spans() {
+    let root = Path::new("src");
+
+    // (a) 1,501-line production file fails.
+    let over_budget = "fn prod() {}\n".repeat(MAX_PROD_LINES + 1);
+    assert_eq!(count_prod_lines(&over_budget), MAX_PROD_LINES + 1);
+    assert!(!prod_line_budget_ok(
+        root,
+        Path::new("src/monolith.rs"),
+        &over_budget
+    ));
+
+    // (b) 1,000-line production file + 2,000-line `#[cfg(test)] mod tests` passes.
+    let mut mixed = "fn prod() {}\n".repeat(1000);
+    mixed.push_str("#[cfg(test)]\nmod tests {\n");
+    mixed.push_str(&"    fn test_case() {}\n".repeat(1997));
+    mixed.push_str("}\n");
+    assert_eq!(count_prod_lines(&mixed), 1000);
+    assert!(prod_line_budget_ok(root, Path::new("src/mixed.rs"), &mixed));
+
+    // (c) Multi-line raw string literals (r#, rb#, rc#) in production code count all lines.
+    let raw_strings = concat!(
+        "const A: &str = r#\"\n",
+        "line 2\n",
+        "line 3\n",
+        "\"#;\n",
+        "const B: &[u8] = rb#\"\n",
+        "line 6\n",
+        "\"#;\n",
+        "const C: &std::ffi::CStr = rc#\"\n",
+        "line 9\n",
+        "\"#;\n",
+    );
+    assert_eq!(count_prod_lines(raw_strings), 10);
+
+    // (d) `#[cfg(test)]` struct field ending in `,` and comma-less final field before `}`
+    // exclude only the gated field lines, preserving the struct and closing brace.
+    let gated_fields = concat!(
+        "struct Sample {\n",
+        "    kept_before: usize,\n",
+        "    #[allow(dead_code)]\n",
+        "    #[cfg(test)]\n",
+        "    test_mid: std::collections::BTreeMap<String, usize>,\n",
+        "    kept_after: bool,\n",
+        "    #[cfg(test)]\n",
+        "    test_last: u8\n",
+        "}\n",
+        "fn after_struct() {}\n",
+    );
+    assert_eq!(count_prod_lines(gated_fields), 5);
+    assert!(
+        extract_dependencies(
+            &format!("{gated_fields}\nfn f() {{ crate::alpha::run(); }}"),
+            "crate",
+            "self_mod"
+        )
+        .contains("alpha")
+    );
+
+    // (e) `tests.rs` (and `tests/` directory files) > 1,500 lines pass.
+    assert!(prod_line_budget_ok(
+        root,
+        Path::new("src/mcp/tests.rs"),
+        &over_budget
+    ));
+    assert!(prod_line_budget_ok(
+        root,
+        Path::new("src/mcp/tests/extra.rs"),
+        &over_budget
+    ));
+
+    // Top-level `#![cfg(test)]` marks the entire file as 0 production lines.
+    let inner_cfg_test = "#![cfg(test)]\nfn a() {}\nfn b() {}\n";
+    assert_eq!(count_prod_lines(inner_cfg_test), 0);
 }

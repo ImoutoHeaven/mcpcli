@@ -1,8 +1,33 @@
 //! The local byte streams the daemon listens on and a client connects to: a named pipe whose
 //! access is the current user's alone on Windows, a Unix socket elsewhere.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io;
+
+#[derive(Clone, Copy)]
+pub enum FileKind {
+    File,
+    Directory,
+    Link,
+    Other,
+}
+
+impl FileKind {
+    pub fn is_file(self) -> bool {
+        matches!(self, Self::File)
+    }
+    pub fn is_dir(self) -> bool {
+        matches!(self, Self::Directory)
+    }
+    pub fn is_symlink(self) -> bool {
+        matches!(self, Self::Link)
+    }
+}
+
+pub struct DirectoryEntry {
+    pub name: OsString,
+    pub kind: FileKind,
+}
 
 /// The server side of one accepted connection.
 #[cfg(windows)]
