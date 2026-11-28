@@ -29,6 +29,7 @@ windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_Fil
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
 
 [profile.dev]
 debug = 0

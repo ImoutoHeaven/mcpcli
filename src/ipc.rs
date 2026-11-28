@@ -408,6 +408,60 @@ mod tests {
         writer.flush().await
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn write_raw_idle_allows_progress_across_multiple_idle_periods() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let started = AtomicBool::new(false);
+        let frame = b"abcdefghijklmnop";
+        let writing = write_raw_idle(
+            &mut writer,
+            frame,
+            Duration::from_millis(220),
+            None,
+            &started,
+        );
+        tokio::pin!(writing);
+        assert!(futures_util::poll!(&mut writing).is_pending());
+        assert!(started.load(Ordering::Acquire));
+
+        let began = Instant::now();
+        let mut received = [0u8; 16];
+        for chunk in received[..8].chunks_mut(4) {
+            tokio::time::advance(Duration::from_millis(200)).await;
+            reader.read_exact(chunk).await.unwrap();
+            assert!(futures_util::poll!(&mut writing).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(200)).await;
+        reader.read_exact(&mut received[8..12]).await.unwrap();
+        writing.await.unwrap();
+        reader.read_exact(&mut received[12..]).await.unwrap();
+
+        assert_eq!(Instant::now() - began, Duration::from_millis(600));
+        assert_eq!(&received, frame);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn write_raw_idle_times_out_when_progress_stops() {
+        let (mut writer, mut reader) = tokio::io::duplex(4);
+        let started = AtomicBool::new(false);
+        let writing = write_raw_idle(
+            &mut writer,
+            b"abcdefgh",
+            Duration::from_millis(220),
+            None,
+            &started,
+        );
+        tokio::pin!(writing);
+        assert!(futures_util::poll!(&mut writing).is_pending());
+        assert!(started.load(Ordering::Acquire));
+
+        tokio::time::advance(Duration::from_millis(221)).await;
+        assert_eq!(writing.await.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        let mut received = [0u8; 4];
+        reader.read_exact(&mut received).await.unwrap();
+        assert_eq!(&received, b"abcd");
+    }
+
     #[tokio::test]
     async fn rejects_lengths_before_reading_body() {
         let (mut tx, mut rx) = tokio::io::duplex(16);

@@ -1899,7 +1899,7 @@ async fn media_cache_cross_process_inflight_protection_crash_recovery_and_conten
 }
 
 #[tokio::test]
-async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inflight_batch() {
+async fn daemon_send_idle_timeout_completes_writeback_and_aborts_stalled_inflight_batch() {
     let dir = temp_dir();
     let base = dir.path().canonicalize().unwrap();
     let media_dir = base.join("media");
@@ -2003,7 +2003,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
             daemon_paths,
             daemon_loaded,
             DaemonOptions {
-                idle_timeout: Duration::from_millis(220),
+                idle_timeout: Duration::from_secs(2),
                 media: daemon_store,
                 ..DaemonOptions::default()
             },
@@ -2019,8 +2019,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
     .await
     .unwrap();
 
-    // Case 1: Slow IPC reader making steady progress (> 220ms total, < 220ms per step) across t=80_000:
-    // daemon::send finishes and calls batch.complete(), refreshing the 60s retention window to 80_000..140_000!
+    // Media stays pinned while writeback is blocked, then gets a new TTL at completion.
     let call_req = paths
         .request(
             &loaded.digest,
@@ -2032,7 +2031,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
                 detach: false,
                 expected_schema: None,
             },
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
         .unwrap();
     let mut client1 = platform::local::connect(paths.socket.as_os_str())
@@ -2046,19 +2045,18 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
         .unwrap()
         .unwrap();
     assert!(len1 > 4 * 1024 * 1024);
-    // Advance clock past initial 60s window while response writeback is still blocked on kernel socket buffer!
+    // The client has read only the header, so writeback still holds the batch.
     now_ms.store(80_000, Ordering::Release);
     assert_eq!(store.run_gc().await.unwrap(), 64);
 
     let mut body1 = vec![0u8; len1];
-    let mut read1 = 0usize;
-    while read1 < len1 {
-        let end = (read1 + 256 * 1024).min(len1);
-        let n = client1.read(&mut body1[read1..end]).await.unwrap();
-        assert!(n > 0);
-        read1 += n;
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        client1.read_exact(&mut body1).await.unwrap();
+        let mut extra = [0u8; 1];
+        assert_eq!(client1.read(&mut extra).await.unwrap(), 0);
+    })
+    .await
+    .expect("daemon did not complete IPC writeback");
     drop(client1);
     let resp1: Response = serde_json::from_slice(&body1).unwrap();
     let saved1 = PathBuf::from(
@@ -2066,8 +2064,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
             .as_str()
             .unwrap(),
     );
-    // Wait briefly for daemon::send post-flush batch.complete() to persist its completion record.
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    // EOF follows batch.complete(), so advance media time only after it is durable.
     now_ms.store(130_000, Ordering::Release);
     assert_eq!(store.run_gc().await.unwrap(), 64);
     assert!(
@@ -2079,8 +2076,8 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
     assert_eq!(store.run_gc().await.unwrap(), 0);
     assert!(!saved1.exists());
 
-    // Case 2: Stalled IPC reader reads only the 4-byte header and stalls > 220ms idle_timeout:
-    // daemon::send aborts writeback and calls batch.abort(), so GC at t=270_000 reclaims the file!
+    // Keep the second reader connected without draining its response. Idle expiry must
+    // abort writeback before the request deadline and release the media for GC.
     now_ms.store(200_000, Ordering::Release);
     let call_req2 = paths
         .request(
@@ -2093,7 +2090,7 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
                 detach: false,
                 expected_schema: None,
             },
-            Duration::from_secs(10),
+            Duration::from_secs(30),
         )
         .unwrap();
     let mut client2 = platform::local::connect(paths.socket.as_os_str())
@@ -2109,12 +2106,19 @@ async fn daemon_send_idle_timeout_completes_slow_progress_and_aborts_stalled_inf
     assert!(len2 > 4 * 1024 * 1024);
     assert_eq!(store.run_gc().await.unwrap(), 64);
 
-    // Advance clock past 200_000 + 60_000 BEFORE daemon idle timeout fires so a mistaken complete() would refresh to 270_000!
+    // A mistaken complete() would renew retention at 270_000 instead of allowing GC.
     now_ms.store(270_000, Ordering::Release);
-    tokio::time::sleep(Duration::from_millis(360)).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if store.run_gc().await.unwrap() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("stalled writeback retained media past the idle timeout");
     drop(client2);
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    assert_eq!(store.run_gc().await.unwrap(), 0);
 
     runtime::stop(&paths).await.unwrap();
     daemon_task.await.unwrap();
