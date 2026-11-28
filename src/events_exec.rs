@@ -290,8 +290,9 @@ impl ProcessTree {
                 | windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
         );
 
-        #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut child = command.spawn()?;
+        let child = command.spawn()?;
+        #[cfg(windows)]
+        let mut child = child;
         #[cfg(unix)]
         let group = child.id().map(|id| id as i32);
 
